@@ -1,0 +1,30 @@
+[project]
+name = "clinic-agent"
+version = "0.0.0"
+description = "Inbound appointment-scheduling voice agent (Pipecat). SKELETON — Phase 1+."
+requires-python = ">=3.11"
+
+# NOTE: Dependencies are pinned here for reference but are NOT installed in Phase 0.
+# `uv sync` for this service happens when Phase 1 (the live ASR->LLM->TTS loop) begins.
+dependencies = [
+    # Pipecat with the service extras this project uses.
+    # Deepgram (ASR), Groq (LLM), Cartesia (TTS), Silero (VAD/turn-taking).
+    "pipecat-ai[deepgram,groq,cartesia,silero]>=0.0.90",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",          # agent -> scheduling_api HTTP calls (Phase 2)
+    "loguru>=0.7",
+]
+
+[project.optional-dependencies]
+# Free-tier local TTS alternative to Cartesia. Wired in a later phase.
+# TODO(Phase 1/4): add Piper TTS support for offline/free testing.
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clinic_agent"]

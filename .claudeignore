@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Audio artifacts (recordings, samples, generated speech)
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.m4a
+*.aac
+*.opus
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Local databases / build artifacts
+*.db
+*.sqlite
+*.sqlite3
+.uv/
+dist/
+build/

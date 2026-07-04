@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.uv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Databases (regenerated from seed on startup)
+*.db
+*.sqlite
+*.sqlite3
+
+# Audio artifacts
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.m4a
+*.aac
+*.opus
+
+# Build / dist
+dist/
+build/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
