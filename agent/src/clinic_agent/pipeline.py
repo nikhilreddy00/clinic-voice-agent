@@ -1,21 +1,25 @@
-"""Pipecat pipeline for the clinic voice agent — Phase 1 (local ASR->LLM->TTS loop).
+"""Pipecat pipeline for the clinic voice agent — Phase 2 (booking via tool calls).
 
-Phase 1 scope: one working local voice loop over the laptop mic/speaker.
+Local ASR->LLM->TTS loop over the laptop mic/speaker, now with the LLM able to call the mock
+scheduling API to complete a full booking:
 
-    mic -> Deepgram (ASR) -> Groq/Llama (LLM) -> Cartesia (TTS) -> speaker
+    mic -> Deepgram (ASR) -> Groq/Llama (LLM) <-> scheduling API tools -> Cartesia (TTS) -> speaker
 
-On start the agent speaks a fixed greeting that includes the mandatory AI disclosure
-(spoken deterministically, NOT LLM-generated, so the disclosure wording is exact every run),
-then handles the caller's follow-up turn with a minimal, tightly scoped system prompt.
+On start the agent speaks a fixed greeting that includes the mandatory AI disclosure (spoken
+deterministically, NOT LLM-generated, so the disclosure wording is exact every run). It then
+runs the full slot-fill -> offer -> hold -> confirm -> book -> close flow, with the LLM
+deciding when to call check_availability / hold_slot / confirm_booking (see scheduling_tools.py
+and the PHASE2 system prompt in prompts.py). The Phase-1 echo-safe mic gate and greeting are
+unchanged.
 
 Deliberately OUT of scope here (later phases):
-    - slot-filling / booking / scheduling-API tool calls  (Phase 2)
-    - the full dialogue state machine + validation/fallbacks (Phase 3, docs/build_spec.md)
-    - telephony / SIP                                        (Phase 7)
+    - the full dialogue state machine + per-state validation/fallbacks (Phase 3, docs/build_spec.md)
+    - barge-in / VAD tuning                                  (Phase 4)
+    - telephony / SIP + warm human transfer                  (Phase 7)
 
 Pipeline order (Pipecat 1.5.x):
-    transport.input() -> vad -> stt -> [log ASR] -> user_agg
-        -> llm -> [log LLM/TTS] -> tts -> transport.output() -> assistant_agg
+    transport.input() -> mic-gate -> vad -> stt -> [log ASR] -> user_agg
+        -> llm (<-> scheduling tools) -> [log LLM/TTS] -> tts -> transport.output() -> assistant_agg
 """
 
 from __future__ import annotations
@@ -57,7 +61,12 @@ from pipecat.transports.local.audio import (
 from pipecat.workers.runner import WorkerRunner
 
 from .config import load_settings, require_phase1_keys
-from .prompts import GREETING, PHASE1_SYSTEM_PROMPT
+from .prompts import GREETING, build_phase2_system_prompt
+from .scheduling_tools import (
+    SchedulingClient,
+    build_tools_schema,
+    register_scheduling_functions,
+)
 
 # Single source of truth for the output sample rate. Cartesia's TTS output, the pipeline's
 # audio_out_sample_rate, and the local speaker stream are all pinned to this so there is no
@@ -265,8 +274,22 @@ async def run_agent() -> None:
         f"cartesia_tts={OUTPUT_SAMPLE_RATE} Hz (resample on playback path should be a no-op)"
     )
 
-    # --- Conversation context (seeded with the minimal Phase-1 system prompt) ------------
-    context = LLMContext(messages=[{"role": "system", "content": PHASE1_SYSTEM_PROMPT}])
+    # --- Scheduling-API tools (Phase 2) --------------------------------------------------
+    # The LLM decides when to call these; the client is the HTTP plumbing to the mock API.
+    scheduling_client = SchedulingClient(settings.scheduling_api_base_url)
+    tools = build_tools_schema()
+    register_scheduling_functions(llm, scheduling_client)
+    logger.info(
+        f"[tools] registered scheduling functions (check_availability, hold_slot, "
+        f"confirm_booking) → {settings.scheduling_api_base_url}"
+    )
+
+    # --- Conversation context (Phase-2 system prompt + tools) ----------------------------
+    # Today's UTC date is baked into the prompt so relative phrases ("next Tuesday") resolve.
+    context = LLMContext(
+        messages=[{"role": "system", "content": build_phase2_system_prompt()}],
+        tools=tools,
+    )
     aggregators = LLMContextAggregatorPair(context)
 
     # --- Pipeline ------------------------------------------------------------------------
@@ -302,8 +325,14 @@ async def run_agent() -> None:
         logger.info("TTS  ▶ synthesis triggered for greeting/disclosure")
         await worker.queue_frames([TTSSpeakFrame(GREETING)])
 
-    logger.info("Starting clinic voice agent (Phase 1 local loop). Speak into your mic; Ctrl-C to stop.")
-    await WorkerRunner().run(worker)
+    logger.info(
+        "Starting clinic voice agent (Phase 2: booking via scheduling-API tools). "
+        "Speak into your mic; Ctrl-C to stop."
+    )
+    try:
+        await WorkerRunner().run(worker)
+    finally:
+        await scheduling_client.aclose()  # close the HTTP client even on Ctrl-C / error
 
 
 def main() -> None:
