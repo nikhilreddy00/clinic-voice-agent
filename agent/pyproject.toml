@@ -8,8 +8,9 @@ requires-python = ">=3.11"
 # `uv sync` for this service happens when Phase 1 (the live ASR->LLM->TTS loop) begins.
 dependencies = [
     # Pipecat with the service extras this project uses.
-    # Deepgram (ASR), Groq (LLM), Cartesia (TTS), Silero (VAD/turn-taking).
-    "pipecat-ai[deepgram,groq,cartesia,silero]>=0.0.90",
+    # Deepgram (ASR), Groq (LLM), Cartesia (TTS), Silero (VAD/turn-taking),
+    # local (PyAudio mic/speaker transport for Phase 1 local dev).
+    "pipecat-ai[deepgram,groq,cartesia,silero,local]>=1.5.0",
     "python-dotenv>=1.0",
     "httpx>=0.27",          # agent -> scheduling_api HTTP calls (Phase 2)
     "loguru>=0.7",

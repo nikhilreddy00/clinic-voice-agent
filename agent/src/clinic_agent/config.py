@@ -57,3 +57,30 @@ def load_settings() -> Settings:
             "SCHEDULING_API_BASE_URL", "http://127.0.0.1:8000"
         ),
     )
+
+
+# Env vars the Phase-1 local voice loop (ASR -> LLM -> TTS) cannot run without.
+_PHASE1_REQUIRED = {
+    "DEEPGRAM_API_KEY": "deepgram_api_key",  # ASR
+    "GROQ_API_KEY": "groq_api_key",          # LLM
+    "CARTESIA_API_KEY": "cartesia_api_key",  # TTS
+    "CARTESIA_VOICE_ID": "cartesia_voice_id",  # TTS voice
+}
+
+
+def require_phase1_keys(settings: Settings) -> None:
+    """Fail fast with a clear message if any key the Phase-1 pipeline needs is unset.
+
+    Called at the top of the pipeline entrypoint so a missing `.env` value produces an
+    actionable error instead of an opaque SDK auth failure mid-call.
+    """
+    missing = [
+        env_name
+        for env_name, field in _PHASE1_REQUIRED.items()
+        if not getattr(settings, field)
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s) for the Phase-1 voice loop: "
+            f"{', '.join(missing)}. Set them in agent/.env (see .env.example)."
+        )
