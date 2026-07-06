@@ -1,0 +1,8 @@
+# Generated eval artifacts — the harness is source-controlled, run outputs are not.
+# `results/.gitkeep` keeps the (otherwise-empty) results dir in git. A canonical result can
+# still be tracked deliberately after a VALID run, e.g. `git add -f results/latest.md`.
+results/*.json
+results/latest.md
+.eval_clinic.db
+__pycache__/
+*.pyc
