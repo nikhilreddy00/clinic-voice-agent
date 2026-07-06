@@ -110,6 +110,23 @@ cd agent && cp .env.example .env   # then fill in keys; uv sync when Phase 1 sta
 
 ## Current status
 
-**Phase 0 complete.** Scaffold, docs, and the mock scheduling API are in place and tested.
-Phase 1 (the live ASR→LLM→TTS loop) has **not** started — `agent/` is a skeleton with TODO
-markers only. Do not add pipeline logic until Phase 1 is explicitly begun.
+**Phase 4 complete.** Phases 0–3 (scaffold + mock API, live ASR→LLM→TTS loop, scheduling-API
+tool calls, dialogue hardening + headless eval) are done. Phase 4 fixed all five confirmed
+defects from the Phase-4 target list in [`docs/build_spec.md`](docs/build_spec.md) and added
+barge-in:
+
+- **Five targets fixed** (date-grounding via an injected date→weekday table; past-time slot
+  filter in `scheduling_api`; mid-flow slot tracking + single confirmation gate; empty-window
+  fallback; past-time read-back guard), **plus** a bonus fix for a fabricated-booking bug (agent
+  read a `hold_id` back as a confirmation number without calling `confirm_booking`). Eval moved
+  from **88% task completion / 81% overall pass → 100% / 100%** (16/16, slot-filling 8/9 → 11/11).
+- **Barge-in / turn-taking** (`agent/src/clinic_agent/barge_in.py` + `pipeline.py`): Pipecat's
+  built-in interruption, gated by `MinWordsUserTurnStartStrategy(min_words=3)` at the turn level
+  and a sustained-speech mic gate (~600 ms threshold, 400 ms echo-tail hangover) at the audio
+  level, with a false-positive-interruption metric. Thresholds are tunable via `CLINIC_BARGEIN_*`
+  env vars. **Known limitation:** the local mic has no acoustic echo cancellation, so sustained
+  bot echo can still self-trigger; robust barge-in needs an AEC transport (WebRTC/telephony).
+  End-to-end barge-in is audio-timing behavior and is verified on a live mic, not in the headless
+  eval; the gate's decision logic has unit tests (`agent/tests/test_barge_in.py`).
+
+**Next: Phase 5 — telephony** (Twilio/LiveKit SIP + governance/deploy). Not started.

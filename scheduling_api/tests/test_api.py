@@ -26,6 +26,30 @@ def test_availability_returns_seeded_slots(client):
         assert field in slot
 
 
+def test_availability_excludes_past_slots(client):
+    """Slots whose start_time is already in the past must not be offered (Phase-4 fix #2)."""
+    from datetime import datetime, timedelta, timezone
+
+    from app import db
+
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    conn = db.get_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO slots (id, provider_id, start_time, reason_category, status) "
+            "VALUES (?, 1, ?, 'checkup', 'available')",
+            [(90001, past), (90002, future)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ids = [s["slot_id"] for s in client.get("/availability").json()["slots"]]
+    assert 90001 not in ids, "past slot should be filtered out"
+    assert 90002 in ids, "future slot should still be offered"
+
+
 def test_availability_filter_by_provider(client):
     resp = client.get("/availability", params={"provider_id": 1})
     assert resp.status_code == 200

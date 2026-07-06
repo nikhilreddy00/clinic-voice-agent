@@ -37,17 +37,22 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     OutputAudioRawFrame,
     StartFrame,
     TextFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
+    UserStartedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.anthropic.llm import AnthropicLLMService
@@ -58,8 +63,13 @@ from pipecat.transports.local.audio import (
     LocalAudioTransport,
     LocalAudioTransportParams,
 )
+from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
+    MinWordsUserTurnStartStrategy,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
+from .barge_in import BargeInConfig, MicGateLogic, barge_in_min_words, frame_rms
 from .config import load_settings, require_phase1_keys
 from .prompts import GREETING, build_phase2_system_prompt
 from .scheduling_tools import (
@@ -150,57 +160,76 @@ class InstrumentedLocalAudioTransport(LocalAudioTransport):
 
 
 class BotSpeechInputGate(FrameProcessor):
-    """Half-duplex mic gate: drop mic audio while the bot is speaking (+ hangover).
+    """Echo-suppressing mic gate that still allows barge-in (Phase 4).
 
-    The laptop has no acoustic echo cancellation, so the mic captures the bot's own TTS from
-    the speaker. That echo makes the VAD fire a false "user started speaking", which both
-    (a) interrupts and cuts the bot off mid-sentence and (b) gets transcribed and answered —
-    a feedback loop. Placed BEFORE the VAD, this gate drops InputAudioRawFrames while the bot
-    speaks (plus a short hangover for the echo tail), so the echo never reaches VAD or STT.
+    The laptop has no acoustic echo cancellation, so the mic captures the bot's own TTS. In
+    Phase 1 this gate was fully half-duplex — it dropped ALL mic audio while the bot spoke, so
+    the echo never reached VAD/STT, at the cost of no barge-in.
 
-    This makes the agent half-duplex (no barge-in during bot speech). Real barge-in / VAD
-    tuning is Phase 4; this is the minimal Phase-1 echo fix only.
+    Phase 4 keeps the echo protection but lets genuine interruptions through: while the bot
+    speaks, input is suppressed by default, but SUSTAINED voiced audio (see
+    :class:`MicGateLogic`) opens the gate so a real utterance reaches STT and Pipecat's
+    ``MinWordsUserTurnStartStrategy`` — which broadcasts the interruption that cancels the bot's
+    turn. Short blips / the ~400 ms echo tail stay suppressed. The gate also counts
+    false-positive interruptions (echo opened the gate but no real turn followed) as a trust
+    metric. All decision logic lives in the dependency-free :class:`MicGateLogic`; this class is
+    just the Pipecat frame plumbing + logging.
     """
 
-    HANGOVER_SECS = 0.4  # stay muted briefly after the bot stops, to swallow the echo tail
-
-    def __init__(self, **kwargs):
+    def __init__(self, config: BargeInConfig | None = None, **kwargs):
         super().__init__(**kwargs)
-        self._bot_speaking = False
-        self._unmute_at = 0.0
-        self._suppressed = 0
-
-    def _muted(self) -> bool:
-        return self._bot_speaking or time.monotonic() < self._unmute_at
+        self._logic = MicGateLogic(config or BargeInConfig.from_env())
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+        now = time.monotonic()
 
         if isinstance(frame, BotStartedSpeakingFrame):
-            if not self._bot_speaking:
-                logger.info("[mic-gate] bot started speaking → muting mic")
-            self._bot_speaking = True
+            resolved = self._logic.on_bot_started(now)
+            logger.info(
+                "[mic-gate] bot speaking → guarding mic (sustained speech can still barge in)"
+            )
+            if resolved == "false_positive":
+                logger.info(
+                    f"[barge-in] false-positive interruption — echo opened the gate but no real "
+                    f"turn followed (total false={self._logic.bargein_false})"
+                )
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            self._bot_speaking = False
-            self._unmute_at = time.monotonic() + self.HANGOVER_SECS
+            self._logic.on_bot_stopped(now)
+        elif isinstance(frame, (InterruptionFrame, UserStartedSpeakingFrame)):
+            if self._logic.on_interruption(now) == "true_positive":
+                logger.info(
+                    f"[barge-in] real interruption — caller barged in over the bot "
+                    f"(total real={self._logic.bargein_true})"
+                )
 
         if isinstance(frame, InputAudioRawFrame):
-            if self._muted():
-                self._suppressed += 1
-                # Heartbeat every ~1s (50 x 20ms frames) so suppression is visible in the
-                # console without spamming a line per 20ms audio frame.
-                if self._suppressed % 50 == 1:
+            rms = frame_rms(frame.audio)
+            channels = getattr(frame, "num_channels", 1) or 1
+            n_samples = (len(frame.audio) // 2) // channels
+            frame_ms = (n_samples / frame.sample_rate * 1000.0) if frame.sample_rate else 20.0
+            decision = self._logic.on_audio(now, rms, frame_ms)
+            if decision == "OPEN":
+                logger.info(
+                    f"[barge-in] sustained input during bot speech → opening mic "
+                    f"(candidate #{self._logic.bargein_candidates})"
+                )
+            elif decision == "SUPPRESS":
+                # Heartbeat every ~1s (50 x 20ms frames) so suppression is visible without
+                # spamming a line per 20ms audio frame.
+                if self._logic.suppressed_frames % 50 == 1:
                     logger.info(
-                        f"[mic-gate] muting mic while bot speaks (dropped {self._suppressed} frames)"
+                        f"[mic-gate] suppressing echo while bot speaks "
+                        f"(dropped {self._logic.suppressed_frames} frames)"
                     )
                 return  # drop: do not forward the bot's echo to VAD/STT
-            if self._suppressed:
-                logger.info(
-                    f"[mic-gate] mic re-opened (dropped {self._suppressed} echo frames total)"
-                )
-                self._suppressed = 0
 
         await self.push_frame(frame, direction)
+
+    def barge_in_stats(self) -> dict:
+        """Resolve any dangling candidate and return the barge-in counters (for a teardown log)."""
+        self._logic.resolve_pending_on_shutdown()
+        return self._logic.stats()
 
 
 class StageLogger(FrameProcessor):
@@ -294,14 +323,30 @@ async def run_agent() -> None:
         messages=[{"role": "system", "content": build_phase2_system_prompt()}],
         tools=tools,
     )
-    aggregators = LLMContextAggregatorPair(context)
+    # Barge-in (Phase 4): the user aggregator's built-in turn controller broadcasts an
+    # interruption on user-turn-start, which cancels the bot's in-flight TTS/LLM. We gate WHEN a
+    # turn starts with MinWordsUserTurnStartStrategy: while the bot speaks it needs >= min_words
+    # transcribed words (so short sounds / echo blips don't interrupt); while the bot is silent a
+    # single word starts a normal turn. This pairs with the audio-level BotSpeechInputGate below.
+    min_words = barge_in_min_words()
+    user_params = LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            start=[MinWordsUserTurnStartStrategy(min_words=min_words, use_interim=True)],
+        ),
+    )
+    aggregators = LLMContextAggregatorPair(context, user_params=user_params)
+    logger.info(
+        f"[barge-in] turn gate: MinWordsUserTurnStartStrategy(min_words={min_words}); "
+        f"interruptions enabled"
+    )
 
     # --- Pipeline ------------------------------------------------------------------------
     # The mic gate sits BEFORE the VAD so the bot's own echo never reaches VAD/STT.
+    mic_gate = BotSpeechInputGate(name="mic-gate")
     pipeline = Pipeline(
         [
             transport.input(),
-            BotSpeechInputGate(name="mic-gate"),
+            mic_gate,
             vad,
             stt,
             StageLogger(log_asr=True, name="asr-logger"),
@@ -336,6 +381,12 @@ async def run_agent() -> None:
     try:
         await WorkerRunner().run(worker)
     finally:
+        stats = mic_gate.barge_in_stats()
+        logger.info(
+            f"[barge-in] session totals: candidates={stats['bargein_candidates']}, "
+            f"real={stats['bargein_true']}, false-positive={stats['bargein_false']}, "
+            f"suppressed_echo_frames={stats['suppressed_frames']}"
+        )
         await scheduling_client.aclose()  # close the HTTP client even on Ctrl-C / error
 
 

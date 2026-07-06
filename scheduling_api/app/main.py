@@ -58,14 +58,18 @@ def get_availability(
         db.release_expired_holds(conn)
         conn.commit()
 
+        # Only future slots: never offer a time that has already passed (Phase-4 fix #2).
+        # start_time and _now() are both ISO-8601 UTC with the same +00:00 offset, so a plain
+        # string comparison orders them correctly — same trick release_expired_holds() uses.
         sql = """
             SELECT s.id AS slot_id, s.provider_id, p.name AS provider_name,
                    p.specialty, s.start_time, s.reason_category
               FROM slots s
               JOIN providers p ON p.id = s.provider_id
              WHERE s.status = 'available'
+               AND s.start_time >= ?
         """
-        params: list = []
+        params: list = [db._now().isoformat()]
         if provider_id is not None:
             sql += " AND s.provider_id = ?"
             params.append(provider_id)
