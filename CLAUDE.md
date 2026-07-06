@@ -74,20 +74,34 @@ state — is in [`docs/build_spec.md`](docs/build_spec.md).
 The agent and the scheduling API are **separate services / processes** with their own
 `pyproject.toml` (managed with `uv`).
 
-## 8-phase build plan
+## Build plan
 
-- **Phase 0 — Scaffold, docs, mock scheduling API.** ← *(current)*
-- **Phase 1 — Live ASR→LLM→TTS loop.** Local/WebRTC transport, core dialogue happy path.
-- **Phase 2 — Tool/function calling.** Wire the agent to the scheduling API
-  (availability / hold / confirm).
-- **Phase 3 — Dialogue management hardening.** State machine (Pipecat Flows), input
-  validation, per-state fallback/no-match handling.
-- **Phase 4 — Turn-taking / barge-in.** VAD tuning, interruption handling.
-- **Phase 5 — Observability.** Per-turn latency, ASR confidence, tool-success metrics,
-  structured logs.
-- **Phase 6 — Eval harness.** Scripted + adversarial test conversations.
-- **Phase 7 — Telephony + governance + deploy.** Twilio/LiveKit SIP, AI disclosure &
-  call-recording consent, deployment.
+This reflects the *actual* build sequence. (Earlier drafts of this file had an 8-phase plan
+that listed the eval harness and barge-in as separate later phases; both landed earlier than
+planned — the eval harness in Phase 3, barge-in in Phase 4 — so the remaining work is
+renumbered to what's actually left.)
+
+**Completed:**
+
+- **Phase 0 — Scaffold, docs, mock scheduling API.** ✅
+- **Phase 1 — Live ASR→LLM→TTS loop.** Local/WebRTC transport, greeting/AI disclosure, mic
+  gate, core dialogue happy path. ✅
+- **Phase 2 — LLM-driven booking via tool calls.** Wire the agent to the scheduling API
+  (availability / hold / confirm). ✅
+- **Phase 3 — Headless eval harness.** 16 scripted + adversarial conversations, structural
+  (tool-trace) scoring. ✅
+- **Phase 4 — Dialogue/API defect fixes + barge-in.** Five target fixes (see
+  `docs/build_spec.md`) + turn-taking / interruption handling with a false-positive metric. ✅
+
+**Remaining:**
+
+- **Phase 5 — Telephony.** Wire a real inbound phone number (Twilio or LiveKit SIP); deliver
+  the AI disclosure and call-recording consent on real calls.
+- **Phase 6 — Observability + deployment.** Per-turn latency (P50/P95/P99), ASR confidence,
+  tool-success and outcome metrics, structured logs / dashboard; Dockerize (1 container per
+  session); deploy to Fly.io or Render.
+- **Phase 7 — README + demo.** Architecture diagram, eval results, latency percentiles, a
+  recorded call demo, and a callable number.
 
 ## Conventions & governance
 
@@ -129,4 +143,5 @@ barge-in:
   End-to-end barge-in is audio-timing behavior and is verified on a live mic, not in the headless
   eval; the gate's decision logic has unit tests (`agent/tests/test_barge_in.py`).
 
-**Next: Phase 5 — telephony** (Twilio/LiveKit SIP + governance/deploy). Not started.
+**Next: Phase 5 — telephony** (Twilio/LiveKit SIP; AI disclosure + call-recording consent on
+real calls). Observability + deployment is Phase 6; README + demo is Phase 7. Not started.
