@@ -21,11 +21,26 @@ this repo, logs, or prompts.**
 | Telephony (later) | Inbound PSTN/SIP call ingress | Twilio / LiveKit SIP |
 | Transport | Real-time audio in/out | Pipecat transport (WebRTC local dev → SIP later) |
 | ASR | Speech → text | Deepgram (`pipecat.services.deepgram`) |
-| LLM | Reasoning / dialogue | Groq-hosted Llama (`pipecat.services.groq`) |
+| LLM | Reasoning / dialogue | Anthropic Claude Haiku 4.5 (`pipecat.services.anthropic`) — see LLM-provider note below |
 | TTS | Text → speech | Cartesia (`pipecat.services.cartesia`); Piper for free-tier testing (TODO) |
 | Orchestration | Pipeline, turn-taking, context | Pipecat (`Pipeline` / `PipelineWorker` / `WorkerRunner`) |
 | Scheduling backend | Availability / hold / booking | FastAPI mock service (`scheduling_api/`) |
 | Storage | Slots & bookings | SQLite (`scheduling_api/clinic.db`) |
+
+### LLM-provider note (why Claude, not Groq)
+
+The dialogue LLM was **Groq-hosted Llama** through Phase 2, then swapped to **Anthropic Claude
+Haiku 4.5** during Phase 3 to unblock eval iteration: Groq's free tier has a 100K-tokens/day cap
+that a full 16-case eval run exhausts on its own, which stalled Phase-3 development. Claude Haiku
+4.5 is the fastest/cheapest Claude model and reasonable for real-time voice latency.
+
+- **Groq remains available as a dormant option for future latency benchmarking.** The `groq`
+  Pipecat extra is still installed and `GROQ_API_KEY`/`GROQ_MODEL` still load in `config.py`, but
+  nothing is wired to them. **Switching back to Groq is a deliberate code change in
+  `agent/src/clinic_agent/pipeline.py` and `eval/run_eval.py`** — there is no runtime provider
+  flag. This keeps the active path simple while leaving the fallback one edit away.
+- This is a **development-unblocking swap, not a permanent architecture decision.** Groq's low
+  latency may still make it the better choice for the final production/demo voice build.
 
 ## Dialogue states (summary)
 

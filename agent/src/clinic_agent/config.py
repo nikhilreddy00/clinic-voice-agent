@@ -21,7 +21,13 @@ class Settings:
     # ASR — Deepgram
     deepgram_api_key: str
 
-    # LLM — Groq (Llama)
+    # LLM — Anthropic (Claude), the active provider.
+    anthropic_api_key: str
+    anthropic_model: str
+
+    # LLM — Groq (Llama). DORMANT fallback: kept for a future latency benchmark
+    # only. Not wired into the active pipeline; switching back to Groq is a
+    # deliberate code change in pipeline.py + eval/run_eval.py (see CLAUDE.md).
     groq_api_key: str
     groq_model: str
 
@@ -46,6 +52,8 @@ def load_settings() -> Settings:
     """
     return Settings(
         deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
         groq_api_key=os.getenv("GROQ_API_KEY", ""),
         groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
         cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),
@@ -60,11 +68,13 @@ def load_settings() -> Settings:
 
 
 # Env vars the Phase-1 local voice loop (ASR -> LLM -> TTS) cannot run without.
+# The active LLM is Anthropic/Claude, so ANTHROPIC_API_KEY is required here; a
+# missing GROQ_API_KEY is fine — Groq is a dormant fallback (see CLAUDE.md).
 _PHASE1_REQUIRED = {
-    "DEEPGRAM_API_KEY": "deepgram_api_key",  # ASR
-    "GROQ_API_KEY": "groq_api_key",          # LLM
-    "CARTESIA_API_KEY": "cartesia_api_key",  # TTS
-    "CARTESIA_VOICE_ID": "cartesia_voice_id",  # TTS voice
+    "DEEPGRAM_API_KEY": "deepgram_api_key",      # ASR
+    "ANTHROPIC_API_KEY": "anthropic_api_key",    # LLM (active provider)
+    "CARTESIA_API_KEY": "cartesia_api_key",      # TTS
+    "CARTESIA_VOICE_ID": "cartesia_voice_id",    # TTS voice
 }
 
 

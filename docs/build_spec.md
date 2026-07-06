@@ -19,6 +19,12 @@ management) implements and Phase 6 (evals) tests against.
   confirmed before any write to the scheduling API.
 - **Tool boundary:** `OFFER_SLOTS`, `BOOK`, and hold management map to the three scheduling
   API endpoints (see the mapping table). This is where Phase 2 function-calling wires in.
+- **LLM provider:** dialogue/function-calling runs on **Anthropic Claude Haiku 4.5** (swapped
+  from Groq-hosted Llama during Phase 3 to unblock eval iteration past Groq's free-tier
+  100K-tokens/day cap). Groq remains available as a **dormant** option for future latency
+  benchmarking; switching back requires code changes in `agent/src/clinic_agent/pipeline.py`
+  and `eval/run_eval.py` (there is no runtime provider flag). See CLAUDE.md for the full note.
+  The state machine and tool contract below are provider-agnostic.
 
 ## State diagram
 

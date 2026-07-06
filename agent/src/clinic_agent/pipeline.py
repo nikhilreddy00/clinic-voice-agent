@@ -3,7 +3,7 @@
 Local ASR->LLM->TTS loop over the laptop mic/speaker, now with the LLM able to call the mock
 scheduling API to complete a full booking:
 
-    mic -> Deepgram (ASR) -> Groq/Llama (LLM) <-> scheduling API tools -> Cartesia (TTS) -> speaker
+    mic -> Deepgram (ASR) -> Anthropic/Claude (LLM) <-> scheduling API tools -> Cartesia (TTS) -> speaker
 
 On start the agent speaks a fixed greeting that includes the mandatory AI disclosure (spoken
 deterministically, NOT LLM-generated, so the disclosure wording is exact every run). It then
@@ -50,9 +50,9 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.groq.llm import GroqLLMService
 from pipecat.transports.local.audio import (
     LocalAudioOutputTransport,
     LocalAudioTransport,
@@ -260,9 +260,13 @@ async def run_agent() -> None:
     # --- Services ------------------------------------------------------------------------
     vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
     stt = DeepgramSTTService(api_key=settings.deepgram_api_key)
-    llm = GroqLLMService(
-        api_key=settings.groq_api_key,
-        settings=GroqLLMService.Settings(model=settings.groq_model),
+    # LLM: Anthropic/Claude (active provider). The Phase-2 tool schema + handlers
+    # are provider-agnostic — Pipecat's AnthropicLLMAdapter converts build_tools_schema()
+    # to Anthropic's input_schema format and routes tool_use/tool_result through the
+    # same register_scheduling_functions handlers, so nothing below the service changes.
+    llm = AnthropicLLMService(
+        api_key=settings.anthropic_api_key,
+        settings=AnthropicLLMService.Settings(model=settings.anthropic_model),
     )
     tts = CartesiaTTSService(
         api_key=settings.cartesia_api_key,
