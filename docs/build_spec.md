@@ -182,3 +182,23 @@ stateDiagram-v2
 - **Call-recording consent** — added to `GREETING_DISCLOSURE` when telephony lands (Phase 7).
 - **PHI minimization** — `COLLECT_REASON` captures a coarse reason only; the agent never
   solicits detailed medical history. All names/reasons in dev are synthetic.
+
+## Phase-4 target list (known issues to fix during dialogue hardening)
+
+Concrete defects observed in the Phase-3 eval (headless, 16 cases on Claude Haiku 4.5) and in a
+manual live voice test. **None are fixed yet — this is the Phase-4 to-do.** Each entry records
+the *exact observed behavior*, where the defect lives, and how it was found. "Today" in the
+examples is Monday **2026-07-06** (the eval/live-test date). Layer column: **LLM** = dialogue /
+prompt / state logic in the agent; **API** = scheduling_api backend.
+
+| # | Layer | Defect | Exact observed behavior | Found by |
+|---|-------|--------|-------------------------|----------|
+| 1 | LLM | **Relative-date grounding — wrong calendar date** (off-by-one on weekday references) | Live: caller asked for **"next Sunday"**; agent said **"July 13th"**, but July 13 is a **Monday** — the correct next Sunday is **July 12**. Eval `hp_sorethroat_specificday`: caller asked for **Tuesday** (Jul 7); agent called `check_availability(date='2026-07-08')`, booked Jul 8, and read it back as **"Tuesday, July 8th"** — but Jul 8 is a **Wednesday**. So the model computes the *wrong* calendar date for a relative weekday, and its spoken weekday label disagrees with the date it actually used. Not just mislabeling — the `date=` sent to the tool is wrong. | Live test + eval `hp_sorethroat_specificday` |
+| 2 | API | **Past-time slots offered** — `GET /availability` returns slots whose `start_time` is already in the past | Live: at **~4:25 PM EST (21:25 UTC)**, availability returned a **1:00 PM** slot for the current day — a time that had already passed. The endpoint filters only on `status='available'` (and optional date/reason/provider), never on `start_time >= now`. Fix direction (Phase 4): add a `start_time >= <current UTC>` filter to the availability query so only future slots are returned. This is a `scheduling_api/` change, distinct from the LLM-side defects. | Live test |
+| 3 | LLM | **Mid-flow day change never converges to a booking** | Eval `ec_change_day_midflow`: caller booked, then switched day (tomorrow → the day after). Agent correctly re-queried both days (`check_availability(date='2026-07-07')` then `('2026-07-08')`) but then **never offered a concrete time and never called `hold_slot`/`confirm_booking`**; it looped on the clarifying question *"which of the three times would you prefer: 10:30 AM, 1:00 PM, or 2:30 PM on Wednesday, July 8th?"* Outcome: `gracefully_handled`, no booking, when a booking was expected. The caller's "that one's fine" / "yes, book it" had no concrete slot antecedent to bind to. | Eval `ec_change_day_midflow` |
+| 4 | LLM | **No empty-window fallback — escalates instead of offering the soonest slot** | Eval `ad_mumbled_vague`: mumbled caller said **"sometime next week"**; agent resolved that to Jul 13–17, queried all five days (all returned **0 slots**, outside the mock's 3-working-day seed window), and escalated (*"Take care!"*) — even though the caller then said **"whatever's open, earliest."** A hardened agent should, on an empty preferred window plus an "earliest is fine" signal, drop the window constraint and offer the soonest available slot before escalating. (Partly a test-design artifact: "next week" is genuinely outside the seed window — but the failure to fall back on "earliest" is a real dialogue gap.) | Eval `ad_mumbled_vague` |
+
+**Not defects (scored PASS, noted for clarity):** `ad_unsupported_intent` and `ad_wants_human`
+correctly declined to book an out-of-scope / human-handoff request. Structural scoring can't
+distinguish "escalated" from "declined-to-book" (both = no booking), so their display shows
+`exp=escalated got=gracefully_handled` on a PASS; the traces confirm proper hand-off language.
