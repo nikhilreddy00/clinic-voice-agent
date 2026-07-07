@@ -4,7 +4,8 @@ Tables:
   providers(id, name, specialty)
   slots(id, provider_id, start_time, reason_category, status, hold_id, hold_expires_at)
         status in ('available', 'held', 'booked')
-  bookings(confirmation_id, slot_id, patient_name, reason, created_at)
+  bookings(confirmation_id, slot_id, patient_name, reason, created_at,
+           date_of_birth, new_patient, symptom_notes)
 
 Holds are short-lived: an expired hold is lazily released (slot returns to 'available')
 whenever we read or mutate slot state.
@@ -68,14 +69,35 @@ def init_db() -> None:
                 slot_id         INTEGER NOT NULL REFERENCES slots(id),
                 patient_name    TEXT NOT NULL,
                 reason          TEXT NOT NULL,
-                created_at      TEXT NOT NULL
+                created_at      TEXT NOT NULL,
+                date_of_birth   TEXT,
+                new_patient     INTEGER,
+                symptom_notes   TEXT
             );
             """
         )
+        _migrate_bookings_intake_columns(conn)
         _seed(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+# Intake columns added after the bookings table already shipped. CREATE TABLE IF NOT EXISTS
+# won't alter an existing table, so add any missing column in place. Idempotent: only ALTERs
+# columns that aren't already present. Synthetic data only.
+_BOOKINGS_INTAKE_COLUMNS = (
+    ("date_of_birth", "TEXT"),
+    ("new_patient", "INTEGER"),
+    ("symptom_notes", "TEXT"),
+)
+
+
+def _migrate_bookings_intake_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(bookings)")}
+    for name, sql_type in _BOOKINGS_INTAKE_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE bookings ADD COLUMN {name} {sql_type}")
 
 
 def _seed(conn: sqlite3.Connection) -> None:

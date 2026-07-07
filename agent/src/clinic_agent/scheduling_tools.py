@@ -115,8 +115,24 @@ class SchedulingClient:
             return {"ok": False, "error": f"the scheduling system returned an error ({exc})"}
         return {"ok": True, **resp.json()}
 
-    async def confirm_booking(self, *, hold_id: str, patient_name: str, reason: str) -> dict:
-        payload = {"hold_id": hold_id, "patient_name": patient_name, "reason": reason}
+    async def confirm_booking(
+        self,
+        *,
+        hold_id: str,
+        patient_name: str,
+        reason: str,
+        date_of_birth: str | None = None,
+        new_patient: bool | None = None,
+        symptom_notes: str | None = None,
+    ) -> dict:
+        payload = {
+            "hold_id": hold_id,
+            "patient_name": patient_name,
+            "reason": reason,
+            "date_of_birth": date_of_birth,
+            "new_patient": new_patient,
+            "symptom_notes": symptom_notes,
+        }
         try:
             resp = await self._client.post("/confirm-booking", json=payload)
         except httpx.HTTPError as exc:
@@ -194,12 +210,25 @@ def register_scheduling_functions(llm: LLMService, client: SchedulingClient) -> 
         hold_id = args.get("hold_id")
         patient_name = args.get("patient_name")
         reason = args.get("reason")
+        date_of_birth = args.get("date_of_birth")
+        new_patient = args.get("new_patient")
+        symptom_notes = args.get("symptom_notes")
+        # PHI minimization (governance: no patient data in logs). DOB and the free-text symptom
+        # note are the most sensitive fields, so log only presence/length indicators, never the
+        # values themselves. new_patient is a non-identifying boolean and is safe to log.
         logger.info(
             f"TOOL ▶ POST /confirm-booking req={{hold_id={hold_id!r}, "
-            f"patient_name={patient_name!r}, reason={reason!r}}}"
+            f"patient_name={patient_name!r}, reason={reason!r}, "
+            f"dob={'set' if date_of_birth else 'unset'}, new_patient={new_patient!r}, "
+            f"symptom_notes_len={len(symptom_notes) if symptom_notes else 0}}}"
         )
         result = await client.confirm_booking(
-            hold_id=hold_id, patient_name=patient_name, reason=reason
+            hold_id=hold_id,
+            patient_name=patient_name,
+            reason=reason,
+            date_of_birth=date_of_birth,
+            new_patient=new_patient,
+            symptom_notes=symptom_notes,
         )
         if result.get("ok"):
             logger.info(
@@ -274,9 +303,10 @@ def build_tools_schema() -> ToolsSchema:
                 name="confirm_booking",
                 description=(
                     "Commit the booking. Call ONLY after the caller has explicitly said yes to "
-                    "the read-back of the held slot. Uses the hold_id from hold_slot. Returns a "
-                    "confirmation_id to read back to the caller. If it fails (hold expired), "
-                    "apologize and re-offer available slots."
+                    "the read-back of the held slot. Uses the hold_id from hold_slot. Include the "
+                    "intake details (date_of_birth, new_patient, symptom_notes) collected earlier "
+                    "in the call. Returns a confirmation_id to read back to the caller. If it "
+                    "fails (hold expired), apologize and re-offer available slots."
                 ),
                 properties={
                     "hold_id": {
@@ -290,6 +320,26 @@ def build_tools_schema() -> ToolsSchema:
                     "reason": {
                         "type": "string",
                         "description": "The coarse reason for the visit, as collected earlier.",
+                    },
+                    "date_of_birth": {
+                        "type": "string",
+                        "description": (
+                            "The caller's date of birth, normalized to MM/DD/YYYY from whatever "
+                            "spoken form they gave (e.g. 'March 15th 1990' -> '03/15/1990')."
+                        ),
+                    },
+                    "new_patient": {
+                        "type": "boolean",
+                        "description": (
+                            "True if the caller is a new patient, False if they've visited before."
+                        ),
+                    },
+                    "symptom_notes": {
+                        "type": "string",
+                        "description": (
+                            "One short sentence describing what's going on, in the caller's own "
+                            "words. Not a medical history — one sentence only."
+                        ),
                     },
                 },
                 required=["hold_id", "patient_name", "reason"],

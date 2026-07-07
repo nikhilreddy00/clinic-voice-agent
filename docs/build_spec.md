@@ -298,3 +298,7 @@ Local dev is unchanged: omit `MODE` (defaults to `local`) to use the laptop mic/
   times. **Deferred to Phase 6.**
 - **1–2 seconds of audio noise at the very start of a telephony call is normal** SIP/RTP
   media negotiation (codec/jitter-buffer settling), **not a code issue** — no fix needed.
+- **Reschedules are handled as brand-new bookings** — the mock API has no patient-lookup
+  endpoint, so a returning caller re-collects intake and books a fresh slot rather than amending
+  an existing appointment. **Deferred:** add a patient/appointment lookup endpoint if reschedule
+  flows are needed.

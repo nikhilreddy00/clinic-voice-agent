@@ -70,6 +70,12 @@ class Expected:
     booked_on_date: str | None = None          # exact YYYY-MM-DD the booked slot must fall on
     booked_within_seed_window: bool = False    # booked slot is any seeded working day
 
+    # --- booked: richer-intake slot-filling (extended booking flow) ---
+    dob_equals: str | None = None              # exact normalized MM/DD/YYYY in confirm_booking args
+    new_patient_expected: bool | None = None   # exact bool captured for new_patient
+    symptom_any: tuple[str, ...] = ()          # >=1 of these (lowercased) appears in symptom_notes
+    symptom_max_words: int | None = None       # PHI-minimization: symptom_notes stays this short
+
     # --- escalated ---
     require_zero_availability: bool = False    # must have seen a check_availability -> 0 slots
 
@@ -99,7 +105,10 @@ HAPPY_PATH: list[EvalCase] = [
         utterances=[
             "Hi, I'd like to book an appointment.",
             "My name is Jordan Alvarez.",
+            "March 15th, 1990.",
+            "I'm a new patient.",
             "It's just for a routine checkup.",
+            "Nothing specific, just my annual physical.",
             "Whatever you have soonest is fine.",
             "That works, let's do it.",
             "Yes, please book it.",
@@ -119,6 +128,9 @@ HAPPY_PATH: list[EvalCase] = [
             "I need to see someone about a sore throat.",
             "Yeah I'd like to book that.",
             "Priya Nair.",
+            "3/15/90.",
+            "I've been in before.",
+            "Just some throat pain and trouble swallowing.",
             f"Can I come in on {FIRST_OPEN_DAY.strftime('%A')}?",
             "Morning works better for me.",
             "Sure, that one's good.",
@@ -139,6 +151,9 @@ HAPPY_PATH: list[EvalCase] = [
             "I want to come in for a flu shot.",
             "Book an appointment, yes.",
             "Sam Okafor.",
+            "The fifth of June, nineteen eighty-five.",
+            "New patient, first time here.",
+            "Nothing's wrong, I just need my flu shot.",
             "Any day this week is fine, earliest you've got.",
             "Great, that time works.",
             "Yes.",
@@ -157,7 +172,10 @@ HAPPY_PATH: list[EvalCase] = [
         utterances=[
             "I'd like to schedule a follow-up visit.",
             "This is Dana Kim.",
-            "It's a follow-up from my last visit.",
+            "October 2nd, 1978.",
+            "I'm an existing patient — a follow-up from my last visit.",
+            "Still some knee soreness I want checked.",
+            "It's been aching when I go up stairs for about a week.",
             f"Do you have anything {FIRST_OPEN_DAY.strftime('%A')} around 9?",
             "If 9 is taken, the next closest works.",
             "Okay perfect, that one.",
@@ -169,6 +187,59 @@ HAPPY_PATH: list[EvalCase] = [
             reason_any=("follow", "follow-up"),
             booked_on_date=FIRST_OPEN_DAY.isoformat(),
         ),
+    ),
+    EvalCase(
+        id="hp_intake_new_patient_wordform",
+        category="happy_path",
+        description="New patient; DOB spoken in words must normalize to MM/DD/YYYY and be captured.",
+        utterances=[
+            "Hi, I'd like to book a checkup.",
+            "Avery Lindqvist.",
+            "The twenty-second of November, nineteen eighty-eight.",
+            "I'm a brand new patient.",
+            "It's a routine checkup.",
+            "Just want a general once-over, nothing's wrong.",
+            "Earliest you have is great.",
+            "That works.",
+            "Yes, book it.",
+        ],
+        expected=Expected(
+            outcome="booked",
+            name_contains="avery",
+            reason_any=("checkup", "routine"),
+            booked_within_seed_window=True,
+            dob_equals="11/22/1988",
+            new_patient_expected=True,
+            symptom_any=("check", "general", "once-over", "nothing"),
+        ),
+        notes="Verifies spoken-word DOB normalization + new_patient=True capture.",
+    ),
+    EvalCase(
+        id="hp_intake_existing_slashdob",
+        category="happy_path",
+        description="Existing patient; slash-form DOB captured; new_patient=False.",
+        utterances=[
+            "I need to book a follow-up.",
+            "Yes, an appointment.",
+            "Rosa Delgado.",
+            "04/09/1971.",
+            "I've been a patient here for years.",
+            "Follow-up on my blood pressure check.",
+            "My blood pressure's been running high and I want it rechecked.",
+            "Whatever's soonest works.",
+            "Sounds good.",
+            "Yes, confirm it.",
+        ],
+        expected=Expected(
+            outcome="booked",
+            name_contains="rosa",
+            reason_any=("follow", "follow-up"),
+            booked_within_seed_window=True,
+            dob_equals="04/09/1971",
+            new_patient_expected=False,
+            symptom_any=("blood pressure", "follow", "pressure"),
+        ),
+        notes="Verifies slash-form DOB capture + existing-patient (no early-arrival) path.",
     ),
 ]
 
@@ -185,6 +256,8 @@ EDGE_CASES: list[EvalCase] = [
         utterances=[
             f"Hi, this is Marcus Webb, I need a checkup and I'd like to come in "
             f"{FIRST_OPEN_DAY.strftime('%A')} morning if possible.",
+            "Sure — date of birth is 07/22/1992, and I'm a new patient.",
+            "Just a routine checkup, nothing's bothering me.",
             "Yes that time is good.",
             "Yes, book it.",
         ],
@@ -205,6 +278,8 @@ EDGE_CASES: list[EvalCase] = [
             "Oh, to book an appointment, yes.",
             "It's for a checkup.",
             "Lena Fischer is the name.",
+            "Born April 3rd, 1988, and I've been a patient here before.",
+            "Just a general check, feeling fine overall.",
             "Yes, the earliest tomorrow works.",
             "Yep, confirm it.",
         ],
@@ -248,10 +323,13 @@ EDGE_CASES: list[EvalCase] = [
         utterances=[
             "Booking an appointment, please.",
             "Omar Haddad.",
+            "12/30/1995.",
+            "New patient.",
             "A checkup.",
+            "No real symptoms, just overdue for a physical.",
             "What have you got tomorrow?",
             "Actually tomorrow's bad — what about the day after?",
-            "That one's fine.",
+            "The earliest one that day works.",
             "Yes, book it.",
         ],
         expected=Expected(
@@ -277,7 +355,10 @@ ADVERSARIAL: list[EvalCase] = [
             "uh yeah hi so like... i dunno, sometime next week i guess?",
             "oh, an appointment yeah",
             "uhh Riley",
+            "uh, birthday's like... may 9th, 1991 i think",
+            "yeah nah i've been here before",
             "just a normal checkup thing",
+            "eh nothing really, just feeling kinda run down",
             "yeah whatever's open, earliest",
             "sure that's fine",
             "yeah ok",
@@ -297,6 +378,9 @@ ADVERSARIAL: list[EvalCase] = [
         utterances=[
             "I need an appointment for a checkup.",
             "Nadia Sokolov.",
+            "Date of birth? August 14th, 1983.",
+            "I'm a returning patient.",
+            "Nothing wrong really, just my routine checkup.",
             "Let's do Tuesday — wait, no, make it Wednesday.",
             "Hmm actually, just give me the earliest you have any day.",
             "Okay that works.",
@@ -318,7 +402,9 @@ ADVERSARIAL: list[EvalCase] = [
             "What's your favorite color? Do you like pizza?",
             "haha okay okay. Actually, can I book an appointment?",
             "Gabriel Santos.",
+            "Sure, 11/11/1990. First time patient, by the way.",
             "A flu shot.",
+            "Nothing's wrong, just need the shot.",
             "Earliest available is fine.",
             "Yes, that works.",
             "Yes book it.",
@@ -363,9 +449,11 @@ ADVERSARIAL: list[EvalCase] = [
             "I need to book about my sore throat.",
             "Yes, book me in.",
             "Morgan Reyes.",
+            "June 6th, 1975. I'm an existing patient.",
             "It started after a long detailed story about my chronic condition and meds...",
-            "Earliest you have is fine.",
-            "Yes, that works.",
+            "Bottom line — my throat's been sore and scratchy for a few days.",
+            "Any day works, just the earliest slot you've got.",
+            "Yes, that time works.",
             "Yes, book it.",
         ],
         expected=Expected(
@@ -386,6 +474,34 @@ ADVERSARIAL: list[EvalCase] = [
         ],
         expected=Expected(outcome="escalated"),
         notes="Explicit human-handoff request is a global escalation intent.",
+    ),
+    EvalCase(
+        id="ad_intake_symptom_minimization",
+        category="adversarial",
+        description="Caller volunteers a long medical narrative; symptom_notes must stay brief.",
+        utterances=[
+            "I want to book about a sore throat.",
+            "Yes please.",
+            "Devon Marsh.",
+            "02/17/1969.",
+            "Existing patient.",
+            "Well it all started three weeks ago after my flight, then my sinuses, and "
+            "my old prescription from Dr. So-and-so, and my cousin had the same thing, and...",
+            "Earliest is fine.",
+            "Yes, that works.",
+            "Yes, book it.",
+        ],
+        expected=Expected(
+            outcome="booked",
+            name_contains="devon",
+            reason_any=("throat", "sore throat", "sick"),
+            booked_within_seed_window=True,
+            dob_equals="02/17/1969",
+            new_patient_expected=False,
+            symptom_any=("throat", "sinus"),
+            symptom_max_words=25,
+        ),
+        notes="PHI minimization on the new symptom field: capture a coarse note, not the saga.",
     ),
 ]
 

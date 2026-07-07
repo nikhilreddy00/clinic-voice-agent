@@ -158,8 +158,9 @@ def confirm_booking(req: ConfirmRequest) -> ConfirmResponse:
         )
         conn.execute(
             """
-            INSERT INTO bookings (confirmation_id, slot_id, patient_name, reason, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO bookings (confirmation_id, slot_id, patient_name, reason, created_at,
+                                  date_of_birth, new_patient, symptom_notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 confirmation_id,
@@ -167,6 +168,9 @@ def confirm_booking(req: ConfirmRequest) -> ConfirmResponse:
                 req.patient_name,
                 req.reason,
                 db._now().isoformat(),
+                req.date_of_birth,
+                req.new_patient,
+                req.symptom_notes,
             ),
         )
         conn.commit()
@@ -176,6 +180,9 @@ def confirm_booking(req: ConfirmRequest) -> ConfirmResponse:
             provider_name=row["provider_name"],
             start_time=row["start_time"],
             patient_name=req.patient_name,
+            date_of_birth=req.date_of_birth,
+            new_patient=req.new_patient,
+            symptom_notes=req.symptom_notes,
         )
     finally:
         conn.close()

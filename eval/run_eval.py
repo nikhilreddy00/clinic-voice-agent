@@ -411,6 +411,34 @@ def _check_slot_filling(exp: Expected, trace: Trace, seed_dates: set[str],
         ok = False
         reasons.append(f"date outside seed window: booked {booked_date}")
 
+    # --- richer-intake fields (extended booking flow) -----------------------------------
+    # dob_equals is an EXACT normalized-string check on purpose: it verifies the LLM turned
+    # whatever spoken form the caller used into MM/DD/YYYY. Flakiness here is real signal.
+    if exp.dob_equals is not None:
+        dob = args.get("date_of_birth")
+        if dob != exp.dob_equals:
+            ok = False
+            reasons.append(f"DOB mismatch: booked {dob!r}, expected exactly {exp.dob_equals!r}")
+
+    if exp.new_patient_expected is not None:
+        got_new = args.get("new_patient")
+        if bool(got_new) != exp.new_patient_expected or got_new is None:
+            ok = False
+            reasons.append(f"new_patient mismatch: booked {got_new!r}, "
+                           f"expected {exp.new_patient_expected}")
+
+    symptom = (args.get("symptom_notes") or "")
+    if exp.symptom_any and not any(k.lower() in symptom.lower() for k in exp.symptom_any):
+        ok = False
+        reasons.append(f"symptom mismatch: booked {symptom!r}, "
+                       f"expected one of {exp.symptom_any}")
+    if exp.symptom_max_words is not None:
+        n_words = len(symptom.split())
+        if n_words > exp.symptom_max_words:
+            ok = False
+            reasons.append(f"symptom too long ({n_words} words > {exp.symptom_max_words}): "
+                           f"{symptom!r} — should be a brief note, not a medical narrative")
+
     return ok
 
 
