@@ -91,19 +91,20 @@ renumbered to what's actually left.)
   (tool-trace) scoring. ✅
 - **Phase 4 — Dialogue/API defect fixes + barge-in.** Five target fixes (see
   `docs/build_spec.md`) + turn-taking / interruption handling with a false-positive metric. ✅
-
-**In progress:**
-
-- **Phase 5 — Telephony.** ⏳ Wired; pending live-call verification. Real inbound phone number
-  via LiveKit SIP (free tier, `+14842950169`), with a `MODE=local|telephony` runtime switch, an
-  idempotent SIP trunk + Direct-dispatch setup script (`agent/scripts/setup_livekit_sip.py` →
-  room `clinic-inbound`), and the AI disclosure + call-recording consent delivered in the
-  greeting on the telephony path. Marked done only after a live call connects end to end.
+- **Phase 5 — Telephony.** Real inbound phone number via LiveKit SIP (free tier,
+  `+14842950169`), `MODE=local|telephony` runtime switch, idempotent SIP trunk + Direct-dispatch
+  setup script (`agent/scripts/setup_livekit_sip.py` → room `clinic-inbound`), AI disclosure +
+  call-recording consent in the greeting on the telephony path. **Verified end to end** —
+  multiple live inbound calls connected and booked appointments. ✅
+- **Phase 6 — Observability + Docker + demo.** Per-turn latency (P50/P95/P99), ASR confidence,
+  tool-success + outcome metrics via a structured JSONL sink (`logs/calls.jsonl`) alongside the
+  console logs; `GET /metrics` + a `/dashboard` on the scheduling API; both services Dockerized
+  (`docker compose up`) with a shared logs volume; `start_demo.sh` one-command host launcher +
+  ngrok for public dashboard access. **Real numbers captured on a live call** (see
+  `docs/build_spec.md` → *Phase 6*). No cloud deployment — the demo runs the agent locally
+  (outbound to LiveKit) and uses ngrok only to expose the dashboard. ✅
 
 **Remaining:**
-- **Phase 6 — Observability + deployment.** Per-turn latency (P50/P95/P99), ASR confidence,
-  tool-success and outcome metrics, structured logs / dashboard; Dockerize (1 container per
-  session); deploy to Fly.io or Render.
 - **Phase 7 — README + demo.** Architecture diagram, eval results, latency percentiles, a
   recorded call demo, and a callable number.
 
@@ -145,10 +146,28 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phase 4 complete.** Phases 0–3 (scaffold + mock API, live ASR→LLM→TTS loop, scheduling-API
-tool calls, dialogue hardening + headless eval) are done. Phase 4 fixed all five confirmed
-defects from the Phase-4 target list in [`docs/build_spec.md`](docs/build_spec.md) and added
-barge-in:
+**Phase 6 complete.** Phases 0–5 are done (scaffold + mock API, live ASR→LLM→TTS loop,
+scheduling-API tool calls, dialogue hardening + headless eval, barge-in, and LiveKit SIP
+telephony verified end to end by live inbound calls). Phase 6 added observability, Docker, and
+the demo launcher:
+
+- **Per-turn latency + outcomes** (`agent/src/clinic_agent/metrics.py`): a `LatencyCollector` fed
+  by three pass-through `MetricsTap` processors (after STT/LLM/TTS) writes a structured JSONL sink
+  (`logs/calls.jsonl`) *alongside* the console logs — ASR/LLM/TTS/E2E latency, ASR confidence,
+  per-tool outcomes, and a per-call P50/P95/P99 summary (also printed as a human `[session]` line
+  on hangup). The VAD-silence boundary is `VADUserStoppedSpeakingFrame` (NOT
+  `UserStoppedSpeakingFrame` — the wrong class silently records `turns=0`; guarded by a canary
+  test). Idle-timeout is disabled on the telephony path so the agent waits for an inbound call.
+- **Dashboard**: `GET /metrics` aggregates the log; `/dashboard` (served same-origin, vanilla JS)
+  shows the percentile table, outcomes, ASR confidence, tool success, and last-5 calls.
+- **Docker + demo**: `agent/Dockerfile`, `scheduling_api/Dockerfile`, `docker-compose.yml`
+  (shared logs volume, secrets via `env_file`), and `start_demo.sh` (host launcher: API + agent
+  in `MODE=telephony` + optional ngrok). **Live-call numbers captured** (E2E p50 ≈ 4.1 s, LLM the
+  dominant stage — see `docs/build_spec.md` → *Phase 6*). Docker files are validated but not
+  locally built (Docker not installed on the dev machine).
+
+**Earlier phases (recap).** Phase 4 fixed all five confirmed defects from the Phase-4 target list
+in [`docs/build_spec.md`](docs/build_spec.md) and added barge-in:
 
 - **Five targets fixed** (date-grounding via an injected date→weekday table; past-time slot
   filter in `scheduling_api`; mid-flow slot tracking + single confirmation gate; empty-window
@@ -164,10 +183,12 @@ barge-in:
   End-to-end barge-in is audio-timing behavior and is verified on a live mic, not in the headless
   eval; the gate's decision logic has unit tests (`agent/tests/test_barge_in.py`).
 
-**In progress: Phase 5 — telephony** (LiveKit SIP, `+14842950169`). Code wired: `MODE` switch
-in `config.py`/`pipeline.py` (default `local`), LiveKit transport + join-token in `pipeline.py`,
+**Phase 5 — telephony (done)** (LiveKit SIP, `+14842950169`): `MODE` switch in
+`config.py`/`pipeline.py` (default `local`), LiveKit transport + join-token in `pipeline.py`,
 telephony greeting with consent + explicit PII-minimization rule in `prompts.py`, and the
 idempotent `agent/scripts/setup_livekit_sip.py` (Direct dispatch → room `clinic-inbound`).
-All 10 unit tests pass and both transports build. **Pending: a live call to verify end-to-end
-audio** before marking Phase 5 complete. Observability + deployment is Phase 6; README + demo
-is Phase 7.
+Verified by live inbound calls that connected, ran the full booking flow, and returned a
+confirmation number.
+
+**Next: Phase 7 — README + demo** (architecture diagram, eval results, latency percentiles from
+the Phase-6 live call, recorded demo, callable number). Not started.

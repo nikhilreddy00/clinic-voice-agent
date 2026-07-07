@@ -1,0 +1,11 @@
+# Keep the build context small and reproducible.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+tests/
+*.db
+*.sqlite*
+.env
+.env.*

@@ -1,0 +1,40 @@
+# One-command local start for the whole stack: `docker compose up --build`.
+#
+#   scheduling_api  — FastAPI mock backend + /metrics + /dashboard, published on :8000
+#   agent           — Pipecat voice agent in MODE=telephony (inbound LiveKit SIP calls)
+#
+# The agent reaches the API by its compose service name (scheduling_api), never localhost.
+# Secrets live only in the git-ignored agent/.env (loaded via env_file) — none are baked into
+# an image. logs/ is a shared bind mount: the agent writes calls.jsonl, the API reads it for the
+# dashboard.
+
+services:
+  scheduling_api:
+    build: ./scheduling_api
+    ports:
+      - "8000:8000"
+    environment:
+      CLINIC_LOG_DIR: /logs
+      CLINIC_DASHBOARD_DIR: /app/dashboard
+    volumes:
+      - ./logs:/logs                 # read the agent's calls.jsonl
+      - ./dashboard:/app/dashboard:ro # serve the static dashboard at /dashboard
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  agent:
+    build: ./agent
+    env_file:
+      - ./agent/.env                 # DEEPGRAM/ANTHROPIC/CARTESIA/LIVEKIT keys (git-ignored)
+    environment:
+      MODE: telephony
+      SCHEDULING_API_BASE_URL: http://scheduling_api:8000
+      CLINIC_LOG_DIR: /logs
+    volumes:
+      - ./logs:/logs                 # write calls.jsonl for the API to read
+    depends_on:
+      scheduling_api:
+        condition: service_healthy

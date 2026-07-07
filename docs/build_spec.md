@@ -302,3 +302,111 @@ Local dev is unchanged: omit `MODE` (defaults to `local`) to use the laptop mic/
   endpoint, so a returning caller re-collects intake and books a fresh slot rather than amending
   an existing appointment. **Deferred:** add a patient/appointment lookup endpoint if reschedule
   flows are needed.
+
+## Phase 6 — Observability, Docker, and the ngrok demo
+
+Phase 6 makes the running agent measurable and packageable: structured per-turn latency logging,
+a live dashboard, container images, and a one-command demo launcher. No cloud deployment — the
+demo runs the agent locally (it reaches LiveKit Cloud outbound) and uses **ngrok** only to expose
+the dashboard/API publicly.
+
+### Observability — per-turn latency + call outcomes
+
+The agent writes newline-delimited JSON to **`logs/calls.jsonl`** (one object per event), *alongside*
+the existing human-readable console logs (`ASR ▶ / LLM ▶ / TOOL ▶ / TTS ▶`) — the JSON is an added
+sink, not a replacement. Instrumentation lives in `agent/src/clinic_agent/metrics.py`
+(`LatencyCollector` + three `MetricsTap` pass-through processors inserted after STT, LLM, and TTS);
+the taps never mutate or drop a frame.
+
+A **turn** spans the caller's VAD silence to the first audio frame of the bot's reply. Four
+latencies are captured per turn from the Pipecat frame stream:
+
+| Metric | Boundary (frame → frame) |
+|--------|--------------------------|
+| `asr_ms` | `VADUserStoppedSpeakingFrame` → final `TranscriptionFrame` |
+| `llm_ms` | final `TranscriptionFrame` → first `LLMTextFrame` **or** first `FunctionCallInProgressFrame` |
+| `tts_ms` | last `LLMFullResponseEndFrame` → first `OutputAudioRawFrame` |
+| `e2e_ms` | `VADUserStoppedSpeakingFrame` → first `OutputAudioRawFrame` (voice-to-voice) |
+
+> The VAD-silence boundary is Pipecat's `VADUserStoppedSpeakingFrame` (emitted by the in-pipeline
+> `VADProcessor`), *not* the higher-level `UserStoppedSpeakingFrame` — a distinction that matters:
+> using the wrong class silently records zero turns.
+
+Deltas use `time.monotonic()`. Each turn record also carries **ASR confidence** (Deepgram's
+`result.channel.alternatives[0].confidence`, or `null` if not surfaced — a one-time session warning
+fires if it's never present) and `had_tool_call`. Each scheduling-tool call emits a `tool` event
+(`endpoint`, `http_status`, `latency_ms`, `success`). At hangup a `call_summary` event records the
+**outcome** and **P50/P95/P99** for all four stages, and the agent also prints a human-readable
+console line, e.g.:
+
+```
+[session] outcome=booked turns=6 | ASR p50=210ms p95=340ms | LLM p50=480ms p95=720ms | TTS p50=320ms p95=450ms | E2E p50=1010ms p95=1340ms
+```
+
+Two honesty caveats (surfaced in the dashboard footnotes too):
+
+- **Outcome is heuristic-based:** `booked` = a `confirm_booking` succeeded; `escalated` = availability
+  came back empty and the agent handed off; `abandoned` = the call ended with neither. It approximates
+  intent; it doesn't read it.
+- **`llm_ms` on tool-call turns ends at the *first tool call*,** not the final spoken response, so those
+  turns show a lower LLM figure than the caller feels. **`e2e_ms` is the honest number on tool-call turns.**
+
+`logs/calls.jsonl` is a runtime artifact (git-ignored), and `logs/` is shared between the agent
+(writer) and the API (reader) via the repo-root `logs/` dir — overridable with `CLINIC_LOG_DIR`
+(set to a shared volume under Docker).
+
+### Dashboard — `GET /metrics` + `/dashboard`
+
+The scheduling API gained two routes (`scheduling_api/app/metrics.py` + `main.py`):
+
+- **`GET /metrics`** reads `logs/calls.jsonl` and returns aggregated stats — P50/P95/P99 per stage,
+  ASR confidence avg/min/max, tool-call success + per-endpoint P50, outcome counts, and the last 5
+  calls. A missing/empty log yields a valid zeroed payload (never a 500).
+- **`GET /dashboard/`** serves `dashboard/index.html` (plain HTML + vanilla JS, no framework),
+  mounted same-origin so it just fetches `/metrics` (no CORS). It auto-refreshes every 5 s, so a call
+  in progress shows up live. Screenshot-friendly for the README.
+
+### Docker (`docker compose up`)
+
+Both services are containerized: `scheduling_api/Dockerfile`, `agent/Dockerfile` (defaults to
+`MODE=telephony`; the agent installs PortAudio because Pipecat's `[local]` extra imports PyAudio at
+module load even in telephony mode), and a root **`docker-compose.yml`**. One command starts the whole
+stack:
+
+```bash
+docker compose up --build
+```
+
+The API is published on `:8000`; the agent reaches it by the compose **service name**
+(`SCHEDULING_API_BASE_URL=http://scheduling_api:8000`), never localhost. Secrets come only from the
+git-ignored `agent/.env` (loaded via `env_file`) — nothing secret is baked into an image (see each
+`.dockerignore`, which excludes `.env`). `logs/` is a shared bind mount so the agent writes
+`calls.jsonl` and the API reads it. (For **concurrent** calls, switch the LiveKit dispatch rule from
+Direct to Individual and run one agent container per room — see the "one container per session" note
+in CLAUDE.md; the single-room demo does not need this.)
+
+> **Known limitation — Docker not locally tested.** The Docker files are present and validated
+> (compose config parses; Dockerfiles follow the standard uv build) but **not locally tested
+> (Docker not installed on the dev machine due to storage constraints).** Containerized deployment
+> is documented for production use; the live demo runs on the host via `start_demo.sh`, which *is*
+> fully tested.
+
+### Demo startup sequence
+
+For a live demo, run the agent on the host (`start_demo.sh`) rather than in Docker — it reaches
+LiveKit Cloud outbound and needs no inbound tunnel. **`./start_demo.sh`** does steps 1–3 in one
+command and prints the dashboard URL (and the public ngrok URL if ngrok is already running):
+
+1. **Start the scheduling API** (`:8000`, with `/metrics` + `/dashboard`).
+2. **Start the agent** in `MODE=telephony` (joins LiveKit room `clinic-inbound`, waits for the call).
+3. **Optional — expose the dashboard publicly:** `ngrok http 8000` in another terminal. ngrok is only
+   for public dashboard/API access; the agent itself needs no tunnel.
+4. **Call `+14842950169`.** The per-call session summary (P50/P95/P99) is written to `logs/calls.jsonl`
+   and printed to the console the moment the caller hangs up; the dashboard reflects it within 5 s.
+
+```bash
+./start_demo.sh        # API + agent (MODE=telephony); Ctrl-C stops both
+# optional, separate terminal:
+ngrok http 8000        # public dashboard at https://<sub>.ngrok-free.app/dashboard/
+# then call +14842950169
+```

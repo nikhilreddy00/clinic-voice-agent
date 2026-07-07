@@ -10,13 +10,17 @@ Storage is SQLite (see app/db.py). All data is synthetic — no real PHI.
 
 from __future__ import annotations
 
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .metrics import aggregate_metrics
 from .models import (
     AvailabilityResponse,
     ConfirmRequest,
@@ -44,6 +48,26 @@ app = FastAPI(
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "clinic": CLINIC_NAME}
+
+
+@app.get("/metrics")
+def metrics() -> dict:
+    """Aggregate the agent's call log (logs/calls.jsonl) for the dashboard (Phase 6).
+
+    Latency P50/P95/P99 per stage, ASR confidence, tool-call outcomes, call outcomes, and the
+    last five calls. Returns a zeroed-but-valid payload when no calls have been logged yet.
+    """
+    return aggregate_metrics()
+
+
+# Serve the observability dashboard same-origin with /metrics so the page needs no CORS and no
+# configured API base — it just fetches "/metrics". dashboard/ lives at the repo root in local
+# dev; CLINIC_DASHBOARD_DIR overrides the location inside the container image.
+_DASHBOARD_DIR = Path(
+    os.getenv("CLINIC_DASHBOARD_DIR", str(Path(__file__).resolve().parents[2] / "dashboard"))
+)
+if _DASHBOARD_DIR.is_dir():
+    app.mount("/dashboard", StaticFiles(directory=_DASHBOARD_DIR, html=True), name="dashboard")
 
 
 @app.get("/availability", response_model=AvailabilityResponse)

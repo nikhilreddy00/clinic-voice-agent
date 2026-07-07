@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clinic Voice Agent — Observability</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --ink: #1a1d21; --muted: #6b7280;
+      --line: #e5e7eb; --accent: #2563eb; --ok: #059669; --warn: #d97706; --bad: #dc2626;
+      --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 16px rgba(0,0,0,.05);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1115; --panel: #171a21; --ink: #e6e8eb; --muted: #9aa1ac;
+        --line: #262b34; --accent: #60a5fa; --ok: #34d399; --warn: #fbbf24; --bad: #f87171;
+        --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 20px rgba(0,0,0,.35);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 32px 20px 64px; }
+    header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+    h1 { font-size: 22px; margin: 0; letter-spacing: -.01em; }
+    .sub { color: var(--muted); font-size: 13px; }
+    #updated { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    section { margin-top: 28px; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+    thead th { font-size: 12px; color: var(--muted); font-weight: 600; }
+    tbody tr:last-child td { border-bottom: none; }
+    td.num, th.num { text-align: right; }
+    .stage { font-weight: 600; }
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+    .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); padding: 16px 18px; }
+    .tile .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .tile .v { font-size: 28px; font-weight: 650; margin-top: 6px; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+    .tile .v small { font-size: 14px; color: var(--muted); font-weight: 500; }
+    .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+    .pill.booked { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+    .pill.escalated { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+    .pill.abandoned { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+    .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+    .note b { color: var(--ink); font-weight: 600; }
+    .empty { color: var(--muted); padding: 16px; font-size: 14px; }
+    .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background: var(--ok); margin-right:6px; vertical-align: middle; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; background: color-mix(in srgb, var(--ink) 7%, transparent); padding: 1px 5px; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Clinic Voice Agent — Observability</h1>
+        <div class="sub">Per-turn latency, ASR confidence, and call outcomes across all logged calls.</div>
+      </div>
+      <div id="updated">loading…</div>
+    </header>
+
+    <section>
+      <h2>Voice-to-voice latency (milliseconds)</h2>
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th>Stage</th><th class="num">P50</th><th class="num">P95</th><th class="num">P99</th><th class="num">Turns</th>
+            </tr>
+          </thead>
+          <tbody id="latency-body"></tbody>
+        </table>
+      </div>
+      <div class="note">
+        <b>End-to-end</b> = caller silence → first audio out (the honest voice-to-voice number).
+        On turns where the agent calls a scheduling tool, <b>LLM</b> latency ends at the first tool
+        call — not the final spoken response — so those turns show a lower LLM figure than the caller
+        actually experiences. <b>E2E is the number to trust on tool-call turns.</b>
+      </div>
+    </section>
+
+    <section>
+      <h2>Call outcomes &amp; ASR confidence</h2>
+      <div class="tiles" id="tiles"></div>
+      <div class="note">
+        Outcome is <b>heuristic-based</b>: <b>booked</b> = a booking was confirmed;
+        <b>escalated</b> = availability came back empty and the agent handed off;
+        <b>abandoned</b> = the call ended with neither. It approximates intent, it doesn't read it.
+      </div>
+    </section>
+
+    <section>
+      <h2>Tool calls (agent → scheduling API)</h2>
+      <div class="panel">
+        <table>
+          <thead>
+            <tr><th>Endpoint</th><th class="num">Calls</th><th class="num">Success</th><th class="num">P50 ms</th></tr>
+          </thead>
+          <tbody id="tool-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recent calls (last 5)</h2>
+      <div class="panel">
+        <table>
+          <thead>
+            <tr><th>When</th><th>Mode</th><th>Outcome</th><th class="num">Turns</th><th class="num">E2E P50 ms</th></tr>
+          </thead>
+          <tbody id="recent-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const STAGES = [["asr","ASR (Deepgram)"],["llm","LLM (Claude)"],["tts","TTS (Cartesia)"],["e2e","End-to-end"]];
+    const fmt = v => (v === null || v === undefined) ? "—" : v.toLocaleString();
+    const fmtConf = v => (v === null || v === undefined) ? "—" : v.toFixed(3);
+
+    function fmtTime(iso) {
+      if (!iso) return "—";
+      const d = new Date(iso);
+      return isNaN(d) ? iso : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    }
+
+    function renderLatency(m) {
+      const body = document.getElementById("latency-body");
+      body.innerHTML = STAGES.map(([key, label]) => {
+        const p = m.latency_ms[key] || {};
+        return `<tr>
+          <td class="stage">${label}</td>
+          <td class="num">${fmt(p.p50)}</td>
+          <td class="num">${fmt(p.p95)}</td>
+          <td class="num">${fmt(p.p99)}</td>
+          <td class="num">${fmt(p.count)}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function renderTiles(m) {
+      const o = m.outcomes, c = m.asr_confidence, t = m.tool_calls;
+      const rate = t.success_rate === null ? "—" : (t.success_rate * 100).toFixed(0) + "%";
+      const tiles = [
+        { k: "Calls logged", v: fmt(m.calls_total) },
+        { k: "Turns logged", v: fmt(m.turns_total) },
+        { k: "Booked", v: `<span class="pill booked">${fmt(o.booked)}</span>` },
+        { k: "Escalated", v: `<span class="pill escalated">${fmt(o.escalated)}</span>` },
+        { k: "Abandoned", v: `<span class="pill abandoned">${fmt(o.abandoned)}</span>` },
+        { k: "ASR confidence", v: `${fmtConf(c.avg)} <small>avg · ${fmtConf(c.min)}–${fmtConf(c.max)}</small>` },
+        { k: "Tool success", v: `${rate} <small>${fmt(t.success)}/${fmt(t.total)}</small>` },
+      ];
+      document.getElementById("tiles").innerHTML = tiles.map(
+        t => `<div class="tile"><div class="k">${t.k}</div><div class="v">${t.v}</div></div>`
+      ).join("");
+    }
+
+    function renderTools(m) {
+      const body = document.getElementById("tool-body");
+      const eps = Object.entries(m.tool_calls.by_endpoint || {});
+      if (!eps.length) { body.innerHTML = `<tr><td colspan="4" class="empty">No tool calls logged yet.</td></tr>`; return; }
+      body.innerHTML = eps.map(([ep, s]) =>
+        `<tr><td><code>${ep}</code></td><td class="num">${fmt(s.total)}</td>
+         <td class="num">${fmt(s.success)}/${fmt(s.total)}</td><td class="num">${fmt(s.p50_ms)}</td></tr>`
+      ).join("");
+    }
+
+    function renderRecent(m) {
+      const body = document.getElementById("recent-body");
+      if (!m.recent_calls.length) { body.innerHTML = `<tr><td colspan="5" class="empty">No calls logged yet — start the agent and place a call.</td></tr>`; return; }
+      body.innerHTML = m.recent_calls.map(c =>
+        `<tr><td>${fmtTime(c.ts)}</td><td>${c.mode || "—"}</td>
+         <td><span class="pill ${c.outcome}">${c.outcome || "—"}</span></td>
+         <td class="num">${fmt(c.turns)}</td><td class="num">${fmt(c.e2e_p50)}</td></tr>`
+      ).join("");
+    }
+
+    async function load() {
+      try {
+        const res = await fetch("/metrics", { cache: "no-store" });
+        const m = await res.json();
+        renderLatency(m); renderTiles(m); renderTools(m); renderRecent(m);
+        document.getElementById("updated").innerHTML =
+          `<span class="dot"></span>updated ${new Date().toLocaleTimeString()}`;
+      } catch (e) {
+        document.getElementById("updated").textContent = "could not reach /metrics";
+      }
+    }
+    load();
+    setInterval(load, 5000); // live-refresh so a call in progress shows up during a demo
+  </script>
+</body>
+</html>

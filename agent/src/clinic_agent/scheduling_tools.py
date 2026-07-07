@@ -24,7 +24,9 @@ and recover (re-offer / escalate) instead of the turn crashing.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import httpx
 from loguru import logger
@@ -32,6 +34,9 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams, LLMService
+
+if TYPE_CHECKING:
+    from .metrics import LatencyCollector
 
 # Coarse, non-clinical reason categories a slot can be tagged with. Mirrors
 # scheduling_api/app/seed_data.py REASON_CATEGORIES — the API filters on these exact values.
@@ -159,8 +164,28 @@ class SchedulingClient:
 # availability/hold/booking data and speaks from it — no manual context editing here.
 
 
-def register_scheduling_functions(llm: LLMService, client: SchedulingClient) -> None:
-    """Register the three scheduling functions on the LLM service."""
+def _tool_http_status(result: dict) -> int | None:
+    """Best-effort HTTP status for a tool result (for the metrics sink).
+
+    The client returns LLM-friendly dicts, not responses: success dicts carry no status (the call
+    was 2xx), error dicts set `status` only for the 404/409 cases we special-case. So map ok→200,
+    a set `status`→itself, and an unmapped failure (transport error)→None.
+    """
+    if result.get("ok"):
+        return 200
+    return result.get("status")
+
+
+def register_scheduling_functions(
+    llm: LLMService,
+    client: SchedulingClient,
+    collector: "LatencyCollector | None" = None,
+) -> None:
+    """Register the three scheduling functions on the LLM service.
+
+    `collector` (Phase 6, optional) receives a `tool` metrics event per call — endpoint, HTTP
+    status, latency, success — and an escalation mark when availability comes back empty.
+    """
 
     async def check_availability(params: FunctionCallParams) -> None:
         args = params.arguments or {}
@@ -171,7 +196,13 @@ def register_scheduling_functions(llm: LLMService, client: SchedulingClient) -> 
             f"TOOL ▶ GET /availability req={{date={date!r}, reason={reason!r}, "
             f"provider_id={provider_id!r}}}"
         )
+        _t0 = time.monotonic()
         result = await client.get_availability(date=date, reason=reason, provider_id=provider_id)
+        if collector:
+            collector.record_tool(
+                "/availability", _tool_http_status(result),
+                (time.monotonic() - _t0) * 1000, bool(result.get("ok")),
+            )
         if not result.get("ok"):
             logger.warning(f"TOOL ▶ GET /availability FAILED → {result.get('error')!r}")
         elif result["count"] == 0:
@@ -182,6 +213,8 @@ def register_scheduling_functions(llm: LLMService, client: SchedulingClient) -> 
                 "TOOL ▶ GET /availability → 0 slots (no availability) — agent will ESCALATE: "
                 "spoken hand-off message only, no human transfer until Phase 7"
             )
+            if collector:
+                collector.mark_escalation()  # overridden by a later successful confirm_booking
         else:
             preview = ", ".join(
                 f"#{s['slot_id']} {s['display_time']} ({s['provider_name']})"
@@ -195,7 +228,13 @@ def register_scheduling_functions(llm: LLMService, client: SchedulingClient) -> 
         args = params.arguments or {}
         slot_id = args.get("slot_id")
         logger.info(f"TOOL ▶ POST /hold-slot req={{slot_id={slot_id!r}}}")
+        _t0 = time.monotonic()
         result = await client.hold_slot(slot_id=slot_id)
+        if collector:
+            collector.record_tool(
+                "/hold-slot", _tool_http_status(result),
+                (time.monotonic() - _t0) * 1000, bool(result.get("ok")),
+            )
         if result.get("ok"):
             logger.info(
                 f"TOOL ▶ POST /hold-slot → held slot {result['slot_id']} "
@@ -222,6 +261,7 @@ def register_scheduling_functions(llm: LLMService, client: SchedulingClient) -> 
             f"dob={'set' if date_of_birth else 'unset'}, new_patient={new_patient!r}, "
             f"symptom_notes_len={len(symptom_notes) if symptom_notes else 0}}}"
         )
+        _t0 = time.monotonic()
         result = await client.confirm_booking(
             hold_id=hold_id,
             patient_name=patient_name,
@@ -230,6 +270,11 @@ def register_scheduling_functions(llm: LLMService, client: SchedulingClient) -> 
             new_patient=new_patient,
             symptom_notes=symptom_notes,
         )
+        if collector:
+            collector.record_tool(
+                "/confirm-booking", _tool_http_status(result),
+                (time.monotonic() - _t0) * 1000, bool(result.get("ok")),
+            )
         if result.get("ok"):
             logger.info(
                 f"TOOL ▶ POST /confirm-booking → BOOKED confirmation_id={result['confirmation_id']} "

@@ -83,6 +83,7 @@ from .config import (
     require_phase1_keys,
     require_telephony_keys,
 )
+from .metrics import LatencyCollector, MetricsTap
 from .prompts import build_phase2_system_prompt, greeting_for
 from .scheduling_tools import (
     SchedulingClient,
@@ -374,11 +375,18 @@ async def run_agent() -> None:
         f"cartesia_tts={OUTPUT_SAMPLE_RATE} Hz (resample on playback path should be a no-op)"
     )
 
+    # --- Observability (Phase 6) ---------------------------------------------------------
+    # One collector per call: MetricsTap processors (inserted in the pipeline below) report the
+    # per-turn latency boundaries into it, the scheduling-tool handlers report tool outcomes, and
+    # finalize() writes the P50/P95/P99 session summary at hangup. Runs alongside the console logs.
+    metrics = LatencyCollector(mode=settings.mode)
+    logger.info(f"[metrics] structured latency log → {metrics.log_path} (call_id={metrics.call_id})")
+
     # --- Scheduling-API tools (Phase 2) --------------------------------------------------
     # The LLM decides when to call these; the client is the HTTP plumbing to the mock API.
     scheduling_client = SchedulingClient(settings.scheduling_api_base_url)
     tools = build_tools_schema()
-    register_scheduling_functions(llm, scheduling_client)
+    register_scheduling_functions(llm, scheduling_client, collector=metrics)
     logger.info(
         f"[tools] registered scheduling functions (check_availability, hold_slot, "
         f"confirm_booking) → {settings.scheduling_api_base_url}"
@@ -417,10 +425,17 @@ async def run_agent() -> None:
             vad,
             stt,
             StageLogger(log_asr=True, name="asr-logger"),
+            # metrics-asr sits BEFORE the user aggregator so it sees the final TranscriptionFrame
+            # (and UserStoppedSpeakingFrame) before the aggregator consumes them.
+            MetricsTap(metrics, name="metrics-asr"),
             aggregators.user(),
             llm,
             StageLogger(log_llm=True, name="llm-logger"),
+            MetricsTap(metrics, name="metrics-llm"),
             tts,
+            # metrics-tts sits between TTS and the transport so it timestamps the first audio
+            # frame of the reply (turn end) before it leaves for the speaker/SIP egress.
+            MetricsTap(metrics, name="metrics-tts"),
             transport.output(),
             aggregators.assistant(),
         ]
@@ -432,6 +447,11 @@ async def run_agent() -> None:
             enable_metrics=True,
             audio_out_sample_rate=OUTPUT_SAMPLE_RATE,
         ),
+        # Telephony waits (possibly minutes) for an inbound call with no audio flowing. Pipecat's
+        # default 300s idle timeout would cancel the worker before the caller ever dials, so
+        # disable idle cancellation on the telephony path — the agent must wait indefinitely for
+        # the inbound SIP call. Local mic keeps the default safety timeout.
+        idle_timeout_secs=None if telephony else 300,
     )
 
     # --- Greeting trigger (mode-dependent event) -----------------------------------------
@@ -460,6 +480,14 @@ async def run_agent() -> None:
             logger.info(f"[telephony] caller joined room (participant={participant_id})")
             await _speak_greeting()
 
+        @transport.event_handler("on_participant_disconnected")
+        async def _finalize_on_hangup(_transport: BaseTransport, participant_id: str) -> None:
+            # Caller hung up: write the session summary right now so the P50/P95/P99 console line
+            # lands at the moment the call ends (finalize() is idempotent — the finally-block
+            # call below is a no-op after this).
+            logger.info(f"[telephony] caller left room (participant={participant_id})")
+            metrics.finalize()
+
     else:
 
         @worker.event_handler("on_pipeline_started")
@@ -481,6 +509,7 @@ async def run_agent() -> None:
             f"real={stats['bargein_true']}, false-positive={stats['bargein_false']}, "
             f"suppressed_echo_frames={stats['suppressed_frames']}"
         )
+        metrics.finalize()  # write the latency/outcome session summary (idempotent)
         await scheduling_client.aclose()  # close the HTTP client even on Ctrl-C / error
 
 

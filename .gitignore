@@ -18,6 +18,11 @@ venv/
 *.sqlite
 *.sqlite3
 
+# Runtime observability log (Phase 6) — the agent appends per-turn/call metrics here.
+# It's a runtime artifact, not source; the /metrics endpoint reads it live.
+logs/calls.jsonl
+logs/
+
 # Audio artifacts
 *.wav
 *.mp3
