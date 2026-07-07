@@ -55,6 +55,6 @@ Interactive docs at http://127.0.0.1:8000/docs once the server is running.
 
 ```bash
 cd agent
-cp .env.example .env    # fill in Deepgram / Groq / Cartesia / LiveKit keys
+# create agent/.env with your Deepgram / Groq / Cartesia / LiveKit keys
 # uv sync + implementation land in Phase 1
 ```

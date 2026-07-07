@@ -60,7 +60,6 @@ state — is in [`docs/build_spec.md`](docs/build_spec.md).
 ├── docs/build_spec.md         # dialogue state machine spec
 ├── agent/                     # Pipecat voice-agent service (SKELETON until Phase 1)
 │   ├── pyproject.toml         # deps pinned; NOT installed in Phase 0
-│   ├── .env.example           # API-key placeholders
 │   └── src/clinic_agent/
 │       ├── pipeline.py        # TODO-marked pipeline skeleton (no logic yet)
 │       ├── config.py          # env/settings loading
@@ -107,7 +106,8 @@ renumbered to what's actually left.)
 ## Conventions & governance
 
 - **Synthetic data only.** No real PHI in code, seeds, logs, or prompts.
-- **Secrets** live in each service's `.env` (copied from `.env.example`), never committed.
+- **Secrets** live in each service's local `.env` (git-ignored), never committed. Real API
+  keys must never enter tracked files.
 - **AI disclosure** is mandatory in the greeting; call-recording consent is required once
   telephony lands (Phase 7). See `agent/src/clinic_agent/prompts.py`.
 - Keep the agent and scheduling API decoupled — the agent talks to the API over HTTP.
@@ -120,7 +120,7 @@ cd scheduling_api && uv sync && uv run uvicorn app.main:app --reload
 cd scheduling_api && uv run pytest
 
 # Voice agent (Phase 1+; skeleton only in Phase 0)
-cd agent && cp .env.example .env   # then fill in keys; uv sync when Phase 1 starts
+cd agent   # create agent/.env with your API keys; uv sync when Phase 1 starts
 ```
 
 ## Current status

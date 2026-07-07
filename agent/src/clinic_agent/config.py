@@ -1,6 +1,6 @@
 """Environment / settings loading for the clinic voice agent.
 
-Phase 0: light boilerplate only. Values are read from a local `.env` (see `.env.example`).
+Phase 0: light boilerplate only. Values are read from a local (git-ignored) `.env`.
 No secrets are hardcoded and nothing here makes network calls.
 """
 
@@ -96,5 +96,5 @@ def require_phase1_keys(settings: Settings) -> None:
     if missing:
         raise RuntimeError(
             "Missing required environment variable(s) for the Phase-1 voice loop: "
-            f"{', '.join(missing)}. Set them in agent/.env (see .env.example)."
+            f"{', '.join(missing)}. Set them in agent/.env."
         )
