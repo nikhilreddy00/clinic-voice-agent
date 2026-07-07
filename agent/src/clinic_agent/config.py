@@ -35,10 +35,11 @@ class Settings:
     cartesia_api_key: str
     cartesia_voice_id: str
 
-    # Telephony — Twilio (Phase 7)
-    twilio_account_sid: str
-    twilio_auth_token: str
-    twilio_phone_number: str
+    # Telephony — LiveKit SIP (required from Phase 5 onward)
+    livekit_url: str
+    livekit_api_key: str
+    livekit_api_secret: str
+    livekit_phone_number: str
 
     # Scheduling backend (local mock API)
     scheduling_api_base_url: str
@@ -58,9 +59,12 @@ def load_settings() -> Settings:
         groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
         cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),
         cartesia_voice_id=os.getenv("CARTESIA_VOICE_ID", ""),
-        twilio_account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
-        twilio_auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
-        twilio_phone_number=os.getenv("TWILIO_PHONE_NUMBER", ""),
+        # Telephony — LiveKit SIP. Not required until Phase 5, so these default
+        # to "" and are not enforced by require_phase1_keys().
+        livekit_url=os.getenv("LIVEKIT_URL", ""),
+        livekit_api_key=os.getenv("LIVEKIT_API_KEY", ""),
+        livekit_api_secret=os.getenv("LIVEKIT_API_SECRET", ""),
+        livekit_phone_number=os.getenv("LIVEKIT_PHONE_NUMBER", ""),
         scheduling_api_base_url=os.getenv(
             "SCHEDULING_API_BASE_URL", "http://127.0.0.1:8000"
         ),

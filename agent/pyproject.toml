@@ -9,11 +9,12 @@ requires-python = ">=3.11"
 dependencies = [
     # Pipecat with the service extras this project uses.
     # Deepgram (ASR), Anthropic (LLM, active), Cartesia (TTS), Silero (VAD/turn-taking),
-    # local (PyAudio mic/speaker transport for Phase 1 local dev).
+    # local (PyAudio mic/speaker transport for Phase 1 local dev),
+    # livekit (SIP telephony transport — wired in Phase 5).
     # `groq` is retained as a DORMANT fallback (see CLAUDE.md): the active LLM is
     # Anthropic/Claude, but switching back to Groq for a latency benchmark is a
     # deliberate code change in pipeline.py + eval/run_eval.py, not a runtime flag.
-    "pipecat-ai[deepgram,groq,anthropic,cartesia,silero,local]>=1.5.0",
+    "pipecat-ai[deepgram,groq,anthropic,cartesia,silero,local,livekit]>=1.5.0",
     "python-dotenv>=1.0",
     "httpx>=0.27",          # agent -> scheduling_api HTTP calls (Phase 2)
     "loguru>=0.7",

@@ -25,6 +25,9 @@ management) implements and Phase 6 (evals) tests against.
   benchmarking; switching back requires code changes in `agent/src/clinic_agent/pipeline.py`
   and `eval/run_eval.py` (there is no runtime provider flag). See CLAUDE.md for the full note.
   The state machine and tool contract below are provider-agnostic.
+- **Telephony layer:** inbound calls arrive over **LiveKit SIP** (free tier, one number
+  included: `+14842950169`), wired in Phase 5. Until then the agent runs on a local/WebRTC
+  transport. The call-recording consent line (below) is delivered once telephony lands.
 
 ## State diagram
 

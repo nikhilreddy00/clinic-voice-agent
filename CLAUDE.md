@@ -18,7 +18,7 @@ this repo, logs, or prompts.**
 
 | Layer | Responsibility | Chosen tech |
 |-------|----------------|-------------|
-| Telephony (later) | Inbound PSTN/SIP call ingress | Twilio / LiveKit SIP |
+| Telephony (later) | Inbound PSTN/SIP call ingress | LiveKit SIP (free tier, one number included: `+14842950169`) |
 | Transport | Real-time audio in/out | Pipecat transport (WebRTC local dev → SIP later) |
 | ASR | Speech → text | Deepgram (`pipecat.services.deepgram`) |
 | LLM | Reasoning / dialogue | Anthropic Claude Haiku 4.5 (`pipecat.services.anthropic`) — see LLM-provider note below |
@@ -95,8 +95,9 @@ renumbered to what's actually left.)
 
 **Remaining:**
 
-- **Phase 5 — Telephony.** Wire a real inbound phone number (Twilio or LiveKit SIP); deliver
-  the AI disclosure and call-recording consent on real calls.
+- **Phase 5 — Telephony.** Wire a real inbound phone number via LiveKit SIP (free tier, one
+  number included: `+14842950169`); deliver the AI disclosure and call-recording consent on
+  real calls.
 - **Phase 6 — Observability + deployment.** Per-turn latency (P50/P95/P99), ASR confidence,
   tool-success and outcome metrics, structured logs / dashboard; Dockerize (1 container per
   session); deploy to Fly.io or Render.
@@ -143,5 +144,6 @@ barge-in:
   End-to-end barge-in is audio-timing behavior and is verified on a live mic, not in the headless
   eval; the gate's decision logic has unit tests (`agent/tests/test_barge_in.py`).
 
-**Next: Phase 5 — telephony** (Twilio/LiveKit SIP; AI disclosure + call-recording consent on
-real calls). Observability + deployment is Phase 6; README + demo is Phase 7. Not started.
+**Next: Phase 5 — telephony** (LiveKit SIP — free tier, one number included, `+14842950169`;
+AI disclosure + call-recording consent on real calls). Observability + deployment is Phase 6;
+README + demo is Phase 7. Not started.
