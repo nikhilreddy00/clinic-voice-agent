@@ -13,10 +13,21 @@ from dotenv import load_dotenv
 
 load_dotenv()  # loads .env from the agent/ working dir if present
 
+# Fixed LiveKit room the inbound SIP call is routed into (Phase 5, Direct dispatch). The
+# agent joins THIS room and the SIP dispatch rule points every inbound call at it, so the
+# name must match in both places — importing this constant from both the agent pipeline and
+# scripts/setup_livekit_sip.py is what keeps them in lockstep. (Phase 6 concurrency would
+# switch to per-call rooms via an Individual dispatch rule + agent dispatch; see the script.)
+TELEPHONY_ROOM_NAME = "clinic-inbound"
+
 
 @dataclass(frozen=True)
 class Settings:
     """Resolved runtime configuration, populated from environment variables."""
+
+    # Runtime mode: "local" = laptop mic/speaker (Phase 1), "telephony" = LiveKit SIP
+    # inbound calls (Phase 5). Defaults to "local" so existing local testing is unchanged.
+    mode: str
 
     # ASR — Deepgram
     deepgram_api_key: str
@@ -52,6 +63,7 @@ def load_settings() -> Settings:
     needed by the active pipeline is missing.
     """
     return Settings(
+        mode=os.getenv("MODE", "local").strip().lower(),
         deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
         anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
@@ -96,5 +108,35 @@ def require_phase1_keys(settings: Settings) -> None:
     if missing:
         raise RuntimeError(
             "Missing required environment variable(s) for the Phase-1 voice loop: "
+            f"{', '.join(missing)}. Set them in agent/.env."
+        )
+
+
+# Env vars the telephony path (MODE=telephony) needs on TOP of the Phase-1 keys: the
+# LiveKit room URL + API credentials the agent uses to mint a join token and connect to
+# the room the inbound SIP call is routed into. The phone number itself is only needed by
+# the one-off dispatch-rule setup script, not by the running agent, so it is not required
+# here.
+_TELEPHONY_REQUIRED = {
+    "LIVEKIT_URL": "livekit_url",
+    "LIVEKIT_API_KEY": "livekit_api_key",
+    "LIVEKIT_API_SECRET": "livekit_api_secret",
+}
+
+
+def require_telephony_keys(settings: Settings) -> None:
+    """Fail fast if a key the LiveKit SIP path needs is unset (MODE=telephony only).
+
+    Called before building the LiveKit transport so a missing credential produces an
+    actionable error instead of an opaque connection failure once a real call arrives.
+    """
+    missing = [
+        env_name
+        for env_name, field in _TELEPHONY_REQUIRED.items()
+        if not getattr(settings, field)
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s) for MODE=telephony (LiveKit SIP): "
             f"{', '.join(missing)}. Set them in agent/.env."
         )

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 
@@ -59,8 +59,12 @@ def get_availability(
         conn.commit()
 
         # Only future slots: never offer a time that has already passed (Phase-4 fix #2).
-        # start_time and _now() are both ISO-8601 UTC with the same +00:00 offset, so a plain
-        # string comparison orders them correctly — same trick release_expired_holds() uses.
+        # timezone: US/Eastern (America/New_York) — agent operates in clinic local time. "Now"
+        # is taken in clinic-local time (so "already passed" means passed in the clinic's day,
+        # not in UTC), then normalized back to UTC for the comparison: start_time is stored as
+        # UTC (+00:00), and this lexical string comparison is only valid when BOTH operands
+        # share that same offset. An instant compared in either tz is the same instant; taking
+        # it in CLINIC_TZ first is what keeps the reasoning about "today"/"passed" in local time.
         sql = """
             SELECT s.id AS slot_id, s.provider_id, p.name AS provider_name,
                    p.specialty, s.start_time, s.reason_category
@@ -69,7 +73,8 @@ def get_availability(
              WHERE s.status = 'available'
                AND s.start_time >= ?
         """
-        params: list = [db._now().isoformat()]
+        now_clinic = datetime.now(db.CLINIC_TZ)
+        params: list = [now_clinic.astimezone(timezone.utc).isoformat()]
         if provider_id is not None:
             sql += " AND s.provider_id = ?"
             params.append(provider_id)

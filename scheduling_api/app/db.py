@@ -15,8 +15,15 @@ from __future__ import annotations
 import os
 import sqlite3
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from . import seed_data
+
+# timezone: US/Eastern (America/New_York) — agent operates in clinic local time.
+# Slots' start_time and hold_expires_at are STORED as UTC (+00:00) so lexical string
+# comparisons stay valid year-round (no DST offset flip mid-column); clinic-local time is
+# used only when we need to know the current wall-clock day/time in the clinic.
+CLINIC_TZ = ZoneInfo("America/New_York")
 
 # How long a hold lasts before it expires and the slot frees up again.
 HOLD_TTL_SECONDS = 120

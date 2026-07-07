@@ -1,21 +1,23 @@
-"""Pipecat pipeline for the clinic voice agent — Phase 2 (booking via tool calls).
+"""Pipecat pipeline for the clinic voice agent — Phase 5 (telephony mode switch).
 
-Local ASR->LLM->TTS loop over the laptop mic/speaker, now with the LLM able to call the mock
-scheduling API to complete a full booking:
+ASR->LLM->TTS booking loop that runs over EITHER the laptop mic/speaker (MODE=local, the
+Phase-1 path) OR a LiveKit SIP room fed by an inbound phone call (MODE=telephony, Phase 5):
 
-    mic -> Deepgram (ASR) -> Anthropic/Claude (LLM) <-> scheduling API tools -> Cartesia (TTS) -> speaker
+    <transport in> -> Deepgram (ASR) -> Anthropic/Claude (LLM) <-> scheduling API tools
+        -> Cartesia (TTS) -> <transport out>
 
-On start the agent speaks a fixed greeting that includes the mandatory AI disclosure (spoken
-deterministically, NOT LLM-generated, so the disclosure wording is exact every run). It then
-runs the full slot-fill -> offer -> hold -> confirm -> book -> close flow, with the LLM
-deciding when to call check_availability / hold_slot / confirm_booking (see scheduling_tools.py
-and the PHASE2 system prompt in prompts.py). The Phase-1 echo-safe mic gate and greeting are
-unchanged.
+The mode switch (see run_agent) changes ONLY the transport and which event fires the greeting;
+the ASR->LLM->TTS chain, scheduling tool calls, echo-safe mic gate, and barge-in are identical
+in both modes. On the first caller/mic contact the agent speaks a fixed greeting that includes
+the mandatory AI disclosure (spoken deterministically, NOT LLM-generated, so the wording is
+exact every run); on telephony that greeting also carries the call-recording consent line
+(prompts.greeting_for). It then runs the full slot-fill -> offer -> hold -> confirm -> book ->
+close flow, with the LLM deciding when to call check_availability / hold_slot / confirm_booking
+(see scheduling_tools.py and the PHASE2 system prompt in prompts.py).
 
 Deliberately OUT of scope here (later phases):
-    - the full dialogue state machine + per-state validation/fallbacks (Phase 3, docs/build_spec.md)
-    - barge-in / VAD tuning                                  (Phase 4)
-    - telephony / SIP + warm human transfer                  (Phase 7)
+    - observability (latency percentiles, structured logs) + Dockerize/deploy (Phase 6)
+    - warm human transfer on escalation                                       (Phase 7)
 
 Pipeline order (Pipecat 1.5.x):
     transport.input() -> mic-gate -> vad -> stt -> [log ASR] -> user_agg
@@ -58,6 +60,8 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.transports.base_transport import BaseTransport
+from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
 from pipecat.transports.local.audio import (
     LocalAudioOutputTransport,
     LocalAudioTransport,
@@ -69,9 +73,17 @@ from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
+from livekit import api as livekit_api
+
 from .barge_in import BargeInConfig, MicGateLogic, barge_in_min_words, frame_rms
-from .config import load_settings, require_phase1_keys
-from .prompts import GREETING, build_phase2_system_prompt
+from .config import (
+    TELEPHONY_ROOM_NAME,
+    Settings,
+    load_settings,
+    require_phase1_keys,
+    require_telephony_keys,
+)
+from .prompts import build_phase2_system_prompt, greeting_for
 from .scheduling_tools import (
     SchedulingClient,
     build_tools_schema,
@@ -268,23 +280,78 @@ class StageLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def run_agent() -> None:
-    """Build and run the Phase-1 local voice-agent pipeline."""
-    _configure_logging()  # non-blocking sink before anything hits the audio loop
+def _build_local_transport() -> InstrumentedLocalAudioTransport:
+    """Laptop mic + speaker transport (MODE=local, the Phase-1 path).
 
-    settings = load_settings()
-    require_phase1_keys(settings)  # fail fast on missing keys before opening the mic
-
-    # --- Local audio transport (laptop mic + speaker) ------------------------------------
-    # Output sample rate is pinned end to end (transport + pipeline + Cartesia) to avoid any
-    # hidden resample on playback. The instrumented transport adds playback diagnostics only.
-    transport = InstrumentedLocalAudioTransport(
+    Output sample rate is pinned end to end (transport + pipeline + Cartesia) to avoid any
+    hidden resample on playback. The instrumented transport adds playback diagnostics only.
+    """
+    return InstrumentedLocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             audio_out_sample_rate=OUTPUT_SAMPLE_RATE,
         )
     )
+
+
+def _livekit_join_token(settings: Settings, room_name: str, identity: str) -> str:
+    """Mint a LiveKit room-join JWT for the agent from the API key/secret in .env.
+
+    The agent is just another room participant: it needs a token granting join on the one
+    room the inbound SIP call is routed into. The caller joins the same room via the SIP
+    dispatch rule (see scripts/setup_livekit_sip.py), and the two meet there.
+    """
+    return (
+        livekit_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
+        .with_identity(identity)
+        .with_name("Clinic Scheduling Agent")
+        .with_grants(livekit_api.VideoGrants(room_join=True, room=room_name))
+        .to_jwt()
+    )
+
+
+def _build_livekit_transport(settings: Settings) -> LiveKitTransport:
+    """LiveKit SIP-compatible transport (MODE=telephony, the Phase-5 path).
+
+    Same TransportParams as local (audio in/out, pinned 24 kHz out) so the pipeline chain and
+    Cartesia rate are unchanged — LiveKit resamples between this room rate and the SIP media
+    at its own boundary. Only the ingress/egress moves from the laptop to a LiveKit room.
+    """
+    token = _livekit_join_token(settings, TELEPHONY_ROOM_NAME, identity="clinic-agent")
+    logger.info(
+        f"[telephony] joining LiveKit room {TELEPHONY_ROOM_NAME!r} at {settings.livekit_url} "
+        f"as 'clinic-agent'; waiting for the inbound SIP caller"
+    )
+    return LiveKitTransport(
+        url=settings.livekit_url,
+        token=token,
+        room_name=TELEPHONY_ROOM_NAME,
+        params=LiveKitParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_out_sample_rate=OUTPUT_SAMPLE_RATE,
+        ),
+    )
+
+
+async def run_agent() -> None:
+    """Build and run the clinic voice-agent pipeline (local mic or LiveKit SIP telephony)."""
+    _configure_logging()  # non-blocking sink before anything hits the audio loop
+
+    settings = load_settings()
+    require_phase1_keys(settings)  # fail fast on missing keys before opening the mic
+
+    # --- Transport (mode switch) ---------------------------------------------------------
+    # Only the transport layer changes between modes; everything below (ASR->LLM->TTS, tool
+    # calls, mic gate, barge-in, greeting/disclosure) is identical. MODE defaults to "local".
+    telephony = settings.mode == "telephony"
+    if telephony:
+        require_telephony_keys(settings)  # fail fast before we try to join the room
+        transport: BaseTransport = _build_livekit_transport(settings)
+    else:
+        transport = _build_local_transport()
+    logger.info(f"[mode] MODE={settings.mode!r} → {'LiveKit SIP telephony' if telephony else 'local mic/speaker'}")
 
     # --- Services ------------------------------------------------------------------------
     vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
@@ -367,16 +434,43 @@ async def run_agent() -> None:
         ),
     )
 
-    @worker.event_handler("on_pipeline_started")
-    async def _greet(worker: PipelineWorker, _frame: StartFrame) -> None:
-        # pipecat calls this handler as (worker, frame) — both args are required.
-        # Deliver the greeting + AI disclosure deterministically (exact wording, every run).
+    # --- Greeting trigger (mode-dependent event) -----------------------------------------
+    # The greeting is spoken deterministically (exact AI-disclosure wording every run; on
+    # telephony it also carries the call-recording consent — see greeting_for()). WHICH event
+    # fires it differs by mode because the two transports reach "a caller is present" at
+    # different moments:
+    #   - local:     the mic opens the instant the pipeline starts, so the caller is already
+    #                "there" at on_pipeline_started. Greet immediately.
+    #   - telephony: the agent joins the LiveKit room at pipeline start, but the room is EMPTY
+    #                until the inbound SIP call connects. Greeting at pipeline-start would talk
+    #                to an empty room, so we wait for on_first_participant_joined (the caller
+    #                actually arriving) before speaking. This is the one behavioral difference
+    #                the room-based transport forces; the greeting text/flow are otherwise the
+    #                same.
+    greeting = greeting_for(settings.mode)
+
+    async def _speak_greeting() -> None:
         logger.info("TTS  ▶ synthesis triggered for greeting/disclosure")
-        await worker.queue_frames([TTSSpeakFrame(GREETING)])
+        await worker.queue_frames([TTSSpeakFrame(greeting)])
+
+    if telephony:
+
+        @transport.event_handler("on_first_participant_joined")
+        async def _greet_on_join(_transport: BaseTransport, participant_id: str) -> None:
+            logger.info(f"[telephony] caller joined room (participant={participant_id})")
+            await _speak_greeting()
+
+    else:
+
+        @worker.event_handler("on_pipeline_started")
+        async def _greet(_worker: PipelineWorker, _frame: StartFrame) -> None:
+            # pipecat calls this handler as (worker, frame) — both args are required.
+            await _speak_greeting()
 
     logger.info(
         "Starting clinic voice agent (Phase 2: booking via scheduling-API tools). "
-        "Speak into your mic; Ctrl-C to stop."
+        + ("Waiting for an inbound call; Ctrl-C to stop." if telephony
+           else "Speak into your mic; Ctrl-C to stop.")
     )
     try:
         await WorkerRunner().run(worker)

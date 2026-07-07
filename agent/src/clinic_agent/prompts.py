@@ -13,24 +13,52 @@ from __future__ import annotations
 
 from datetime import date, timedelta, timezone
 from datetime import datetime as _datetime
+from zoneinfo import ZoneInfo
+
+# timezone: US/Eastern (America/New_York) — agent operates in clinic local time. The current
+# time, "today", and the date→weekday reference table injected into the prompt are all resolved
+# in this zone so the model reasons about the clinic's wall clock (e.g. "12:17 AM EDT, Tuesday
+# July 7"), not UTC — otherwise near midnight local it can land on the wrong calendar day and
+# misjudge which slots are still in the future. Mirrors CLINIC_TZ in scheduling_api/app/db.py.
+CLINIC_TZ = ZoneInfo("America/New_York")
 
 # Mandatory AI disclosure. Delivered in the GREETING_DISCLOSURE state.
 AI_DISCLOSURE = (
     "You're speaking with an automated AI assistant."
 )
 
-# Call-recording consent. Added to the greeting once telephony lands (Phase 7).
-# TODO(Phase 7): confirm exact consent wording for the target jurisdiction.
+# Call-recording consent. Spoken in the greeting on the telephony path (Phase 5), BEFORE
+# any booking begins. Not spoken on the local dev path (nothing is recorded there).
+# TODO: confirm exact consent wording for the target jurisdiction before a real deployment.
 RECORDING_CONSENT = (
     "This call may be recorded for quality and scheduling purposes."
 )
 
-# Greeting delivered at the start of the call (GREETING_DISCLOSURE).
+# Greeting delivered at the start of the call (GREETING_DISCLOSURE) on the LOCAL path.
 GREETING = (
     "Thanks for calling Grove Family Clinic. "
     f"{AI_DISCLOSURE} "
     "I can help you book an appointment. How can I help today?"
 )
+
+# Greeting for the TELEPHONY path: identical AI disclosure, plus the call-recording consent
+# line, spoken up front before any booking. The disclosure and consent lead so both governance
+# statements are delivered before the caller shares anything.
+TELEPHONY_GREETING = (
+    "Thanks for calling Grove Family Clinic. "
+    f"{AI_DISCLOSURE} "
+    f"{RECORDING_CONSENT} "
+    "I can help you book an appointment. How can I help today?"
+)
+
+
+def greeting_for(mode: str) -> str:
+    """Return the greeting for the given runtime mode.
+
+    Telephony adds the call-recording consent line to the shared AI disclosure; local dev
+    records nothing, so it uses the disclosure-only greeting.
+    """
+    return TELEPHONY_GREETING if mode == "telephony" else GREETING
 
 # Minimal Phase-1 system prompt. Scoped to greeting + disclosure + answering a single
 # scripted turn (confirming the agent can help schedule). It deliberately does NOT do
@@ -66,9 +94,9 @@ You are the virtual scheduling assistant for Grove Family Clinic, speaking with 
 phone. You have already greeted the caller and disclosed that you are an automated AI
 assistant. Your job this call is to book ONE appointment, end to end.
 
-Today's date is {today} ({weekday}), and the current time is {now_utc} UTC. Appointment times
-from the tools are UTC; speak them naturally (e.g. "Monday, July 6th at 9 AM"), never as raw
-timestamps.
+Today's date is {today} ({weekday}), and the current time is {now_local} — this is the clinic's
+local time (US/Eastern). Reason about time in the clinic's local timezone. Speak appointment
+times naturally (e.g. "Monday, July 6th at 9 AM"), never as raw timestamps.
 
 DATE RESOLUTION — resolve every relative day the caller says ("today", "tomorrow", "next
 Tuesday", "the 9th") into a concrete YYYY-MM-DD using THIS reference table. Do NOT do weekday
@@ -82,7 +110,7 @@ arithmetic in your head — LLMs get it wrong; just look the day up here:
     day-of-week you say MUST match the date you used — re-check against this table before you
     read any date back, so the weekday and the calendar date never disagree.
   - Only ever offer or confirm times in the FUTURE. Never offer or read back a slot earlier
-    today than the current time ({now_utc} UTC).
+    today than the current clinic-local time ({now_local}).
 
 STYLE: keep every reply to one or two short, natural sentences suitable for text-to-speech.
 Ask for one thing at a time. Never read out slot_id, hold_id, or reason_category codes — those
@@ -151,6 +179,11 @@ BRANCH CASES YOU MUST HANDLE:
     system is unreachable). Apologize briefly and recover: for a taken slot or expired hold,
     offer another available slot; if the system is unreachable, offer to have staff call back.
 
+PII MINIMIZATION: never read a caller's full name and a phone number back together in the same
+sentence or turn — confirm one identifier at a time. Do not repeat back a phone number, date of
+birth, or any government ID at all unless the caller explicitly asks you to; a short reason for
+the visit (one or two words) is all you collect, never a detailed medical history.
+
 Never invent clinic facts (addresses, providers, hours, prices). All data is synthetic; never
 solicit detailed medical information.
 """
@@ -177,19 +210,27 @@ def _build_date_table(today: date) -> str:
 
 
 def build_phase2_system_prompt(now: _datetime | None = None) -> str:
-    """Return the Phase-2 system prompt with today's UTC date and time injected.
+    """Return the Phase-2 system prompt with today's clinic-local date and time injected.
 
     The injected date table + current time are what let the LLM resolve relative phrases
     ("next Tuesday") to the concrete YYYY-MM-DD the scheduling API filters on, and to reject
-    already-passed times. Defaults to the current UTC moment so a long-running process always
-    reflects "now".
+    already-passed times. Everything is resolved in CLINIC_TZ (US/Eastern) so the model reasons
+    in the clinic's wall clock — near midnight local, the UTC date can already be "tomorrow",
+    which previously threw the day-of-week table and "has this time passed?" off by a day.
+
+    `now` defaults to the current moment; a passed-in value may be naive (assumed UTC) or
+    tz-aware, and is converted to clinic-local before any date/time is derived.
     """
     now = now or _datetime.now(timezone.utc)
-    today = now.date()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now_local = now.astimezone(CLINIC_TZ)
+    today = now_local.date()
     return _PHASE2_SYSTEM_PROMPT_TEMPLATE.format(
         today=today.isoformat(),
         weekday=today.strftime("%A"),
-        now_utc=now.strftime("%H:%M"),
+        # e.g. "12:17 AM EDT" — includes the tz abbrev so the model knows which clock it's on.
+        now_local=now_local.strftime("%-I:%M %p %Z"),
         date_table=_build_date_table(today),
     )
 

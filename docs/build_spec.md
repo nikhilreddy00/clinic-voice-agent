@@ -26,8 +26,10 @@ management) implements and Phase 6 (evals) tests against.
   and `eval/run_eval.py` (there is no runtime provider flag). See CLAUDE.md for the full note.
   The state machine and tool contract below are provider-agnostic.
 - **Telephony layer:** inbound calls arrive over **LiveKit SIP** (free tier, one number
-  included: `+14842950169`), wired in Phase 5. Until then the agent runs on a local/WebRTC
-  transport. The call-recording consent line (below) is delivered once telephony lands.
+  included: `+14842950169`), wired in Phase 5 (done). The agent still runs on the local
+  transport by default (`MODE=local`); `MODE=telephony` switches to the LiveKit SIP path.
+  The call-recording consent line (below) is delivered in the greeting on the telephony path.
+  Setup is reproducible — see **Phase 5 — Telephony (LiveKit SIP) setup** below.
 
 ## State diagram
 
@@ -181,10 +183,15 @@ stateDiagram-v2
 
 ## Governance touchpoints
 
-- **AI disclosure** — mandatory, delivered in `GREETING_DISCLOSURE`.
-- **Call-recording consent** — added to `GREETING_DISCLOSURE` when telephony lands (Phase 7).
+- **AI disclosure** — mandatory, delivered in `GREETING_DISCLOSURE` on BOTH paths (local +
+  telephony). Spoken deterministically (`prompts.AI_DISCLOSURE`), never LLM-generated.
+- **Call-recording consent** — delivered in the greeting on the **telephony** path (Phase 5),
+  before any booking begins (`prompts.TELEPHONY_GREETING` / `greeting_for("telephony")`). Not
+  spoken on the local path, which records nothing.
 - **PHI minimization** — `COLLECT_REASON` captures a coarse reason only; the agent never
-  solicits detailed medical history. All names/reasons in dev are synthetic.
+  solicits detailed medical history. The Phase-2 system prompt also makes it explicit that the
+  agent must never read a full name and a phone number back together in one utterance, and must
+  not repeat phone numbers / DOB / IDs unless asked. All names/reasons in dev are synthetic.
 
 ## Phase-4 target list (known issues to fix during dialogue hardening)
 
@@ -218,3 +225,76 @@ deterministic with tool use).
 correctly declined to book an out-of-scope / human-handoff request. Structural scoring can't
 distinguish "escalated" from "declined-to-book" (both = no booking), so their display shows
 `exp=escalated got=gracefully_handled` on a PASS; the traces confirm proper hand-off language.
+
+## Phase 5 — Telephony (LiveKit SIP) setup
+
+Inbound calls to `+14842950169` reach the same Pipecat pipeline as local dev; only the
+transport changes. There is **one runtime switch** (`MODE`) and **one-time LiveKit
+provisioning** (an idempotent script). Nothing about the ASR→LLM→TTS loop, tool calls, mic
+gate, or barge-in differs between modes.
+
+### How it fits together
+
+```
+caller phone ──PSTN──▶ LiveKit SIP (number +14842950169)
+                          │  inbound trunk  (binds the number to our LiveKit project)
+                          │  dispatch rule  (Direct → room "clinic-inbound")
+                          ▼
+                   LiveKit room "clinic-inbound" ◀── agent process (MODE=telephony)
+                                                       joins the same room, waits for the
+                                                       caller, then runs the booking flow
+```
+
+- **Direct dispatch** routes every inbound call into the single fixed room `clinic-inbound`
+  (`config.TELEPHONY_ROOM_NAME`). The agent joins that same room and greets on
+  `on_first_participant_joined` — i.e. when the caller actually connects, not at process
+  start (the room exists but is empty before the call lands). Fine for a single demo call.
+- **Concurrency (Phase 6):** Direct = one shared room, so it does **not** support simultaneous
+  calls. Multi-call requires an **Individual** dispatch rule (room-per-call) + LiveKit agent
+  dispatch starting one agent process per room — the "one container per session" model Phase 6
+  Dockerizes. The setup script documents this in a comment.
+
+### Required `.env` (agent/.env, git-ignored)
+
+```
+LIVEKIT_URL=wss://<your-project>.livekit.cloud
+LIVEKIT_API_KEY=<key>
+LIVEKIT_API_SECRET=<secret>
+LIVEKIT_PHONE_NUMBER=+14842950169
+```
+
+### Steps (reproducible)
+
+1. **Provision the SIP trunk + dispatch rule (one-time, idempotent):**
+   ```bash
+   cd agent && uv run python scripts/setup_livekit_sip.py
+   ```
+   The script prints `FOUND` vs `CREATED` per resource, so a re-run shows current state
+   without changing anything. It never deletes or mutates existing resources.
+
+2. **Start the agent in telephony mode** (in a separate terminal; the mock scheduling API must
+   also be running per the root README):
+   ```bash
+   cd agent && MODE=telephony uv run python -m clinic_agent.pipeline
+   ```
+   It joins room `clinic-inbound` and logs that it is waiting for the inbound SIP caller.
+
+3. **Call `+14842950169`.** The agent greets with the AI disclosure + call-recording consent,
+   then runs the normal booking flow.
+
+Local dev is unchanged: omit `MODE` (defaults to `local`) to use the laptop mic/speaker.
+
+### Known limitations / Phase 6 follow-ups
+
+- **Seed slot hours are stored as UTC**, not clinic-local. `scheduling_api/app/seed_data.py`
+  generates slots at `09:00, 10:30, 13:00, 14:30` **UTC** (`tzinfo=timezone.utc`). The Phase-5
+  timezone fix made the agent's *current-time* reasoning clinic-local (`America/New_York`), but
+  the stored slot **hours** are still UTC while the availability filter compares on the UTC
+  instant. At early-morning hours this is invisible (every slot is future in both frames), but a
+  **mid-day caller may see a slot filtered out that still appears upcoming in Eastern time**
+  (e.g. a 09:00 UTC slot = 5 AM EDT is dropped once 09:00 UTC passes, even though the agent
+  speaks it as an early-morning local time). **Fix:** localize the seed to `America/New_York`
+  when storing (`datetime.combine(day, t, tzinfo=CLINIC_TZ)`) so slot hours are true clinic-local
+  times. **Deferred to Phase 6.**
+- **1–2 seconds of audio noise at the very start of a telephony call is normal** SIP/RTP
+  media negotiation (codec/jitter-buffer settling), **not a code issue** — no fix needed.

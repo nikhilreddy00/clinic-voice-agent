@@ -92,11 +92,15 @@ renumbered to what's actually left.)
 - **Phase 4 — Dialogue/API defect fixes + barge-in.** Five target fixes (see
   `docs/build_spec.md`) + turn-taking / interruption handling with a false-positive metric. ✅
 
-**Remaining:**
+**In progress:**
 
-- **Phase 5 — Telephony.** Wire a real inbound phone number via LiveKit SIP (free tier, one
-  number included: `+14842950169`); deliver the AI disclosure and call-recording consent on
-  real calls.
+- **Phase 5 — Telephony.** ⏳ Wired; pending live-call verification. Real inbound phone number
+  via LiveKit SIP (free tier, `+14842950169`), with a `MODE=local|telephony` runtime switch, an
+  idempotent SIP trunk + Direct-dispatch setup script (`agent/scripts/setup_livekit_sip.py` →
+  room `clinic-inbound`), and the AI disclosure + call-recording consent delivered in the
+  greeting on the telephony path. Marked done only after a live call connects end to end.
+
+**Remaining:**
 - **Phase 6 — Observability + deployment.** Per-turn latency (P50/P95/P99), ASR confidence,
   tool-success and outcome metrics, structured logs / dashboard; Dockerize (1 container per
   session); deploy to Fly.io or Render.
@@ -111,6 +115,14 @@ renumbered to what's actually left.)
 - **AI disclosure** is mandatory in the greeting; call-recording consent is required once
   telephony lands (Phase 7). See `agent/src/clinic_agent/prompts.py`.
 - Keep the agent and scheduling API decoupled — the agent talks to the API over HTTP.
+- **One container per voice session (concurrency).** A running agent process holds one live
+  audio pipeline on the asyncio event loop; Python's GIL means multiple concurrent voice
+  sessions must **not** share a single process — CPU-bound audio/VAD/serialization work on one
+  call would stall the others. For now (single demo call, `MODE=telephony` with a Direct
+  dispatch rule → one shared room) this is a non-issue. But Phase 6 Dockerization must run
+  **one container per session**: switch the LiveKit dispatch rule from Direct to Individual
+  (room-per-call) and start one agent process/container per room. Noted here so Phase 6 gets
+  the isolation model right instead of trying to multiplex sessions in one process.
 
 ## Running the services
 
@@ -119,9 +131,17 @@ renumbered to what's actually left.)
 cd scheduling_api && uv sync && uv run uvicorn app.main:app --reload
 cd scheduling_api && uv run pytest
 
-# Voice agent (Phase 1+; skeleton only in Phase 0)
-cd agent   # create agent/.env with your API keys; uv sync when Phase 1 starts
+# Voice agent — local mic/speaker (default, MODE=local)
+cd agent && uv run python -m clinic_agent.pipeline
+
+# Voice agent — telephony (LiveKit SIP, inbound calls to +14842950169)
+cd agent && uv run python scripts/setup_livekit_sip.py   # one-time, idempotent trunk+rule
+cd agent && MODE=telephony uv run python -m clinic_agent.pipeline
 ```
+
+`MODE` (default `local`) is the only switch between the laptop mic/speaker path and the LiveKit
+SIP telephony path — the ASR→LLM→TTS loop, tool calls, mic gate, and barge-in are identical in
+both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephony (LiveKit SIP)*.
 
 ## Current status
 
@@ -144,6 +164,10 @@ barge-in:
   End-to-end barge-in is audio-timing behavior and is verified on a live mic, not in the headless
   eval; the gate's decision logic has unit tests (`agent/tests/test_barge_in.py`).
 
-**Next: Phase 5 — telephony** (LiveKit SIP — free tier, one number included, `+14842950169`;
-AI disclosure + call-recording consent on real calls). Observability + deployment is Phase 6;
-README + demo is Phase 7. Not started.
+**In progress: Phase 5 — telephony** (LiveKit SIP, `+14842950169`). Code wired: `MODE` switch
+in `config.py`/`pipeline.py` (default `local`), LiveKit transport + join-token in `pipeline.py`,
+telephony greeting with consent + explicit PII-minimization rule in `prompts.py`, and the
+idempotent `agent/scripts/setup_livekit_sip.py` (Direct dispatch → room `clinic-inbound`).
+All 10 unit tests pass and both transports build. **Pending: a live call to verify end-to-end
+audio** before marking Phase 5 complete. Observability + deployment is Phase 6; README + demo
+is Phase 7.
