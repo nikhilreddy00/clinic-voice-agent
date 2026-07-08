@@ -104,9 +104,13 @@ renumbered to what's actually left.)
   `docs/build_spec.md` → *Phase 6*). No cloud deployment — the demo runs the agent locally
   (outbound to LiveKit) and uses ngrok only to expose the dashboard. ✅
 
-**Remaining:**
-- **Phase 7 — README + demo.** Architecture diagram, eval results, latency percentiles, a
-  recorded call demo, and a callable number.
+- **Phase 7 — README + demo.** Recruiter-facing `README.md` (Try-it phone number up top, ASCII
+  architecture diagram, tech-stack + latency + eval tables, five "production-shaped" trust factors,
+  resume line), `docs/demo_script.md` (three-scenario recording guide), and final repo hygiene
+  (stale scaffolding TODOs resolved, gitignore/secret checks). Nothing new built — documents the
+  existing system accurately. ✅
+
+**All 7 phases (0–7) complete — project done.**
 
 ## Conventions & governance
 
@@ -146,10 +150,11 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phase 6 complete.** Phases 0–5 are done (scaffold + mock API, live ASR→LLM→TTS loop,
-scheduling-API tool calls, dialogue hardening + headless eval, barge-in, and LiveKit SIP
-telephony verified end to end by live inbound calls). Phase 6 added observability, Docker, and
-the demo launcher:
+**Project complete — all 7 phases (0–7) done.** Phases 0–5 are done (scaffold + mock API, live
+ASR→LLM→TTS loop, scheduling-API tool calls, dialogue hardening + headless eval, barge-in, and
+LiveKit SIP telephony verified end to end by live inbound calls). Phase 6 added observability,
+Docker, and the demo launcher; Phase 7 shipped the recruiter-facing `README.md`,
+`docs/demo_script.md`, and final repo hygiene. Phase 6 detail:
 
 - **Per-turn latency + outcomes** (`agent/src/clinic_agent/metrics.py`): a `LatencyCollector` fed
   by three pass-through `MetricsTap` processors (after STT/LLM/TTS) writes a structured JSONL sink
@@ -190,5 +195,10 @@ idempotent `agent/scripts/setup_livekit_sip.py` (Direct dispatch → room `clini
 Verified by live inbound calls that connected, ran the full booking flow, and returned a
 confirmation number.
 
-**Next: Phase 7 — README + demo** (architecture diagram, eval results, latency percentiles from
-the Phase-6 live call, recorded demo, callable number). Not started.
+**Phase 7 — README + demo (done).** `README.md` rewritten as the recruiter-facing entry point
+(Try-it phone number up top, ASCII architecture diagram, tech-stack + latency + 19/19 eval tables,
+five "production-shaped" trust factors, resume line); `docs/demo_script.md` added (three-scenario
+recording guide + QuickTime tips); final hygiene pass (stale scaffolding TODOs in `config.py`/
+`prompts.py` resolved, gitignore/secret checks confirmed). The demo recording link is the one
+remaining manual step (the author records the call and drops the URL into the README Try-it
+section — placeholder is in place).

@@ -59,8 +59,9 @@ class Settings:
 def load_settings() -> Settings:
     """Build a Settings object from the current environment.
 
-    TODO(Phase 1): validate required keys and fail fast with a clear message when a key
-    needed by the active pipeline is missing.
+    Phase 1 complete — required-key validation is enforced by require_phase1_keys()
+    (and require_telephony_keys() for MODE=telephony), called at the pipeline entrypoint
+    so a missing .env value fails fast with an actionable message.
     """
     return Settings(
         mode=os.getenv("MODE", "local").strip().lower(),

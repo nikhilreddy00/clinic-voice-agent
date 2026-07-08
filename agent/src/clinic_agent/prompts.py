@@ -62,9 +62,9 @@ def greeting_for(mode: str) -> str:
 
 # Minimal Phase-1 system prompt. Scoped to greeting + disclosure + answering a single
 # scripted turn (confirming the agent can help schedule). It deliberately does NOT do
-# slot-filling, name/reason collection, or booking — that arrives with the state machine in
-# Phase 3 and the scheduling-API tool calls in Phase 2 (see docs/build_spec.md and
-# SYSTEM_PROMPT below).
+# slot-filling, name/reason collection, or booking — that arrives with the scheduling-API
+# tool calls (Phase 2) and dialogue hardening (Phase 4) in build_phase2_system_prompt() below,
+# which is the prompt the running pipeline actually uses (see docs/build_spec.md).
 PHASE1_SYSTEM_PROMPT = """\
 You are the virtual scheduling assistant for Grove Family Clinic, speaking with a caller by
 phone. You have already greeted the caller and disclosed that you are an automated AI
@@ -259,18 +259,8 @@ def build_phase2_system_prompt(now: _datetime | None = None) -> str:
     )
 
 
-# System prompt placeholder for the FULL agent. Phase 3 will expand this into an instruction
-# set that encodes the state machine in docs/build_spec.md (intent -> name -> reason -> offer
-# -> confirm -> book -> close), tool-calling rules for the scheduling API, and PHI-
-# minimization guidance. Phase 1 uses PHASE1_SYSTEM_PROMPT above instead.
-SYSTEM_PROMPT = """\
-You are the virtual scheduling assistant for Grove Family Clinic, speaking with a caller by
-phone. Keep replies short and natural for speech.
-
-TODO(Phase 3): flesh out the full system prompt, including:
-  - the dialogue state machine (see docs/build_spec.md)
-  - tool-calling instructions for the scheduling API (availability / hold / confirm)
-  - PHI minimization: collect only a coarse reason for the visit; never solicit clinical detail
-  - fallback / no-match handling and escalation to a human
-All patient data in development is synthetic.
-"""
+# NOTE: the original Phase-0 SYSTEM_PROMPT placeholder was superseded and removed. The full
+# agent prompt now lives in build_phase2_system_prompt() above — it encodes the state machine
+# from docs/build_spec.md (intent -> name -> reason -> offer -> confirm -> book -> close),
+# the scheduling-API tool-calling rules, date grounding, PHI minimization, and human escalation.
+# That builder is what pipeline.py passes to the LLM; there is no separate static full prompt.
