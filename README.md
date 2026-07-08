@@ -4,8 +4,6 @@
 
 **Deployed on:** Railway (scheduling API + voice agent, always-on)
 
-**GitHub:** https://github.com/nikhilreddy00/clinic-voice-agent
-
 A caller phones the clinic, hears an AI disclosure, and books an appointment end to end — intake,
 availability lookup, slot confirmation, and booking — over a real telephone number. Built as a
 portfolio project to show the *shape* of a real voice system: dialogue design, tool calls,
@@ -42,8 +40,6 @@ the soonest available instead.
 Expect a natural, interruptible conversation. Total call time is typically under 90 seconds. The
 LLM is the main source of response latency at this stack (~3 s per turn — see
 [Latency](#latency-real-numbers) below).
-
-> **[Demo video]** — _(recording link — see [`docs/demo_script.md`](docs/demo_script.md))_
 
 ---
 
