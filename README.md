@@ -2,6 +2,10 @@
 
 **Production inbound voice scheduling agent — healthcare clinic themed, live on a real phone number.**
 
+**Deployed on:** Railway (scheduling API + voice agent, always-on)
+
+**GitHub:** https://github.com/nikhilreddy00/clinic-voice-agent
+
 A caller phones the clinic, hears an AI disclosure, and books an appointment end to end — intake,
 availability lookup, slot confirmation, and booking — over a real telephone number. Built as a
 portfolio project to show the *shape* of a real voice system: dialogue design, tool calls,
@@ -15,6 +19,8 @@ observability, evals, and governance.
 
 **Call `+1 (484) 295-0169`.**
 
+The agent runs 24/7 on Railway — no local setup needed to test it. Just call.
+
 You'll be greeted by an automated AI assistant that discloses it's an AI and (on the phone path)
 states a call-recording consent line. Then just talk to it like a receptionist:
 
@@ -25,9 +31,9 @@ states a call-recording consent line. Then just talk to it like a receptionist:
 - It reads the appointment back and asks to confirm. Say *"yes, book it."*
 - You get a confirmation number and the call closes.
 
-The agent is **deployed on Railway and always on** — the number is answered 24/7 with nothing
-running locally. (Deployment details: [`docs/build_spec.md`](docs/build_spec.md) → *Deployment
-(Railway)*.)
+Deployment topology and redeploy steps are in [`docs/build_spec.md`](docs/build_spec.md) →
+*Deployment (Railway)* — the agent is an outbound-only worker to LiveKit Cloud, so it needs no
+inbound tunnel.
 
 Note: the mock scheduling API always keeps ~3 upcoming working days of slots available (the seeded
 window rolls forward automatically), so if asked for dates far in the future the agent will offer
@@ -163,6 +169,8 @@ Five trust factors that separate a demo from something you'd let answer a real p
   live audio session (documented for the Individual-dispatch, room-per-call scaling path).
 
 ## Local setup
+
+The agent is already deployed and live — local setup is only needed for development.
 
 Two independent services, each managed with [`uv`](https://docs.astral.sh/uv/).
 
