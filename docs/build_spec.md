@@ -410,3 +410,111 @@ command and prints the dashboard URL (and the public ngrok URL if ngrok is alrea
 ngrok http 8000        # public dashboard at https://<sub>.ngrok-free.app/dashboard/
 # then call +14842950169
 ```
+
+## Deployment (Railway) — always-on cloud hosting
+
+The local `start_demo.sh` + ngrok path (above) needs the author's laptop running. For a
+recruiter-facing demo the two services are also deployed to **Railway** so `+14842950169` is
+answered 24/7 with nothing running locally.
+
+### Why this works on a PaaS with no inbound telephony support
+
+The agent is an **outbound-only worker**: at startup it mints a LiveKit join token and connects
+*out* to LiveKit Cloud (room `clinic-inbound`), then waits. **LiveKit Cloud** terminates the
+PSTN/SIP call and bridges media — Railway never needs an inbound port, a public domain, or
+SIP/UDP ingress for the agent. So the SIP trunk + dispatch rule (which point at a *room*, not a
+server) are unchanged from Phase 5 regardless of where the agent runs.
+
+### Topology
+
+```
+  PSTN call → +14842950169 → LiveKit Cloud (SIP trunk → room clinic-inbound)
+                                     ▲  outbound WS
+                                     │
+   Railway: agent (MODE=telephony) ──┘   ── HTTPS ──▶  Railway: scheduling-api (public URL)
+     restartPolicyType=always, 1 replica          GET /availability · POST /hold-slot · /confirm-booking
+```
+
+- **`scheduling-api`** — public Railway URL (`https://scheduling-api-production-4a80.up.railway.app`).
+  The agent reaches it over HTTPS via `SCHEDULING_API_BASE_URL`. Chosen over Railway private
+  networking to avoid the IPv6-only internal-DNS gotcha (uvicorn `--host 0.0.0.0` binds IPv4).
+- **`agent`** — no public port. `restartPolicyType="always"` (it must be joined to the room when
+  a call lands) and `numReplicas=1` (one audio pipeline per process — see the concurrency note in
+  CLAUDE.md).
+- Both build from the **existing Phase-6 Dockerfiles** (`builder="dockerfile"` in each service's
+  `railway.toml`); nixpacks can't cleanly handle the agent's PortAudio/`build-essential` deps.
+
+### Config files added
+
+- `agent/railway.toml`, `scheduling_api/railway.toml` — pin the Dockerfile builder + restart/replica
+  policy. Everything else (secrets, `SCHEDULING_API_BASE_URL`, `MODE`) comes from Railway env vars.
+
+### No SQLite volume — rolling slot refresh instead
+
+The DB is **intentionally ephemeral** (re-seeded on boot). A persistent volume would be *harmful*:
+seeded slots carry fixed ids but dates relative to seed time, and seeding is `INSERT OR IGNORE`,
+so a persisted DB would freeze slot dates and `/availability` would go empty within ~3 days.
+Instead, `db.refresh_available_slots()` re-stamps still-`available` slots to the upcoming
+next-few-working-days window on every `/availability` read (and at startup), leaving `held`/`booked`
+slots untouched. An always-on server therefore never runs out of upcoming slots — verified in the
+cloud: `/availability` returns future-dated slots indefinitely with no restart.
+
+### Redeploy steps (reproducible)
+
+Prereqs: `railway` CLI, logged in (`railway login`); secrets in `agent/.env`.
+
+```bash
+# One-time: create the project + two empty services (already done for clinic-voice-agent)
+railway init --name clinic-voice-agent --workspace <workspace-id>
+railway add --service scheduling-api
+railway add --service agent
+
+# scheduling-api: deploy its dir as build root, then expose it publicly
+railway up ./scheduling_api --path-as-root --service scheduling-api --detach
+railway domain --service scheduling-api --port 8000     # → https://<api>.up.railway.app
+
+# agent: set env (secrets piped from .env via stdin so values never hit the shell history),
+# point it at the deployed API, and deploy
+for k in DEEPGRAM_API_KEY ANTHROPIC_API_KEY ANTHROPIC_MODEL CARTESIA_API_KEY CARTESIA_VOICE_ID \
+         LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_PHONE_NUMBER; do
+  grep -E "^${k}=" agent/.env | cut -d= -f2- \
+    | railway variable set "$k" --stdin --service agent --skip-deploys
+done
+printf telephony | railway variable set MODE --stdin --service agent --skip-deploys
+printf 'https://<api>.up.railway.app' \
+  | railway variable set SCHEDULING_API_BASE_URL --stdin --service agent --skip-deploys
+railway up ./agent --path-as-root --service agent --detach
+
+# Confirm LiveKit routing is still correct (idempotent), then place a test call
+cd agent && uv run python scripts/setup_livekit_sip.py
+railway logs --service agent --lines 200      # watch the call trace
+```
+
+### Verified end to end (from the cloud)
+
+A live inbound call to `+14842950169` — with the agent running **only on Railway** — connected,
+ran the full booking flow against the deployed `scheduling-api`, and returned a confirmation
+number. From the agent's Railway logs:
+
+```
+[tools] registered scheduling functions → https://scheduling-api-production-4a80.up.railway.app
+[telephony] caller joined room (participant=…)
+TOOL ▶ GET /availability → 3 slots …
+TOOL ▶ POST /hold-slot → held slot 10 hold_id=…
+TOOL ▶ POST /confirm-booking → BOOKED confirmation_id=7E45AA57 Thursday, July 9 at 10:30 AM …
+[session] outcome=booked turns=7 | ASR p50=187ms p95=211ms | LLM p50=895ms p95=1279ms
+          | TTS p50=64ms p95=840ms | E2E p50=1314ms p95=2297ms
+```
+
+### Known limitations on Railway
+
+- **Free-tier cost.** Two always-on containers (the agent's event loop can't scale to zero — Direct
+  dispatch needs it joined to the room 24/7) run ~$4–6/month combined; the agent is the cost driver.
+  This fits the Railway Hobby plan ($5/mo, $5 usage included) but with little headroom — watch usage.
+- **`/dashboard` is not served on Railway.** The dashboard static files live at the repo root,
+  outside the `scheduling_api/` build context, and the Dockerfile doesn't COPY them (docker-compose
+  bind-mounts them locally). `GET /metrics` still responds (zeroed, since the agent writes
+  `calls.jsonl` to its own container, not a shared volume). Per-call latency remains in the agent's
+  Railway logs (the `[session]` summary line). Wiring the public dashboard would mean either copying
+  the static files into the API image or having the agent POST its per-call summary to the API — a
+  deliberate follow-up, out of scope for the "verify a live cloud call" goal.

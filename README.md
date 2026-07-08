@@ -25,8 +25,13 @@ states a call-recording consent line. Then just talk to it like a receptionist:
 - It reads the appointment back and asks to confirm. Say *"yes, book it."*
 - You get a confirmation number and the call closes.
 
-Note: the mock scheduling API seeds ~3 working days of slots from startup, so if asked for dates
-far in the future the agent will offer the soonest available instead.
+The agent is **deployed on Railway and always on** — the number is answered 24/7 with nothing
+running locally. (Deployment details: [`docs/build_spec.md`](docs/build_spec.md) → *Deployment
+(Railway)*.)
+
+Note: the mock scheduling API always keeps ~3 upcoming working days of slots available (the seeded
+window rolls forward automatically), so if asked for dates far in the future the agent will offer
+the soonest available instead.
 
 Expect a natural, interruptible conversation. Total call time is typically under 90 seconds. The
 LLM is the main source of response latency at this stack (~3 s per turn — see
@@ -179,20 +184,27 @@ cd agent && MODE=telephony uv run python -m clinic_agent.pipeline
 SIP telephony path — the ASR→LLM→TTS loop, tool calls, mic gate, and barge-in are identical in
 both.
 
-**One-command demo:** `./start_demo.sh` starts the API + the agent in `MODE=telephony` and prints
-the dashboard URL; run `ngrok http 8000` in another terminal to expose the dashboard publicly.
+**Always-on demo (deployed):** both services run on **Railway**, so `+14842950169` is answered
+24/7 with nothing running locally — the agent is an outbound-only worker connecting to LiveKit
+Cloud, and the scheduling API is a public Railway URL. Redeploy steps and topology are in
+[`docs/build_spec.md`](docs/build_spec.md) → *Deployment (Railway)*.
+
+**One-command local demo:** `./start_demo.sh` starts the API + the agent in `MODE=telephony` and
+prints the dashboard URL; run `ngrok http 8000` in another terminal to expose the dashboard
+publicly. Use this when iterating locally.
 
 Full telephony provisioning and the demo sequence are in
-[`docs/build_spec.md`](docs/build_spec.md) (Phase 5 & Phase 6). Docker is also provided
+[`docs/build_spec.md`](docs/build_spec.md) (Phase 5, Phase 6 & Deployment). Docker is also provided
 (`docker compose up --build`) — see the Known limitations note.
 
 ## Known limitations
 
-- **Seed slot window.** The mock backend seeds ~3 working days of slots, and seed slot *hours* are
-  stored as UTC while the agent reasons in clinic-local (`America/New_York`) time. A mid-day caller
-  can see an early-morning slot filtered out that still reads as upcoming locally. Requests far
-  outside the seed window ("sometime next month") have nothing to offer and fall back to the
-  soonest available slot.
+- **Seed slot window.** The mock backend keeps ~3 upcoming working days of slots, rolled forward
+  automatically on each `/availability` read so an always-on deploy never runs out (see
+  `db.refresh_available_slots`). Seed slot *hours* are stored as UTC while the agent reasons in
+  clinic-local (`America/New_York`) time, so a mid-day caller can see an early-morning slot filtered
+  out that still reads as upcoming locally. Requests far outside the window ("sometime next month")
+  have nothing to offer and fall back to the soonest available slot.
 - **Docker not locally tested.** The Dockerfiles and `docker-compose.yml` are present and validated
   (compose config parses, standard uv build) but not built locally (no Docker on the dev machine).
   The live demo runs on the host via `start_demo.sh`, which *is* fully tested.

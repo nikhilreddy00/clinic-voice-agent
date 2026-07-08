@@ -1,0 +1,18 @@
+# Railway deploy config — mock scheduling API (FastAPI + SQLite).
+#
+# Public HTTP service: the agent reaches it over its public Railway URL (set as the agent's
+# SCHEDULING_API_BASE_URL). Railway routes public traffic to the port from the Dockerfile's
+# EXPOSE 8000; if a deploy can't detect it, set the service's target port to 8000 in the
+# Railway dashboard (no Dockerfile change needed).
+#
+# No volume: SQLite is re-seeded on boot and the seeded window is rolled forward on every
+# /availability read (db.refresh_available_slots), so the DB is intentionally ephemeral and an
+# always-on server never runs out of upcoming slots. Persisting it would freeze slot dates.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10

@@ -1,0 +1,22 @@
+# Railway deploy config — Pipecat voice agent (MODE=telephony).
+#
+# The agent is an OUTBOUND worker: at startup it mints a LiveKit join token and connects OUT to
+# LiveKit Cloud (room "clinic-inbound"), then waits for the inbound SIP caller. It exposes no
+# port and needs no public domain on Railway — only outbound network access. LiveKit Cloud
+# terminates the PSTN/SIP call and bridges media; Railway just runs the worker.
+#
+# It MUST stay up continuously: with the Direct dispatch rule, the agent has to already be
+# joined to the room when a call lands, so restartPolicyType = "always". One replica only —
+# a single process holds one audio pipeline on the event loop (see CLAUDE.md concurrency note).
+#
+# Secrets (DEEPGRAM/ANTHROPIC/CARTESIA/LIVEKIT keys) and SCHEDULING_API_BASE_URL (the deployed
+# API's public URL) are injected as Railway environment variables — never baked into the image.
+# MODE=telephony and the start command come from the Dockerfile.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "always"
+numReplicas = 1

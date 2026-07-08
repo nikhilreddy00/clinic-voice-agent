@@ -50,6 +50,35 @@ def test_availability_excludes_past_slots(client):
     assert 90002 in ids, "future slot should still be offered"
 
 
+def test_availability_refreshes_stale_slots(client):
+    """An always-on server whose seeded slots have aged into the past must self-heal.
+
+    Seeded slots carry fixed ids but dates relative to seed time, so after a few days of
+    uptime (or a persisted DB) every seeded slot would fall in the past and /availability
+    would return nothing. Reading availability must roll the still-'available' slots forward
+    into the upcoming window (deploy longevity). Held/booked slots are covered elsewhere.
+    """
+    from datetime import datetime, timezone
+
+    from app import db
+
+    # Simulate a container that booted days ago: shove every available slot into the past.
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE slots SET start_time = ? WHERE status = 'available'",
+            ("2000-01-01T09:00:00+00:00",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    slots = client.get("/availability").json()["slots"]
+    assert slots, "stale available slots should be refreshed into the upcoming window"
+    now = datetime.now(timezone.utc).isoformat()
+    assert all(s["start_time"] > now for s in slots), "refreshed slots must all be in the future"
+
+
 def test_availability_filter_by_provider(client):
     resp = client.get("/availability", params={"provider_id": 1})
     assert resp.status_code == 200

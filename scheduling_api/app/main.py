@@ -80,6 +80,9 @@ def get_availability(
     conn = db.get_connection()
     try:
         db.release_expired_holds(conn)
+        # Roll seeded slots forward so an always-on server never runs out of upcoming slots as
+        # the originally-seeded window ages into the past (see db.refresh_available_slots).
+        db.refresh_available_slots(conn)
         conn.commit()
 
         # Only future slots: never offer a time that has already passed (Phase-4 fix #2).

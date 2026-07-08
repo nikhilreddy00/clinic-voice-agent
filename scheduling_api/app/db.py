@@ -78,6 +78,7 @@ def init_db() -> None:
         )
         _migrate_bookings_intake_columns(conn)
         _seed(conn)
+        refresh_available_slots(conn)
         conn.commit()
     finally:
         conn.close()
@@ -113,6 +114,31 @@ def _seed(conn: sqlite3.Connection) -> None:
             VALUES (?, ?, ?, ?, 'available')
             """,
             (slot_id, provider_id, start_iso, reason),
+        )
+
+
+def refresh_available_slots(conn: sqlite3.Connection) -> None:
+    """Roll still-'available' slots forward to the upcoming next-few-working-days window.
+
+    Seeded slots carry fixed ids but dates computed relative to seed time (see
+    seed_data.generate_slots), and seeding is INSERT-OR-IGNORE by id — so nothing ever moves a
+    slot's date after it's first written. On an always-on deploy (or a persisted DB) the seeded
+    window therefore ages into the past within a few days and /availability goes empty. This
+    re-stamps every slot that is still 'available' with the freshly-computed window, so a
+    long-running server keeps offering upcoming slots without a restart.
+
+    Only 'available' slots are touched: 'held' (an in-flight caller) and 'booked' (a confirmed
+    appointment, referenced by a bookings row) keep their original date. Idempotent — on a
+    freshly-seeded DB the dates already match, so this is a no-op.
+    """
+    for slot_id, _provider_id, start_iso, reason in seed_data.generate_slots():
+        conn.execute(
+            """
+            UPDATE slots
+               SET start_time = ?, reason_category = ?
+             WHERE id = ? AND status = 'available'
+            """,
+            (start_iso, reason, slot_id),
         )
 
 
