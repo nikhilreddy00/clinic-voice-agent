@@ -220,13 +220,3 @@ Full telephony provisioning and the demo sequence are in
   re-collects intake and books a fresh slot rather than amending an existing appointment.
 - **LLM latency vs Groq.** Median E2E is ~4 s, LLM-bottlenecked (see [Latency](#latency-real-numbers)).
   A Groq-hosted Llama swap is documented as the path to a sub-500 ms latency-optimized build.
-
----
-
-## Resume line
-
-> Built a production inbound voice scheduling agent (Pipecat/LiveKit SIP, Deepgram ASR, Claude
-> Haiku, Cartesia TTS) on a live phone number (+1-484-295-0169): richer clinical intake (DOB,
-> patient status, symptom notes), barge-in with false-positive metric, structural eval harness
-> (19/19 adversarial cases), per-turn latency logging (E2E P50 4.1s — LLM-bottlenecked; Groq path
-> documented for <500ms target), AI disclosure + PHI-minimization governance.
