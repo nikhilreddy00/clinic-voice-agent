@@ -68,6 +68,13 @@ from clinic_agent.prompts import build_phase2_system_prompt  # noqa: E402
 from clinic_agent.scheduling_tools import SchedulingClient, build_tools_schema  # noqa: E402
 
 import test_cases  # noqa: E402  (sibling module)
+from providers import (  # noqa: E402  (sibling module)
+    CANDIDATES,
+    LLMTurn,
+    OpenAICompatBackend,
+    RunMetrics,
+    build_backend,
+)
 from test_cases import ALL_CASES, EvalCase, Expected  # noqa: E402
 
 # Per user turn, how many LLM<->tool round-trips we allow before giving up on that turn.
@@ -217,20 +224,18 @@ async def _execute_tool(name: str, args: dict, client: SchedulingClient, trace: 
     return result
 
 
-async def _anthropic_call(client, model: str, system: str, messages: list[dict],
-                          tools: list[dict]):
-    """One Messages API call with retry/backoff on transient API errors."""
+async def _complete_with_retry(backend, system: str, history: list, tools) -> LLMTurn:
+    """One model turn with retry/backoff on transient API errors.
+
+    Provider-agnostic: `backend` owns the wire format, streaming, and usage accounting
+    (see eval/providers.py). Phase 8 made this streaming so time-to-first-token is measurable —
+    TTS cannot start until the first text token lands, so TTFT is the latency number that
+    actually maps to how quickly a caller hears a voice.
+    """
     last_exc: Exception | None = None
     for attempt in range(API_RETRIES + 1):
         try:
-            return await client.messages.create(
-                model=model,
-                max_tokens=MAX_TOKENS,
-                system=system,
-                messages=messages,
-                tools=tools,
-                temperature=0,  # Haiku 4.5 accepts temperature; 0 minimises run-to-run variance
-            )
+            return await backend.complete(system, history, tools)
         except Exception as exc:  # noqa: BLE001 - surface as a case error, not a crash
             last_exc = exc
             if attempt < API_RETRIES:
@@ -238,61 +243,39 @@ async def _anthropic_call(client, model: str, system: str, messages: list[dict],
     raise last_exc  # type: ignore[misc]
 
 
-def _assistant_content_for_history(blocks) -> list[dict]:
-    """Serialise the assistant's returned content blocks back into message-param dicts.
+async def run_case(case: EvalCase, client: SchedulingClient, backend, tools,
+                   system_prompt: str, *, metrics: RunMetrics | None = None) -> Trace:
+    """Drive one scripted conversation end to end and return its trace.
 
-    Anthropic requires the exact tool_use blocks to be echoed in the assistant turn so the
-    following tool_result blocks can reference them by id.
+    `metrics` accumulates latency / cache / cost for the Phase-8 bake-off; the plain `run_eval`
+    path leaves it None and behaves exactly as before.
     """
-    out: list[dict] = []
-    for block in blocks:
-        if block.type == "text":
-            out.append({"type": "text", "text": block.text})
-        elif block.type == "tool_use":
-            out.append(
-                {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
-            )
-    return out
-
-
-async def run_case(case: EvalCase, client: SchedulingClient, anthropic_client, model: str,
-                   tools: list[dict], system_prompt: str) -> Trace:
-    """Drive one scripted conversation end to end and return its trace."""
     trace = Trace()
-    messages: list[dict] = []  # Anthropic: system is a separate param, NOT a message
+    # Provider-shaped conversation history. Both wire formats take a plain user message, but
+    # assistant turns and tool results differ — the backend owns appending those.
+    history: list = []
 
     try:
         for utterance in case.utterances:
-            messages.append({"role": "user", "content": utterance})
+            history.append({"role": "user", "content": utterance})
             # Resolve this user turn: keep looping while the model wants tools, until it
             # produces a plain-text reply (its spoken turn) or we hit the step cap.
             for _ in range(MAX_TOOL_STEPS):
-                resp = await _anthropic_call(anthropic_client, model, system_prompt, messages, tools)
-                messages.append(
-                    {"role": "assistant", "content": _assistant_content_for_history(resp.content)}
-                )
+                turn = await _complete_with_retry(backend, system_prompt, history, tools)
+                if metrics is not None:
+                    metrics.record(turn)
+                backend.append_assistant(history, turn)
 
-                if resp.stop_reason == "tool_use":
-                    tool_results = []
-                    for block in resp.content:
-                        if block.type != "tool_use":
-                            continue
-                        # Anthropic hands back already-parsed input dicts (no json.loads needed).
-                        args = dict(block.input or {})
-                        result = await _execute_tool(block.name, args, client, trace)
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": json.dumps(result),
-                            }
-                        )
-                    messages.append({"role": "user", "content": tool_results})
+                if turn.tool_calls:
+                    results = []
+                    for call in turn.tool_calls:
+                        payload = await _execute_tool(call.name, call.args, client, trace)
+                        results.append((call, payload))
+                    backend.append_tool_results(history, results)
                     continue  # feed tool results back to the model
 
-                text = "".join(b.text for b in resp.content if b.type == "text").strip()
-                if text:
-                    trace.assistant_turns.append(text)
+                if turn.text:
+                    trace.assistant_turns.append(turn.text)
                 break
     except Exception as exc:  # noqa: BLE001
         trace.error = f"{type(exc).__name__}: {exc}"
@@ -598,11 +581,26 @@ def _render_markdown(results: list[CaseResult], summary: dict, model: str, ts: s
 # =========================================================================================
 # Entrypoint
 # =========================================================================================
-async def _run_all(cases: list[EvalCase], base_url: str, db_path: Path, model: str) -> list[CaseResult]:
-    from anthropic import AsyncAnthropic
+def tools_for_backend(backend) -> list[dict]:
+    """Tool schemas in the backend's wire format, both derived from build_tools_schema().
 
-    anthropic_client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    tools = anthropic_tools_from_schema()
+    Keeping a single source of truth matters: if Phase 2's tools change, every provider in the
+    bake-off follows automatically instead of silently drifting apart.
+    """
+    anthropic_tools = anthropic_tools_from_schema()
+    if isinstance(backend, OpenAICompatBackend):
+        return OpenAICompatBackend.tools_from_anthropic(anthropic_tools)
+    return anthropic_tools
+
+
+async def run_suite(cases: list[EvalCase], base_url: str, db_path: Path, backend, *,
+                    metrics: RunMetrics | None = None) -> list[CaseResult]:
+    """Run every case against one backend and score the traces.
+
+    Cases run sequentially and each starts from a freshly re-seeded DB, so a hold or booking in
+    one case can never leak a 409 into the next.
+    """
+    tools = tools_for_backend(backend)
     system_prompt = build_phase2_system_prompt()
     seed_dates = seeded_dates()
 
@@ -612,13 +610,32 @@ async def _run_all(cases: list[EvalCase], base_url: str, db_path: Path, model: s
         client = SchedulingClient(base_url)
         print(f"[{i}/{len(cases)}] running {case.id} ({case.category})...", flush=True)
         try:
-            trace = await run_case(case, client, anthropic_client, model, tools, system_prompt)
+            trace = await run_case(
+                case, client, backend, tools, system_prompt, metrics=metrics
+            )
         finally:
             await client.aclose()
         results.append(score_case(case, trace, seed_dates))
 
-    await anthropic_client.close()
     return results
+
+
+async def _run_all(cases: list[EvalCase], base_url: str, db_path: Path,
+                   model: str) -> list[CaseResult]:
+    """Single-model entrypoint used by `main()` (the pre-Phase-8 behaviour, now streaming)."""
+    from providers import Candidate
+
+    # An explicit --model / ANTHROPIC_MODEL may name something outside the candidate registry,
+    # so fall back to a bare Anthropic candidate rather than requiring registration.
+    candidate = next(
+        (c for c in CANDIDATES.values() if c.provider == "anthropic" and c.model == model),
+        Candidate(key="custom", label=model, provider="anthropic", model=model),
+    )
+    backend = build_backend(candidate, max_tokens=MAX_TOKENS)
+    try:
+        return await run_suite(cases, base_url, db_path, backend)
+    finally:
+        await backend.close()
 
 
 def main() -> int:

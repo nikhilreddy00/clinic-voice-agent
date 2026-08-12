@@ -40,3 +40,6 @@ build/
 .DS_Store
 .idea/
 .vscode/
+
+# Phase-8 bake-off temp DB
+eval/.bakeoff_clinic.db
