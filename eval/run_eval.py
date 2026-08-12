@@ -84,6 +84,12 @@ API_RETRIES = 2
 # Anthropic requires an explicit max_tokens. Replies + tool-call args are short.
 MAX_TOKENS = 1024
 
+# Scratch Postgres database for eval runs. TRUNCATEd before every case, so point it at a
+# throwaway database -- never at anything you care about.
+EVAL_DATABASE_URL = os.getenv(
+    "CLINIC_EVAL_DATABASE_URL", "postgresql://postgres@127.0.0.1:55432/clinic_eval"
+)
+
 
 # =========================================================================================
 # Tool schema conversion (single source of truth = build_tools_schema())
@@ -109,20 +115,29 @@ def _free_port() -> int:
 
 
 class MockApiServer:
-    """Runs scheduling_api/ as a subprocess in its own uv env against a temp DB.
+    """Runs scheduling_api/ as a subprocess in its own uv env against a throwaway database.
 
-    Kept as a context manager so the process is always torn down. The temp DB path is exported
-    via CLINIC_DB_PATH to BOTH the subprocess and this process (for resets).
+    Kept as a context manager so the process is always torn down. The database URL is exported
+    via CLINIC_DATABASE_URL to BOTH the subprocess and this process (which resets between cases).
+
+    Phase 9 moved storage from a SQLite file to Postgres, so isolation is now a dedicated
+    DATABASE rather than a temp file. Point CLINIC_EVAL_DATABASE_URL at a scratch database — it
+    is TRUNCATEd before every case.
     """
 
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
+    def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
         self.port = _free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         self._proc: subprocess.Popen | None = None
 
     def __enter__(self) -> "MockApiServer":
-        env = {**os.environ, "CLINIC_DB_PATH": str(self.db_path)}
+        env = {
+            **os.environ,
+            "CLINIC_DATABASE_URL": self.database_url,
+            # The sweeper is housekeeping; a tight loop only adds noise during scoring.
+            "CLINIC_SWEEP_INTERVAL_SECONDS": "3600",
+        }
         # Own uv env for the API service (has fastapi/uvicorn); we only need HTTP from it.
         self._proc = subprocess.Popen(
             [
@@ -160,30 +175,38 @@ class MockApiServer:
                 self._proc.kill()
 
 
-def reset_db(db_path: Path) -> None:
-    """Remove + re-seed the temp DB so every case starts from all-available slots.
+async def reset_db(database_url: str) -> None:
+    """Truncate + re-seed the scratch database so every case starts from all-available slots.
 
-    Reuses scheduling_api's own (stdlib-only) db module — the exact reset the API's test
-    conftest uses. The subprocess opens a fresh connection per request, so replacing the file
-    while it is idle between cases is safe.
+    Reuses scheduling_api's own reset helper, so the table list stays in one place: a table added
+    to schema.sql and forgotten here would survive the reset and leak state between cases.
+
+    Uses a direct connection rather than the API's pool — that pool lives in the uvicorn
+    subprocess, and the subprocess opens a connection per request, so resetting while it is idle
+    between cases is safe.
     """
-    os.environ["CLINIC_DB_PATH"] = str(db_path)
-    # Import lazily and re-read the path: app.db caches DB_PATH at import time from the env.
-    import importlib
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
 
     import app.db as api_db  # type: ignore
 
-    importlib.reload(api_db)
-    if db_path.exists():
-        db_path.unlink()
-    api_db.init_db()
+    async with await psycopg.AsyncConnection.connect(
+        database_url, row_factory=dict_row, autocommit=True
+    ) as conn:
+        await api_db.reset_and_seed(conn)
 
 
 def seeded_dates() -> set[str]:
-    """The set of YYYY-MM-DD days the mock API seeds slots for (for date-constraint checks)."""
+    """The set of YYYY-MM-DD days the API seeds slots for (for date-constraint checks).
+
+    Phase 9: generate_slots() now returns tz-aware datetimes in the CLINIC's zone rather than
+    ISO strings, so the day is taken from .date() instead of slicing. The old `start[:10]` also
+    silently read a UTC day, which disagreed with the clinic day the agent reasons about.
+    """
     import app.seed_data as seed  # type: ignore
 
-    return {start[:10] for _, _, start, _ in seed.generate_slots()}
+    return {start.astimezone(seed.CLINIC_TZ).date().isoformat()
+            for _, _, start, _ in seed.generate_slots()}
 
 
 # =========================================================================================
@@ -593,7 +616,7 @@ def tools_for_backend(backend) -> list[dict]:
     return anthropic_tools
 
 
-async def run_suite(cases: list[EvalCase], base_url: str, db_path: Path, backend, *,
+async def run_suite(cases: list[EvalCase], base_url: str, database_url: str, backend, *,
                     metrics: RunMetrics | None = None) -> list[CaseResult]:
     """Run every case against one backend and score the traces.
 
@@ -606,7 +629,7 @@ async def run_suite(cases: list[EvalCase], base_url: str, db_path: Path, backend
 
     results: list[CaseResult] = []
     for i, case in enumerate(cases, 1):
-        reset_db(db_path)  # fresh, all-available slots per case (no 409 bleed-through)
+        await reset_db(database_url)  # fresh slots per case (no 409 bleed-through)
         client = SchedulingClient(base_url)
         print(f"[{i}/{len(cases)}] running {case.id} ({case.category})...", flush=True)
         try:
@@ -620,7 +643,7 @@ async def run_suite(cases: list[EvalCase], base_url: str, db_path: Path, backend
     return results
 
 
-async def _run_all(cases: list[EvalCase], base_url: str, db_path: Path,
+async def _run_all(cases: list[EvalCase], base_url: str, database_url: str,
                    model: str) -> list[CaseResult]:
     """Single-model entrypoint used by `main()` (the pre-Phase-8 behaviour, now streaming)."""
     from providers import Candidate
@@ -633,7 +656,7 @@ async def _run_all(cases: list[EvalCase], base_url: str, db_path: Path,
     )
     backend = build_backend(candidate, max_tokens=MAX_TOKENS)
     try:
-        return await run_suite(cases, base_url, db_path, backend)
+        return await run_suite(cases, base_url, database_url, backend)
     finally:
         await backend.close()
 
@@ -658,11 +681,11 @@ def main() -> int:
         return 2
 
     model = args.model or os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-    db_path = Path(RESULTS_DIR).parent / ".eval_clinic.db"
+    database_url = EVAL_DATABASE_URL
 
-    print(f"Starting mock scheduling API (temp DB: {db_path.name}); model={model}")
-    with MockApiServer(db_path) as server:
-        results = asyncio.run(_run_all(cases, server.base_url, db_path, model))
+    print(f"Starting scheduling API (scratch DB); model={model}")
+    with MockApiServer(database_url) as server:
+        results = asyncio.run(_run_all(cases, server.base_url, database_url, model))
 
     summary = print_summary(results)
     write_results(results, summary, model)

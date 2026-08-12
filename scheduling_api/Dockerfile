@@ -17,7 +17,7 @@ RUN uv sync --frozen --no-dev
 # Both paths are provided by docker-compose as a shared volume + bind mount.
 ENV CLINIC_LOG_DIR=/logs \
     CLINIC_DASHBOARD_DIR=/app/dashboard \
-    CLINIC_DB_PATH=/app/clinic.db
+    CLINIC_DATABASE_URL=postgresql://postgres:postgres@postgres:5432/clinic
 
 EXPOSE 8000
 CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

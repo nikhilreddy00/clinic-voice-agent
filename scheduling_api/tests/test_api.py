@@ -1,4 +1,11 @@
-"""Tests for the mock scheduling API: happy path + hold edge cases."""
+"""Tests for the scheduling API: happy path + hold edge cases.
+
+Concurrency guarantees live in test_concurrency.py; idempotency in test_idempotency.py.
+"""
+
+import psycopg
+
+from app import db
 
 
 def _first_slot_id(client) -> int:
@@ -30,52 +37,56 @@ def test_availability_excludes_past_slots(client):
     """Slots whose start_time is already in the past must not be offered (Phase-4 fix #2)."""
     from datetime import datetime, timedelta, timezone
 
-    from app import db
-
-    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-    conn = db.get_connection()
-    try:
-        conn.executemany(
-            "INSERT INTO slots (id, provider_id, start_time, reason_category, status) "
-            "VALUES (?, 1, ?, 'checkup', 'available')",
-            [(90001, past), (90002, future)],
-        )
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    with psycopg.connect(db.DATABASE_URL) as conn:
+        clinic_id = conn.execute(
+            "SELECT id FROM clinics WHERE slug = %s", (db.DEFAULT_CLINIC_SLUG,)
+        ).fetchone()[0]
+        # psycopg3 puts executemany on the cursor, not the connection.
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO slots (id, clinic_id, provider_id, start_time, reason_category,"
+                " status) VALUES (%s, %s, 1, %s, 'checkup', 'available')",
+                [(90001, clinic_id, past), (90002, clinic_id, future)],
+            )
         conn.commit()
-    finally:
-        conn.close()
 
     ids = [s["slot_id"] for s in client.get("/availability").json()["slots"]]
     assert 90001 not in ids, "past slot should be filtered out"
     assert 90002 in ids, "future slot should still be offered"
 
 
-def test_availability_refreshes_stale_slots(client):
+async def test_sweeper_refreshes_stale_slots(pool):
     """An always-on server whose seeded slots have aged into the past must self-heal.
 
-    Seeded slots carry fixed ids but dates relative to seed time, so after a few days of
-    uptime (or a persisted DB) every seeded slot would fall in the past and /availability
-    would return nothing. Reading availability must roll the still-'available' slots forward
-    into the upcoming window (deploy longevity). Held/booked slots are covered elsewhere.
+    Seeded slots carry fixed ids but dates relative to seed time, so after a few days of uptime
+    the whole seeded window falls into the past and availability empties out.
+
+    PHASE-9 BEHAVIOUR CHANGE: this refresh used to happen inside GET /availability, which made
+    every read take the write lock. It now runs in the background sweeper, so the trigger under
+    test is db.sweep(), and a read is asserted to do nothing on its own.
+
+    Driven through db.* rather than TestClient because the pool is bound to the event loop that
+    opened it — reaching into it from a second loop is what a TestClient-based version would do.
     """
     from datetime import datetime, timezone
 
-    from app import db
-
-    # Simulate a container that booted days ago: shove every available slot into the past.
-    conn = db.get_connection()
-    try:
-        conn.execute(
-            "UPDATE slots SET start_time = ? WHERE status = 'available'",
-            ("2000-01-01T09:00:00+00:00",),
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE slots SET start_time = %s WHERE status = 'available'",
+            (datetime(2000, 1, 1, 9, 0, tzinfo=timezone.utc),),
         )
-        conn.commit()
-    finally:
-        conn.close()
 
-    slots = client.get("/availability").json()["slots"]
-    assert slots, "stale available slots should be refreshed into the upcoming window"
-    now = datetime.now(timezone.utc).isoformat()
+    assert await db.list_available_slots() == [], (
+        "a pure read must NOT self-heal — that is the sweeper's job now"
+    )
+
+    await db.sweep()
+
+    slots = await db.list_available_slots()
+    assert slots, "the sweeper should roll stale available slots into the upcoming window"
+    now = datetime.now(timezone.utc)
     assert all(s["start_time"] > now for s in slots), "refreshed slots must all be in the future"
 
 

@@ -384,7 +384,13 @@ async def run_agent() -> None:
 
     # --- Scheduling-API tools (Phase 2) --------------------------------------------------
     # The LLM decides when to call these; the client is the HTTP plumbing to the mock API.
-    scheduling_client = SchedulingClient(settings.scheduling_api_base_url)
+    # call_id scopes the client's Idempotency-Keys to this call, so a retry after a timed-out
+    # voice turn replays the original booking instead of creating a second appointment, while two
+    # concurrent callers never collide on a key. Reuses the metrics call id so a booking in the
+    # API's idempotency table can be traced back to a call in logs/calls.jsonl.
+    scheduling_client = SchedulingClient(
+        settings.scheduling_api_base_url, call_id=metrics.call_id
+    )
     tools = build_tools_schema()
     register_scheduling_functions(llm, scheduling_client, collector=metrics)
     logger.info(

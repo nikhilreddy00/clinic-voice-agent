@@ -1,6 +1,7 @@
 # One-command local start for the whole stack: `docker compose up --build`.
 #
-#   scheduling_api  — FastAPI mock backend + /metrics + /dashboard, published on :8000
+#   postgres        — appointment state (Phase 9; replaced SQLite)
+#   scheduling_api  — FastAPI backend + /metrics + /dashboard, published on :8000
 #   agent           — Pipecat voice agent in MODE=telephony (inbound LiveKit SIP calls)
 #
 # The agent reaches the API by its compose service name (scheduling_api), never localhost.
@@ -9,6 +10,23 @@
 # dashboard.
 
 services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres    # local compose only — never a deployed credential
+      POSTGRES_DB: clinic
+    volumes:
+      # Named volume, so appointments survive `docker compose down` (but not `down -v`).
+      - clinic_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # scheduling_api waits on THIS, not on a fixed sleep: Postgres briefly accepts and then
+      # drops connections during init, so a naive wait races the first query on a cold start.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d clinic"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   scheduling_api:
     build: ./scheduling_api
     ports:
@@ -16,9 +34,13 @@ services:
     environment:
       CLINIC_LOG_DIR: /logs
       CLINIC_DASHBOARD_DIR: /app/dashboard
+      CLINIC_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/clinic
     volumes:
       - ./logs:/logs                 # read the agent's calls.jsonl
       - ./dashboard:/app/dashboard:ro # serve the static dashboard at /dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
       interval: 10s
@@ -38,3 +60,6 @@ services:
     depends_on:
       scheduling_api:
         condition: service_healthy
+
+volumes:
+  clinic_pgdata:

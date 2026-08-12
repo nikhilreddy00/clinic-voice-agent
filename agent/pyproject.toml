@@ -25,6 +25,9 @@ dependencies = [
 # TODO(Phase 1/4): add Piper TTS support for offline/free testing.
 dev = [
     "pytest>=8.0",
+    # eval/ runs in this venv and imports scheduling_api's app.db (Phase 9: Postgres)
+    # to reset the scratch database between cases.
+    "psycopg[binary,pool]>=3.2",
 ]
 
 [build-system]

@@ -24,8 +24,8 @@ this repo, logs, or prompts.**
 | LLM | Reasoning / dialogue | Anthropic Claude Haiku 4.5 (`pipecat.services.anthropic`) — see LLM-provider note below |
 | TTS | Text → speech | Cartesia (`pipecat.services.cartesia`); Piper for free-tier testing (TODO) |
 | Orchestration | Pipeline, turn-taking, context | Pipecat (`Pipeline` / `PipelineWorker` / `WorkerRunner`) |
-| Scheduling backend | Availability / hold / booking | FastAPI mock service (`scheduling_api/`) |
-| Storage | Slots & bookings | SQLite (`scheduling_api/clinic.db`) |
+| Scheduling backend | Availability / hold / booking | FastAPI service (`scheduling_api/`) |
+| Storage | Slots & bookings | **Postgres** (`CLINIC_DATABASE_URL`) — Phase 9; was SQLite |
 
 ### LLM-provider note (why Claude, not Groq)
 
@@ -110,7 +110,24 @@ renumbered to what's actually left.)
   (stale scaffolding TODOs resolved, gitignore/secret checks). Nothing new built — documents the
   existing system accurately. ✅
 
-**All 7 phases (0–7) complete — project done.**
+**Phases 0–7 complete.** The project then entered a **production-scale rebuild (Phases 8–17)** —
+see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full plan. In progress:
+
+- **Phase 8 — model bake-off.** `eval/providers.py` (backend abstraction over Anthropic + the
+  OpenAI wire format for Groq/Cerebras, all streaming so TTFT is measurable) and `eval/bakeoff.py`
+  (runs the 19-case suite per candidate; compares TTFT, cost/call, and cache viability). Harness
+  done; the full sweep has not been run. **Key measurement: prompt caching cannot engage on Haiku
+  4.5** — the cacheable prefix (tools + system) is 3,811 tokens against a 4,096 minimum, and
+  Anthropic accepts `cache_control` then silently caches nothing. Sonnet 4.6/5 cache fine
+  (1,024 minimum). Do NOT "shrink the prompt" — that makes it permanently impossible.
+- **Phase 9 — data layer.** ✅ SQLite → Postgres. Every state transition is a single-statement
+  compare-and-swap (`UPDATE ... WHERE <expected state> RETURNING`), which is what makes concurrent
+  holds safe: the old read-then-write let **9 of 20** concurrent callers "win" the same slot.
+  Adds idempotency keys (a retried booking replays the original confirmation instead of creating
+  a second appointment), a background sweeper so `/availability` performs no writes, optional
+  `CLINIC_API_TOKEN` auth, and the Phase 12/13 schema landed early so there is one migration.
+  Fixed the seed timezone bug: slots were built as 09:00 **UTC** (05:00 clinic-local); they are
+  now generated in `America/New_York` and stored as `timestamptz`.
 
 ## Conventions & governance
 
@@ -132,9 +149,14 @@ renumbered to what's actually left.)
 ## Running the services
 
 ```bash
-# Mock scheduling API (works today)
-cd scheduling_api && uv sync && uv run uvicorn app.main:app --reload
-cd scheduling_api && uv run pytest
+# Scheduling API — needs Postgres (Phase 9). Any throwaway database will do:
+#   initdb -D /tmp/pgclinic -U postgres --auth=trust
+#   pg_ctl -D /tmp/pgclinic -o "-p 55432 -c listen_addresses=127.0.0.1 \
+#       -c unix_socket_directories=''" -l /tmp/pgclinic.log start
+#   createdb -h 127.0.0.1 -p 55432 -U postgres clinic_dev   # and clinic_test, clinic_eval
+export CLINIC_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/clinic_dev
+cd scheduling_api && uv sync --extra dev && uv run uvicorn app.main:app --reload
+cd scheduling_api && uv run pytest        # 35 tests; SKIPPED if no Postgres is reachable
 
 # Voice agent — local mic/speaker (default, MODE=local)
 cd agent && uv run python -m clinic_agent.pipeline

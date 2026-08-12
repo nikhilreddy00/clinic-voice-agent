@@ -60,6 +60,7 @@ from providers import (  # noqa: E402
 )
 from run_eval import (  # noqa: E402
     ALL_CASES,
+    EVAL_DATABASE_URL,
     MAX_TOKENS,
     RESULTS_DIR,
     CaseResult,
@@ -112,8 +113,8 @@ def _fmt_usd(value: float | None) -> str:
     return "—" if value is None else f"${value:.4f}"
 
 
-async def _run_one(candidate: Candidate, cases: list[EvalCase], base_url: str, db_path: Path,
-                   use_cache: bool) -> ModelRun:
+async def _run_one(candidate: Candidate, cases: list[EvalCase], base_url: str,
+                   database_url: str, use_cache: bool) -> ModelRun:
     """Run the full suite against one candidate, isolating its failures from the sweep."""
     metrics = RunMetrics.for_candidate(candidate, use_cache=use_cache)
 
@@ -138,7 +139,7 @@ async def _run_one(candidate: Candidate, cases: list[EvalCase], base_url: str, d
         return ModelRun(candidate, [], metrics, skipped=str(exc))
 
     try:
-        results = await run_suite(cases, base_url, db_path, backend, metrics=metrics)
+        results = await run_suite(cases, base_url, database_url, backend, metrics=metrics)
     finally:
         await backend.close()
 
@@ -276,7 +277,7 @@ def main() -> int:
         print(f"No matching cases for --only {args.only}", file=sys.stderr)
         return 2
 
-    db_path = RESULTS_DIR.parent / ".bakeoff_clinic.db"
+    database_url = EVAL_DATABASE_URL
     print(
         f"Bake-off: {len(candidates)} model(s) x {len(cases)} case(s)"
         f"{' with prompt caching' if args.cache else ''}"
@@ -285,11 +286,11 @@ def main() -> int:
     runs: list[ModelRun] = []
     # One API subprocess for the whole sweep; run_suite re-seeds the DB before every case, so
     # models never see each other's bookings.
-    with MockApiServer(db_path) as server:
+    with MockApiServer(database_url) as server:
         for candidate in candidates:
             print(f"\n--- {candidate.label} ({candidate.model}) ---", flush=True)
             runs.append(
-                asyncio.run(_run_one(candidate, cases, server.base_url, db_path, args.cache))
+                asyncio.run(_run_one(candidate, cases, server.base_url, database_url, args.cache))
             )
 
     print_comparison(runs)

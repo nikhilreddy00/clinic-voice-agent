@@ -25,6 +25,7 @@ and recover (re-offer / escalate) instead of the turn crashing.
 from __future__ import annotations
 
 import time
+import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -77,8 +78,29 @@ class SchedulingClient:
     never raises for HTTP/transport failures — it maps them to `{"ok": False, "error": ...}`.
     """
 
-    def __init__(self, base_url: str, *, timeout: float = 10.0) -> None:
-        self._client = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=timeout)
+    def __init__(self, base_url: str, *, timeout: float = 10.0, call_id: str | None = None,
+                 api_token: str | None = None) -> None:
+        headers = {}
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"), timeout=timeout, headers=headers
+        )
+        # Scopes idempotency keys to this call, so two callers booking at the same moment never
+        # collide on a key. Falls back to a random id when the pipeline doesn't supply one.
+        self._call_id = call_id or uuid.uuid4().hex
+        self._attempt = 0
+
+    def _idempotency_key(self, operation: str, discriminator: str) -> str:
+        """A key that is STABLE across retries of the same logical operation.
+
+        This is the whole point: the agent's HTTP client sits inside a voice turn with a timeout,
+        so a write can commit and still look like a failure. Retrying without a key books a
+        second appointment. The key must therefore derive from *what is being done* (call +
+        operation + target), never from a counter or a fresh uuid per attempt -- those change on
+        the retry and defeat the mechanism entirely.
+        """
+        return f"{self._call_id}:{operation}:{discriminator}"
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -107,7 +129,11 @@ class SchedulingClient:
 
     async def hold_slot(self, *, slot_id: int) -> dict:
         try:
-            resp = await self._client.post("/hold-slot", json={"slot_id": slot_id})
+            resp = await self._client.post(
+                "/hold-slot",
+                json={"slot_id": slot_id},
+                headers={"Idempotency-Key": self._idempotency_key("hold", str(slot_id))},
+            )
         except httpx.HTTPError as exc:
             return {"ok": False, "error": f"could not reach the scheduling system ({exc})"}
         if resp.status_code == 409:
@@ -139,7 +165,13 @@ class SchedulingClient:
             "symptom_notes": symptom_notes,
         }
         try:
-            resp = await self._client.post("/confirm-booking", json=payload)
+            resp = await self._client.post(
+                "/confirm-booking",
+                json=payload,
+                # Keyed on the hold: confirming a given hold is the operation, and a retry of
+                # that same confirmation must replay the original confirmation number.
+                headers={"Idempotency-Key": self._idempotency_key("confirm", hold_id)},
+            )
         except httpx.HTTPError as exc:
             return {"ok": False, "error": f"could not reach the scheduling system ({exc})"}
         if resp.status_code == 409:
