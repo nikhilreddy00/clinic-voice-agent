@@ -393,11 +393,29 @@ async def run_agent() -> None:
     )
 
     # --- Conversation context (Phase-2 system prompt + tools) ----------------------------
-    # Today's UTC date is baked into the prompt so relative phrases ("next Tuesday") resolve.
+    # The prompt embeds today's clinic-local date plus a 14-day date->weekday table, which is what
+    # lets relative phrases ("next Tuesday") resolve to the concrete date the scheduling API
+    # filters on. That makes the prompt TIME-SENSITIVE, and the telephony worker is long-lived: it
+    # sits idle for days waiting for inbound calls, so a prompt built once at process start is
+    # already wrong after the first midnight -- the model would resolve "tomorrow" against a stale
+    # table and book the wrong day. Built here so nothing downstream ever sees an empty context,
+    # then rebuilt at the start of each call by _reset_context_for_call() below.
     context = LLMContext(
         messages=[{"role": "system", "content": build_phase2_system_prompt()}],
         tools=tools,
     )
+
+    def _reset_context_for_call() -> None:
+        """Rebuild the system prompt with a current date table, at the start of each call.
+
+        `messages` is a read-only property on LLMContext, so the supported way to replace the
+        conversation is set_messages(). Replacing (rather than appending) also drops any prior
+        call's turns, which matters on telephony where one process can serve a second caller.
+        NOTE: this resets the *conversation* only -- the LatencyCollector is still per-process,
+        so a second call still reports into the first call's collector. Per-call session state is
+        Phase 10 (the in-house event loop); this is the narrow date-correctness fix.
+        """
+        context.set_messages([{"role": "system", "content": build_phase2_system_prompt()}])
     # Barge-in (Phase 4): the user aggregator's built-in turn controller broadcasts an
     # interruption on user-turn-start, which cancels the bot's in-flight TTS/LLM. We gate WHEN a
     # turn starts with MinWordsUserTurnStartStrategy: while the bot speaks it needs >= min_words
@@ -470,6 +488,9 @@ async def run_agent() -> None:
     greeting = greeting_for(settings.mode)
 
     async def _speak_greeting() -> None:
+        # Both modes converge here at "a caller is present", which is the correct moment to
+        # rebuild the date-sensitive system prompt (see _reset_context_for_call above).
+        _reset_context_for_call()
         logger.info("TTS  ▶ synthesis triggered for greeting/disclosure")
         await worker.queue_frames([TTSSpeakFrame(greeting)])
 
