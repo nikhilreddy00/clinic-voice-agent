@@ -58,6 +58,40 @@ DATABASE_URL = os.getenv(
     "CLINIC_DATABASE_URL", "postgresql://postgres@127.0.0.1:5432/clinic_dev"
 )
 
+# Supavisor's transaction-pooler port. Supabase exposes three endpoints and the choice matters:
+#
+#   direct    db.<ref>.supabase.co:5432            IPv6 only (IPv4 is a paid add-on)
+#   session   aws-<region>.pooler.supabase.com:5432 IPv4 on every tier  <-- use this one
+#   transaction aws-<region>.pooler.supabase.com:6543 IPv4, serverless-oriented
+#
+# The session pooler is the right endpoint for this service: a long-lived process holding its own
+# connection pool, on a network that is very often IPv4-only (home ISPs, most CI runners). A
+# direct connection simply fails to resolve there, which looks like a hang rather than a
+# configuration error.
+#
+# The transaction pooler works too, but DOES NOT SUPPORT PREPARED STATEMENTS -- and psycopg3
+# silently starts preparing a statement once it has been executed `prepare_threshold` times
+# (default 5). So the app would work fine, then start failing on the sixth execution of a hot
+# query. That is a genuinely nasty delayed failure, so it is detected and disabled here rather
+# than left as a deployment note nobody reads.
+_TRANSACTION_POOLER_PORT = "6543"
+
+
+def _prepare_threshold() -> int | None:
+    """psycopg3's prepared-statement threshold; None disables preparation entirely.
+
+    Auto-disabled on the transaction pooler (see above). Override with
+    CLINIC_DB_PREPARE_THRESHOLD ("none" to disable, an integer to set it).
+    """
+    override = os.getenv("CLINIC_DB_PREPARE_THRESHOLD")
+    if override is not None:
+        return None if override.strip().lower() in {"none", "off", ""} else int(override)
+    if f":{_TRANSACTION_POOLER_PORT}/" in DATABASE_URL or DATABASE_URL.endswith(
+        f":{_TRANSACTION_POOLER_PORT}"
+    ):
+        return None
+    return 5  # psycopg3's default
+
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 _pool: AsyncConnectionPool | None = None
@@ -79,9 +113,15 @@ async def open_pool() -> AsyncConnectionPool:
         _pool = AsyncConnectionPool(
             DATABASE_URL,
             min_size=1,
+            # Keep this well under the database's connection limit. Supabase's free tier allows
+            # far fewer direct connections than a self-hosted server, and the pool is per
+            # process — N API replicas multiply it.
             max_size=int(os.getenv("CLINIC_DB_POOL_MAX", "10")),
             open=False,
-            kwargs={"row_factory": dict_row},
+            kwargs={
+                "row_factory": dict_row,
+                "prepare_threshold": _prepare_threshold(),
+            },
         )
         await _pool.open(wait=True, timeout=15)
     return _pool

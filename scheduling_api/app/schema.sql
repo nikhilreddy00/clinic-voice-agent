@@ -227,3 +227,39 @@ BEGIN
             FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE SET NULL;
     END IF;
 END $$;
+
+-- =========================================================================================
+-- ROW LEVEL SECURITY
+-- =========================================================================================
+--
+-- Deny-by-default on every table. This is a no-op for the service itself (it connects as a role
+-- that bypasses RLS) and matters entirely for one deployment target: SUPABASE.
+--
+-- Supabase exposes the `public` schema through its Data API (PostgREST). Any table here is
+-- therefore potentially reachable by the `anon` / `authenticated` roles with nothing more than
+-- the project's publishable key -- which is, by design, shipped to browsers. `bookings` holds
+-- patient_name, date_of_birth, and symptom_notes; `patients` and `call_summaries` are worse.
+-- Without RLS that is a PHI disclosure reachable from a browser console.
+--
+-- RLS is enabled with NO policies, which denies everything to non-bypassing roles. That is the
+-- correct posture here because this service is the only intended reader and it connects
+-- directly as an owner/service role. Nothing should be querying these tables through the Data
+-- API; if that ever changes, add explicit policies rather than disabling RLS.
+--
+-- Failure mode to know about: connect as a role WITHOUT bypassrls and every query returns zero
+-- rows rather than an error. That is loud in the right way (obviously broken) instead of quiet
+-- in the wrong way (data leaking).
+
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        'clinics', 'providers', 'slots', 'bookings', 'idempotency_keys',
+        'patients', 'caller_memory', 'call_summaries', 'clinic_facts',
+        'staff_tasks', 'audit_log'
+    ] LOOP
+        IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = t) THEN
+            EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+        END IF;
+    END LOOP;
+END $$;

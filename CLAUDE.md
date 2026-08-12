@@ -158,6 +158,24 @@ export CLINIC_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/clinic_dev
 cd scheduling_api && uv sync --extra dev && uv run uvicorn app.main:app --reload
 cd scheduling_api && uv run pytest        # 35 tests; SKIPPED if no Postgres is reachable
 
+# --- Using Supabase instead of a local Postgres -------------------------------------
+# Supabase IS Postgres, so nothing in the code changes — only CLINIC_DATABASE_URL. Three
+# things to get right (all three are enforced/verified in tests):
+#
+#   1. Use the SESSION POOLER, not the direct connection:
+#        postgresql://postgres.<ref>:<pw>@aws-<region>.pooler.supabase.com:5432/postgres
+#      The direct host (db.<ref>.supabase.co:5432) is IPv6-only unless you buy the IPv4
+#      add-on; on an IPv4-only network it fails as a hang, not a clear error.
+#   2. The TRANSACTION pooler (port 6543) does NOT support prepared statements, and psycopg3
+#      starts preparing after 5 executions — so it works, then breaks on the 6th. db.py
+#      detects port 6543 and disables preparation (override: CLINIC_DB_PREPARE_THRESHOLD).
+#   3. RLS is enabled on every table by schema.sql. Supabase exposes `public` via its Data
+#      API, and bookings/patients hold PHI; without RLS that is readable with the browser-side
+#      publishable key. See tests/test_rls.py.
+#
+# Free tier: 500 MB, and projects PAUSE after ~7 days without database activity — a paused
+# project means the agent cannot book. Keep it warm or use a paid plan for a live demo number.
+
 # Voice agent — local mic/speaker (default, MODE=local)
 cd agent && uv run python -m clinic_agent.pipeline
 
