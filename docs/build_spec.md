@@ -518,3 +518,139 @@ TOOL ▶ POST /confirm-booking → BOOKED confirmation_id=7E45AA57 Thursday, Jul
   Railway logs (the `[session]` summary line). Wiring the public dashboard would mean either copying
   the static files into the API image or having the agent POST its per-call summary to the API — a
   deliberate follow-up, out of scope for the "verify a live cloud call" goal.
+
+---
+
+## Phase 10 — In-house event loop (`agent/src/clinic_agent/core/`)
+
+Pipecat's `Pipeline` / `FrameProcessor` chain is replaced by an orchestration loop this project
+owns. Media transport (LiveKit SIP, the local audio device) and the vendor models are still
+bought — writing a SIP/WebRTC stack is where the rebuild would die, and it is not what the loop
+rewrite is about.
+
+`clinic_agent.pipeline` (Pipecat) is **unchanged and still runnable**. The new engine is a
+separate entrypoint, so a problem in it costs a one-word command change rather than the live
+phone number.
+
+```
+python -m clinic_agent.core     # in-house loop  (MODE=local | telephony)
+python -m clinic_agent.pipeline # Pipecat path   (unchanged fallback)
+```
+
+### The shape
+
+```
+adapters ──emit──▶ asyncio.Queue ──▶ reduce(state, event) ──▶ [actions] ──▶ adapters
+                                          (pure)
+```
+
+| Module | Role |
+|---|---|
+| `events.py` | Typed, JSON-round-trippable events — the only things the reducer sees |
+| `actions.py` | What the reducer asks adapters to do |
+| `state.py` | Immutable `CallState` + the turn-phase FSM |
+| `reducer.py` | Pure `reduce(state, event) -> (state, actions)` — **the engine** |
+| `session.py` | `CallSession`: one queue, one drain loop, all per-call state |
+| `recorder.py` | Trace recording + deterministic replay |
+| `telemetry.py` | Phase-6 latency metrics, re-sourced from events |
+| `adapters/` | `media`, `turn`, `stt`, `llm`, `tts`, `tools` |
+
+**Raw audio is never an event.** 20 ms PCM frames go `media → TurnEngine`; only derived
+decisions (`SpeechStarted`, `SpeechStopped`, `UserInterrupted`) reach the reducer. That is what
+keeps a call trace small enough to commit and exact enough to replay.
+
+**The FSM** (`Phase`: `INIT → GREETING → LISTENING → THINKING → TOOL_WAIT → SPEAKING → CLOSED`)
+is about the *turn*, not the booking script. The prompt still guides what to say; the FSM decides
+what the engine does — and unlike prose, it is enforceable and testable.
+
+### What the purity buys
+
+1. **Deterministic replay.** A recorded call replays through `reduce()` in milliseconds with no
+   audio, no network, and no API keys. This is the phase's exit criterion and becomes the Tier-1
+   eval in Phase 16.
+2. **Speculative execution (Phase 14).** Because the loop owns turn boundaries, it can start an
+   LLM request on a partial transcript and cancel on continue. Not expressible inside a linear
+   frame chain.
+3. **Granular failover (Phase 15).** Provider degradation is just another event, so the
+   degradation ladder becomes testable logic rather than scattered `try/except`.
+
+Every identifier (`req-N`, `utt-N`) is derived from a counter in the state rather than `uuid4()`,
+and the reducer never reads a clock — all timing arrives on the event. Without both, every replay
+comparison would fail for reasons unrelated to the logic under test.
+
+### Ported forward, not rewritten
+
+- **`MicGateLogic`** is unchanged and becomes `TurnEngine` input. `frame_rms` was vectorized with
+  numpy (`frame_rms_pure` retained as the reference, pinned by a parity test): it runs on every
+  20 ms frame, 50×/second per session, directly on the loop that must also deliver audio on time.
+- **`scheduling_tools.py`** schemas carry over untouched. The HTTP + logging + metrics body was
+  extracted into `execute_tool()`, now shared verbatim by the Pipecat handlers and the core
+  `ToolExecutor` — one implementation, so the two engines cannot drift.
+- **`metrics.py`**'s `LatencyCollector` is unchanged; only its input moved from three frame taps
+  to one event subscriber. The Phase-6 failure mode where watching the wrong frame class silently
+  recorded `turns=0` is now structurally impossible: there is one `SpeechStopped` event and it
+  means one thing.
+
+### Defects found and fixed during the build
+
+Both surfaced on the first end-to-end run, and neither is visible in unit tests:
+
+- **Sentence splitter broke on abbreviations.** `"...with Dr. Aisha Patel?"` was split into
+  `"...with Dr."` and `"Aisha Patel?"`. Every provider in the clinic is a "Dr.", so this fired on
+  essentially every booking. `_is_sentence_end()` now rejects a period after a known abbreviation
+  or a single-letter initial.
+- **`CallerPresent` could be reduced before `CallStarted`.** Both transports can announce a caller
+  the instant they start — the local mic is live as soon as its stream opens, and a SIP call can
+  be bridged into the room before the agent finishes connecting. The greeting would then be chosen
+  against the default mode and a **telephony caller would never hear the call-recording consent
+  line**. `CallStarted` is now enqueued before any adapter starts.
+
+### Vendor boundaries (raw, no Pipecat wrapper)
+
+| Layer | Implementation | Detail worth knowing |
+|---|---|---|
+| STT | Deepgram websocket | Segments accumulate on `is_final` and release on `speech_final`; `UtteranceEnd` is the backstop. Emitting per `is_final` would restart the LLM three times per sentence. |
+| LLM | `anthropic` SDK streaming | Text deltas stream live (feeds sentence-by-sentence TTS); tool calls emit after the stream so the SDK assembles the JSON. Cancellation emits **no** `LLMFailed`. |
+| TTS | Cartesia websocket | One `context_id` per utterance, sentences appended with `continue: true`, closed by a `final` flush — continuous prosody instead of butted-together fragments. |
+| Media | PyAudio / `livekit.rtc` | Owns playback, and therefore owns `BotStartedSpeaking` / `BotStoppedSpeaking`. Cartesia's `done` means *synthesis* finished; using it as end-of-turn would reopen the mic mid-sentence. |
+| VAD | `SileroVADAnalyzer` (kept from Pipecat) | A plain ONNX wrapper with an `analyze_audio()` coroutine, not a pipeline component. Re-implementing it buys nothing. |
+
+Prompt caching is wired but **off by default** (`CLINIC_PROMPT_CACHE=1`): Phase 8 measured the
+cacheable prefix at 3,811 tokens against Haiku 4.5's 4,096 minimum, where Anthropic accepts the
+breakpoint and silently caches nothing. Enable it together with a model whose minimum the prompt
+clears, and verify with a non-zero `usage.cache_read_input_tokens`.
+
+### Verification
+
+`agent/tests/` — 70 passing.
+
+- `test_reducer.py` (30) — the FSM: greeting determinism, streaming TTS chunking, the tool
+  round-trip, parallel-result ordering, stale-request rejection, and the nastiest state in the
+  loop: **an interruption mid-tool must synthesize cancellation `tool_result` blocks**, because
+  Anthropic rejects a conversation containing a `tool_use` with no matching result.
+- `test_replay.py` (9) — record → disk → `reduce()` reproduces identical state *and* identical
+  action sequence; replays are stable across runs; traces survive a newly added event field.
+- `test_session.py` (5) — the real `CallSession` loop with vendor adapters faked: full booking,
+  barge-in cancelling both LLM and TTS, the `CallStarted` ordering guarantee, and **two sessions
+  in one process sharing no state** (the defect this phase exists to fix).
+
+**Text-in-the-loop run** (real Claude, real scheduling API against local Postgres; only
+media/STT/TTS faked) — a 10-turn booking completed end to end:
+
+```
+outcome=booked turns=10 events=131
+tools invoked : check_availability, check_availability, hold_slot, confirm_booking
+greeting      : AI disclosure + call-recording consent (MODE=telephony)
+LLM p50=648ms p95=1469ms   E2E p50=912ms p95=2689ms   (ASR/TTS faked, so ~0)
+replay of the recorded trace matches the live final state exactly
+```
+
+The two `check_availability` calls are the Phase-4 empty-window fallback working: the first
+filtered lookup came back empty, and the agent re-checked without a date filter rather than
+escalating.
+
+**Not yet verified:** a live phone call through the new engine. The LLM adapter was checked
+against the real Anthropic API (TTFT 780 ms, correct date resolution, correct tool schema), and
+the tool executor against the real scheduling API on both paths — but the media/STT/TTS adapters
+have not carried real audio. That is the remaining step before the new engine replaces the
+Pipecat path as the default.

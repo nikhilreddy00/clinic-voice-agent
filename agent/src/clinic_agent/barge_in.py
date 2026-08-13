@@ -32,12 +32,17 @@ import math
 import os
 from dataclasses import dataclass
 
+try:  # numpy ships with the audio stack; the pure fallback keeps this module dependency-free
+    import numpy as _np
+except ImportError:  # pragma: no cover - exercised only on a numpy-less install
+    _np = None
 
-def frame_rms(audio: bytes) -> float:
-    """Root-mean-square amplitude of 16-bit PCM ``audio`` (host-native byte order).
 
-    Returns 0.0 for empty input. Local dev targets (macOS/Linux, x86-64/arm64) are all
-    little-endian, matching PyAudio's native int16 delivery, so no byte-swap is needed.
+def frame_rms_pure(audio: bytes) -> float:
+    """Reference implementation: RMS of 16-bit PCM in pure Python.
+
+    Kept as the definition of correct. :func:`frame_rms` is the fast path used in production
+    and is tested for parity against this.
     """
     if not audio:
         return 0.0
@@ -50,6 +55,28 @@ def frame_rms(audio: bytes) -> float:
     for s in samples:
         acc += s * s
     return math.sqrt(acc / len(samples))
+
+
+def frame_rms(audio: bytes) -> float:
+    """Root-mean-square amplitude of 16-bit PCM ``audio`` (host-native byte order).
+
+    Returns 0.0 for empty input. Local dev targets (macOS/Linux, x86-64/arm64) are all
+    little-endian, matching PyAudio's native int16 delivery, so no byte-swap is needed.
+
+    Vectorized in Phase 10. This is called on **every** 20 ms input frame — 50×/second per
+    session — directly on the asyncio event loop that also has to deliver audio on time. The
+    per-sample Python loop in :func:`frame_rms_pure` was affordable at one call per process;
+    at the N-sessions-per-worker target of Phase 11 it is exactly the kind of CPU-bound work
+    on the loop that makes one caller's audio stutter because of another's. Accumulating in
+    float64 also removes the unbounded int growth of the pure version.
+    """
+    if not audio or _np is None:
+        return frame_rms_pure(audio)
+    usable = len(audio) - (len(audio) % 2)
+    if usable <= 0:
+        return 0.0
+    samples = _np.frombuffer(audio[:usable], dtype=_np.int16)
+    return float(_np.sqrt(_np.mean(_np.square(samples, dtype=_np.float64))))
 
 
 def barge_in_min_words() -> int:

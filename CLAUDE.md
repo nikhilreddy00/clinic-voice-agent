@@ -23,7 +23,7 @@ this repo, logs, or prompts.**
 | ASR | Speech → text | Deepgram (`pipecat.services.deepgram`) |
 | LLM | Reasoning / dialogue | Anthropic Claude Haiku 4.5 (`pipecat.services.anthropic`) — see LLM-provider note below |
 | TTS | Text → speech | Cartesia (`pipecat.services.cartesia`); Piper for free-tier testing (TODO) |
-| Orchestration | Pipeline, turn-taking, context | Pipecat (`Pipeline` / `PipelineWorker` / `WorkerRunner`) |
+| Orchestration | Pipeline, turn-taking, context | **In-house event loop** (`clinic_agent.core`, Phase 10); Pipecat retained as the fallback path |
 | Scheduling backend | Availability / hold / booking | FastAPI service (`scheduling_api/`) |
 | Storage | Slots & bookings | **Postgres** (`CLINIC_DATABASE_URL`) — Phase 9; was SQLite |
 
@@ -128,6 +128,23 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
   `CLINIC_API_TOKEN` auth, and the Phase 12/13 schema landed early so there is one migration.
   Fixed the seed timezone bug: slots were built as 09:00 **UTC** (05:00 clinic-local); they are
   now generated in `America/New_York` and stored as `timestamptz`.
+- **Phase 10 — in-house event loop.** ✅ New package `agent/src/clinic_agent/core/` replaces
+  Pipecat's `Pipeline`/`FrameProcessor` chain with `reduce(state, event) -> (state, actions)` —
+  pure, no I/O, no clock reads, ids derived from state counters. Adapters (media/turn/STT/LLM/
+  TTS/tools) talk to the vendors directly and communicate only in events. **Media transport is
+  still bought** (LiveKit SIP / local audio); Silero VAD is kept from Pipecat as a library.
+  Full detail: `docs/build_spec.md` → *Phase 10*. Things to know before touching this:
+  - **Raw audio is never an event** — `media → TurnEngine` emits only derived decisions. That's
+    what makes traces committable and replay exact.
+  - **`python -m clinic_agent.core` is the new entrypoint**; `clinic_agent.pipeline` (Pipecat)
+    is unchanged and still runs. The new engine is **not yet the default** — it has not carried
+    real audio on a live call.
+  - **All per-call state is constructed in `CallSession`**, fixing the Phase-1..9 defect where
+    it lived in `run_agent()` locals and caller #2 inherited caller #1's history.
+  - **`scheduling_tools.execute_tool()` is shared by both engines.** Change tool behavior there,
+    never in one path only.
+  - Adapters are built via overridable `_build_*` methods on `CallSession` — that seam is what
+    Phase 11's Tier-A load test (fake adapters, injected latency) will use.
 
 ## Conventions & governance
 
@@ -185,12 +202,17 @@ cd scheduling_api && uv run python scripts/migrate.py
 #   * FREE TIER PAUSES after ~7 days without database activity. A paused project means the
 #     agent cannot book. Keep it warm, or upgrade before relying on the demo number.
 
-# Voice agent — local mic/speaker (default, MODE=local)
+# Voice agent — in-house event loop (Phase 10). MODE=local | telephony
+cd agent && uv run python -m clinic_agent.core
+cd agent && MODE=telephony uv run python -m clinic_agent.core
+
+# Voice agent — Pipecat path (unchanged fallback; same MODE switch)
 cd agent && uv run python -m clinic_agent.pipeline
 
-# Voice agent — telephony (LiveKit SIP, inbound calls to +14842950169)
-cd agent && uv run python scripts/setup_livekit_sip.py   # one-time, idempotent trunk+rule
-cd agent && MODE=telephony uv run python -m clinic_agent.pipeline
+# Telephony either way needs the one-time, idempotent SIP trunk + dispatch rule:
+cd agent && uv run python scripts/setup_livekit_sip.py
+
+cd agent && uv run pytest        # 70 tests, no network/keys needed
 ```
 
 `MODE` (default `local`) is the only switch between the laptop mic/speaker path and the LiveKit
@@ -199,7 +221,14 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Project complete — all 7 phases (0–7) done.** Phases 0–5 are done (scaffold + mock API, live
+**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 10 of 17.**
+Phase 8 (model bake-off harness) is built but the sweep has not been run; Phase 9 (Postgres +
+Supabase) and Phase 10 (in-house event loop) are done. **Next: Phase 11 — concurrency + load
+proof** (Individual SIP dispatch → room-per-call, multi-session worker, session router, Tier-A/B
+load tests). The one open item from Phase 10 is a live phone call through the new engine before
+it becomes the default.
+
+The original Phase 0–7 record follows. Phases 0–5 are done (scaffold + mock API, live
 ASR→LLM→TTS loop, scheduling-API tool calls, dialogue hardening + headless eval, barge-in, and
 LiveKit SIP telephony verified end to end by live inbound calls). Phase 6 added observability,
 Docker, and the demo launcher; Phase 7 shipped the recruiter-facing `README.md`,

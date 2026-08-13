@@ -52,6 +52,14 @@ TELEPHONY_GREETING = (
 )
 
 
+# Scripted line spoken when the LLM request itself fails (Phase 10). The in-house event loop
+# turns an LLM error into a spoken recovery instead of dead air, and the wording is fixed
+# rather than model-generated for the obvious reason: the model is what just failed.
+SYSTEM_ERROR_LINE = (
+    "Sorry, I'm having trouble on my end. Could you say that again?"
+)
+
+
 def greeting_for(mode: str) -> str:
     """Return the greeting for the given runtime mode.
 

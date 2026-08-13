@@ -1,0 +1,264 @@
+"""Phase 10 — CallSession: the drain loop that ties the engine together.
+
+One ``CallSession`` == one call. It owns a single ``asyncio.Queue`` of events, the adapter set,
+and the loop that does the only thing this engine does:
+
+    event = await queue.get()  ->  record  ->  meter  ->  reduce()  ->  execute actions
+
+Everything else is an adapter turning an action into I/O and pushing the result back as an
+event.
+
+**Every piece of per-call state is constructed here.** That is the concrete defect this phase
+exists to fix: through Phase 9 the ``LatencyCollector``, ``SchedulingClient``, ``LLMContext``,
+and mic gate were function-locals of ``pipeline.run_agent()``, built once per *process*. On the
+telephony path one process serves whatever calls arrive, so caller #2 inherited caller #1's
+message history and wrote turns into an already-finalized metrics summary. Here two sessions
+in one process share nothing but the event loop — which is what Phase 11 needs in order to put
+N calls in one worker.
+
+Adapters are wired with plain callbacks rather than a registry: ``media -> TurnEngine -> STT``
+for audio in, and ``TTS -> media`` for audio out. Audio never becomes an event.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import replace
+
+from loguru import logger
+
+from livekit import api as livekit_api
+
+from ..config import TELEPHONY_ROOM_NAME, Settings
+from ..metrics import LatencyCollector
+from ..prompts import build_phase2_system_prompt
+from ..scheduling_tools import SchedulingClient, build_tools_schema
+from . import events as ev
+from . import telemetry
+from .actions import (
+    Action,
+    CancelLLM,
+    CancelSpeech,
+    EndCall,
+    InvokeTool,
+    Speak,
+    StartLLM,
+)
+from .adapters.llm import AnthropicLLM
+from .adapters.media import LiveKitMedia, LocalMedia, MediaAdapter
+from .adapters.stt import DeepgramSTT
+from .adapters.tools import ToolExecutor
+from .adapters.tts import CartesiaTTS
+from .adapters.turn import TurnEngine
+from .recorder import TraceRecorder
+from .reducer import reduce
+from .state import CallState, Phase
+
+
+def _livekit_join_token(settings: Settings, room_name: str, identity: str) -> str:
+    """Mint a LiveKit room-join JWT for the agent from the API key/secret in .env."""
+    return (
+        livekit_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
+        .with_identity(identity)
+        .with_name("Clinic Scheduling Agent")
+        .with_grants(livekit_api.VideoGrants(room_join=True, room=room_name))
+        .to_jwt()
+    )
+
+
+class CallSession:
+    """One voice call, end to end."""
+
+    def __init__(self, settings: Settings, *, call_id: str | None = None, record: bool = True) -> None:
+        self.settings = settings
+        self.state = CallState()
+        self._queue: asyncio.Queue[ev.Event] = asyncio.Queue()
+        self._seq = 0
+        self._closed = asyncio.Event()
+
+        self.metrics = LatencyCollector(mode=settings.mode, call_id=call_id)
+        self.call_id = self.metrics.call_id
+        self._recorder = TraceRecorder(self.call_id, enabled=record)
+
+        # --- adapters -------------------------------------------------------------------
+        # Built through overridable factories rather than inline, so a subclass can swap any
+        # one of them. That seam is what the Phase-11 Tier-A load test needs: driving 1,000
+        # synthetic sessions means fake STT/LLM/TTS adapters that inject realistic latency
+        # distributions, exercising this exact loop with no vendor spend. Tests use it too.
+        #
+        # Construction order matters: media owns playback, so TTS needs it; STT owns the
+        # socket, so the TurnEngine needs it.
+        self._llm = self._build_llm()
+        self._tools = self._build_tools()
+        self.media: MediaAdapter = self._build_media()
+        self._tts = self._build_tts()
+        self._stt = self._build_stt()
+        self._turn = self._build_turn()
+
+    def _build_llm(self):
+        """The system prompt is built HERE, per call, not per process.
+
+        It embeds today's clinic-local date plus a 14-day date→weekday table, so a long-lived
+        telephony worker idle since yesterday would otherwise resolve "tomorrow" against a
+        stale table and book the wrong day.
+        """
+        return AnthropicLLM(
+            api_key=self.settings.anthropic_api_key,
+            model=self.settings.anthropic_model,
+            system_prompt=build_phase2_system_prompt(),
+            tools=build_tools_schema(),
+            emit=self.emit,
+        )
+
+    def _build_tools(self):
+        # call_id scopes the client's Idempotency-Keys to this call, so a retry after a
+        # timed-out voice turn replays the original booking instead of creating a second
+        # appointment, while two concurrent callers never collide on a key.
+        return ToolExecutor(
+            SchedulingClient(self.settings.scheduling_api_base_url, call_id=self.call_id),
+            emit=self.emit,
+            collector=self.metrics,
+        )
+
+    def _build_media(self) -> MediaAdapter:
+        if self.settings.mode == "telephony":
+            token = _livekit_join_token(self.settings, TELEPHONY_ROOM_NAME, "clinic-agent")
+            return LiveKitMedia(
+                emit=self.emit,
+                on_audio=self._on_audio,
+                url=self.settings.livekit_url,
+                token=token,
+                room_name=TELEPHONY_ROOM_NAME,
+            )
+        return LocalMedia(emit=self.emit, on_audio=self._on_audio)
+
+    def _build_tts(self):
+        return CartesiaTTS(
+            api_key=self.settings.cartesia_api_key,
+            voice_id=self.settings.cartesia_voice_id,
+            emit=self.emit,
+            play=self.media.play,
+            end_utterance=self.media.end_utterance,
+            clear_playback=self.media.clear,
+        )
+
+    def _build_stt(self):
+        return DeepgramSTT(
+            api_key=self.settings.deepgram_api_key,
+            emit=self.emit,
+            on_partial=lambda text, now: self._turn.on_partial_transcript(text, now),
+        )
+
+    def _build_turn(self) -> TurnEngine:
+        return TurnEngine(emit=self.emit, forward_audio=self._stt.send_audio)
+
+    async def _on_audio(self, pcm: bytes, now: float) -> None:
+        await self._turn.feed(pcm, now)
+
+    # --- event intake -------------------------------------------------------------------
+
+    def emit(self, event: ev.Event) -> None:
+        """Accept an event from an adapter. Synchronous so callbacks can call it directly.
+
+        ``seq`` is stamped here rather than by the producer: adapters run as several concurrent
+        tasks, and the order events are accepted onto this queue *is* the order the reducer
+        sees them, which is exactly what a replay has to reproduce.
+        """
+        self._seq += 1
+        self._queue.put_nowait(replace(event, seq=self._seq))
+
+    # --- lifecycle ----------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Start the adapters and drain events until the call closes."""
+        logger.info(
+            f"[session] call_id={self.call_id} mode={self.settings.mode!r} "
+            f"engine=core (in-house event loop)"
+        )
+        logger.info(f"[metrics] structured latency log → {self.metrics.log_path}")
+        if self._recorder.enabled:
+            logger.info(f"[trace] event trace → {self._recorder.path}")
+
+        # CallStarted MUST be enqueued before any adapter can emit. Starting the media adapter
+        # can produce CallerPresent synchronously — the local mic is live the moment its stream
+        # opens, and on telephony a SIP call can already be bridged into the room before the
+        # agent finishes connecting. If CallerPresent were reduced first, the greeting would be
+        # chosen against the default mode and a telephony caller would never hear the
+        # call-recording consent line. That is a governance failure, not a cosmetic ordering nit.
+        self.emit(ev.CallStarted(t=time.monotonic(), call_id=self.call_id, mode=self.settings.mode))
+
+        await self._stt.start()
+        await self._tts.start()
+        await self.media.start()
+
+        try:
+            await self._drain()
+        finally:
+            await self._teardown()
+
+    async def _drain(self) -> None:
+        while True:
+            event = await self._queue.get()
+            self._recorder.record(event)
+            telemetry.record_event(self.metrics, event)
+            self._notify_turn_engine(event)
+
+            self.state, actions = reduce(self.state, event)
+            for action in actions:
+                await self._execute(action)
+
+            if self.state.phase is Phase.CLOSED:
+                return
+
+    def _notify_turn_engine(self, event: ev.Event) -> None:
+        """Keep the mic gate in step with playback.
+
+        Driven from the same event stream the reducer sees rather than from the TTS adapter, so
+        the gate opens and closes at exactly the moments the state machine believes it does.
+        """
+        if isinstance(event, ev.BotStartedSpeaking):
+            self._turn.on_bot_started(event.t)
+        elif isinstance(event, ev.BotStoppedSpeaking):
+            self._turn.on_bot_stopped(event.t)
+
+    async def _execute(self, action: Action) -> None:
+        if isinstance(action, StartLLM):
+            self._llm.start(action.request_id, action.messages)
+        elif isinstance(action, CancelLLM):
+            self._llm.cancel(action.request_id)
+        elif isinstance(action, Speak):
+            if action.deterministic:
+                logger.info(f"TTS  ▶ speaking scripted line: {action.text!r}")
+            await self._tts.speak(action.utterance_id, action.text, final=action.final)
+        elif isinstance(action, CancelSpeech):
+            await self._tts.cancel(action.utterance_id)
+        elif isinstance(action, InvokeTool):
+            self._tools.invoke(action.tool_call_id, action.name, action.arguments)
+        elif isinstance(action, EndCall):
+            logger.info(f"[session] ending call ({action.reason})")
+            self._closed.set()
+
+    def hangup(self, reason: str = "shutdown") -> None:
+        """Close the call from outside the loop (Ctrl-C, worker shutdown)."""
+        self.emit(ev.Hangup(t=time.monotonic(), reason=reason))
+
+    async def _teardown(self) -> None:
+        stats = self._turn.stats()
+        logger.info(
+            f"[barge-in] session totals: candidates={stats['bargein_candidates']}, "
+            f"real={stats['bargein_true']}, false-positive={stats['bargein_false']}, "
+            f"suppressed_echo_frames={stats['suppressed_frames']}"
+        )
+        logger.info(
+            f"[session] outcome={self.state.outcome} turns={self.state.turn_index} "
+            f"interruptions={self.state.interruptions} events={self._seq}"
+        )
+        self.metrics.finalize()
+
+        for closer in (self._stt.aclose, self._tts.aclose, self.media.aclose,
+                       self._tools.aclose, self._llm.aclose):
+            try:
+                await closer()
+            except Exception as exc:  # noqa: BLE001 - one failed close must not skip the rest
+                logger.warning(f"[session] teardown error in {closer.__qualname__}: {exc}")

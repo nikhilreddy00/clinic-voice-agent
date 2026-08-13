@@ -19,7 +19,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from clinic_agent.barge_in import BargeInConfig, MicGateLogic, frame_rms  # noqa: E402
+from clinic_agent.barge_in import (  # noqa: E402
+    BargeInConfig,
+    MicGateLogic,
+    frame_rms,
+    frame_rms_pure,
+)
 
 # Default gate: 600 ms sustained @ 20 ms/frame = 30 voiced frames to open; RMS voiced >= 500.
 CFG = BargeInConfig()
@@ -134,6 +139,26 @@ def test_frame_rms():
     assert abs(frame_rms(array.array("h", [1000] * 100).tobytes()) - 1000.0) < 1e-6
     # Odd trailing byte is tolerated (guarded), not a crash.
     assert frame_rms(array.array("h", [500] * 10).tobytes() + b"\x01") > 0.0
+
+
+def test_frame_rms_matches_the_pure_reference():
+    """Phase 10 vectorized the RMS hot path; it has to give the same answer as before.
+
+    This runs on every 20 ms input frame — 50x/second per session — so it was rewritten with
+    numpy to keep CPU-bound work off the event loop at the Phase-11 concurrency target. The
+    pure implementation stays as the definition of correct, and this pins the two together.
+    """
+    cases = [
+        b"",
+        array.array("h", [0] * 320).tobytes(),
+        array.array("h", [1000] * 320).tobytes(),
+        array.array("h", [-32768, 32767] * 160).tobytes(),   # full-scale, worst case for overflow
+        array.array("h", range(-160, 160)).tobytes(),
+        array.array("h", [500] * 10).tobytes() + b"\x01",     # stray odd byte
+    ]
+    for pcm in cases:
+        fast, pure = frame_rms(pcm), frame_rms_pure(pcm)
+        assert abs(fast - pure) <= 1e-9 * max(1.0, pure), f"{fast} != {pure} for {len(pcm)} bytes"
 
 
 def _run_all() -> int:

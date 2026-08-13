@@ -208,19 +208,36 @@ def _tool_http_status(result: dict) -> int | None:
     return result.get("status")
 
 
-def register_scheduling_functions(
-    llm: LLMService,
+# Tool name -> the scheduling-API endpoint it maps to. Used for the metrics sink and the
+# TOOL ▶ log lines, and shared by both execution paths (see execute_tool).
+TOOL_ENDPOINTS = {
+    "check_availability": "/availability",
+    "hold_slot": "/hold-slot",
+    "confirm_booking": "/confirm-booking",
+}
+
+
+async def execute_tool(
     client: SchedulingClient,
+    name: str,
+    arguments: dict,
     collector: "LatencyCollector | None" = None,
-) -> None:
-    """Register the three scheduling functions on the LLM service.
+) -> tuple[dict, float, int | None]:
+    """Run one scheduling tool call: HTTP + `TOOL ▶` logging + metrics.
 
-    `collector` (Phase 6, optional) receives a `tool` metrics event per call — endpoint, HTTP
-    status, latency, success — and an escalation mark when availability comes back empty.
+    This is the single implementation shared by the Pipecat pipeline (via the function handlers
+    registered below) and the Phase-10 in-house event loop (via
+    ``core.adapters.tools.ToolExecutor``). Both paths must behave identically — same requests,
+    same PHI-minimized log lines, same metrics — so there is exactly one copy of this logic
+    rather than two that quietly diverge.
+
+    Returns ``(result, latency_ms, http_status)``. Never raises for an API failure: the client
+    maps those to ``{"ok": False, "error": ...}`` so the model can apologize and recover.
     """
+    args = arguments or {}
+    t0 = time.monotonic()
 
-    async def check_availability(params: FunctionCallParams) -> None:
-        args = params.arguments or {}
+    if name == "check_availability":
         date = args.get("date")
         reason = args.get("reason_category")
         provider_id = args.get("provider_id")
@@ -228,97 +245,105 @@ def register_scheduling_functions(
             f"TOOL ▶ GET /availability req={{date={date!r}, reason={reason!r}, "
             f"provider_id={provider_id!r}}}"
         )
-        _t0 = time.monotonic()
         result = await client.get_availability(date=date, reason=reason, provider_id=provider_id)
-        if collector:
-            collector.record_tool(
-                "/availability", _tool_http_status(result),
-                (time.monotonic() - _t0) * 1000, bool(result.get("ok")),
-            )
-        if not result.get("ok"):
-            logger.warning(f"TOOL ▶ GET /availability FAILED → {result.get('error')!r}")
-        elif result["count"] == 0:
-            # This is the escalation trigger. There is no human-handoff path yet (warm transfer
-            # is Phase 7), so "escalate" here means the LLM speaks an apology + hand-off line
-            # only — no call is transferred. Logged explicitly so it's obvious under test.
-            logger.warning(
-                "TOOL ▶ GET /availability → 0 slots (no availability) — agent will ESCALATE: "
-                "spoken hand-off message only, no human transfer until Phase 7"
-            )
-            if collector:
-                collector.mark_escalation()  # overridden by a later successful confirm_booking
-        else:
-            preview = ", ".join(
-                f"#{s['slot_id']} {s['display_time']} ({s['provider_name']})"
-                for s in result["slots"][:4]
-            )
-            more = "" if result["count"] <= 4 else f" (+{result['count'] - 4} more)"
-            logger.info(f"TOOL ▶ GET /availability → {result['count']} slots: {preview}{more}")
-        await params.result_callback(result)
-
-    async def hold_slot(params: FunctionCallParams) -> None:
-        args = params.arguments or {}
+    elif name == "hold_slot":
         slot_id = args.get("slot_id")
         logger.info(f"TOOL ▶ POST /hold-slot req={{slot_id={slot_id!r}}}")
-        _t0 = time.monotonic()
         result = await client.hold_slot(slot_id=slot_id)
-        if collector:
-            collector.record_tool(
-                "/hold-slot", _tool_http_status(result),
-                (time.monotonic() - _t0) * 1000, bool(result.get("ok")),
-            )
-        if result.get("ok"):
-            logger.info(
-                f"TOOL ▶ POST /hold-slot → held slot {result['slot_id']} "
-                f"hold_id={result['hold_id']} expires_at={result['expires_at']}"
-            )
-        else:
-            logger.warning(f"TOOL ▶ POST /hold-slot FAILED → {result.get('error')!r}")
-        await params.result_callback(result)
-
-    async def confirm_booking(params: FunctionCallParams) -> None:
-        args = params.arguments or {}
-        hold_id = args.get("hold_id")
-        patient_name = args.get("patient_name")
-        reason = args.get("reason")
-        date_of_birth = args.get("date_of_birth")
-        new_patient = args.get("new_patient")
-        symptom_notes = args.get("symptom_notes")
+    elif name == "confirm_booking":
         # PHI minimization (governance: no patient data in logs). DOB and the free-text symptom
         # note are the most sensitive fields, so log only presence/length indicators, never the
         # values themselves. new_patient is a non-identifying boolean and is safe to log.
+        symptom_notes = args.get("symptom_notes")
         logger.info(
-            f"TOOL ▶ POST /confirm-booking req={{hold_id={hold_id!r}, "
-            f"patient_name={patient_name!r}, reason={reason!r}, "
-            f"dob={'set' if date_of_birth else 'unset'}, new_patient={new_patient!r}, "
+            f"TOOL ▶ POST /confirm-booking req={{hold_id={args.get('hold_id')!r}, "
+            f"patient_name={args.get('patient_name')!r}, reason={args.get('reason')!r}, "
+            f"dob={'set' if args.get('date_of_birth') else 'unset'}, "
+            f"new_patient={args.get('new_patient')!r}, "
             f"symptom_notes_len={len(symptom_notes) if symptom_notes else 0}}}"
         )
-        _t0 = time.monotonic()
         result = await client.confirm_booking(
-            hold_id=hold_id,
-            patient_name=patient_name,
-            reason=reason,
-            date_of_birth=date_of_birth,
-            new_patient=new_patient,
+            hold_id=args.get("hold_id"),
+            patient_name=args.get("patient_name"),
+            reason=args.get("reason"),
+            date_of_birth=args.get("date_of_birth"),
+            new_patient=args.get("new_patient"),
             symptom_notes=symptom_notes,
         )
-        if collector:
-            collector.record_tool(
-                "/confirm-booking", _tool_http_status(result),
-                (time.monotonic() - _t0) * 1000, bool(result.get("ok")),
-            )
-        if result.get("ok"):
-            logger.info(
-                f"TOOL ▶ POST /confirm-booking → BOOKED confirmation_id={result['confirmation_id']} "
-                f"{result['display_time']} with {result['provider_name']} for {result['patient_name']}"
-            )
-        else:
-            logger.warning(f"TOOL ▶ POST /confirm-booking FAILED → {result.get('error')!r}")
-        await params.result_callback(result)
+    else:
+        logger.warning(f"TOOL ▶ unknown tool {name!r} requested by the model")
+        return {"ok": False, "error": f"unknown tool {name}"}, 0.0, None
 
-    llm.register_function("check_availability", check_availability)
-    llm.register_function("hold_slot", hold_slot)
-    llm.register_function("confirm_booking", confirm_booking)
+    latency_ms = (time.monotonic() - t0) * 1000
+    http_status = _tool_http_status(result)
+    endpoint = TOOL_ENDPOINTS[name]
+    if collector:
+        collector.record_tool(endpoint, http_status, latency_ms, bool(result.get("ok")))
+
+    _log_tool_result(name, endpoint, result, collector)
+    return result, latency_ms, http_status
+
+
+def _log_tool_result(
+    name: str, endpoint: str, result: dict, collector: "LatencyCollector | None"
+) -> None:
+    """Human-readable `TOOL ▶` result line, plus the empty-availability escalation mark."""
+    if not result.get("ok"):
+        logger.warning(f"TOOL ▶ {endpoint} FAILED → {result.get('error')!r}")
+        return
+
+    if name == "check_availability":
+        if result["count"] == 0:
+            # This is the escalation trigger. There is no live human-transfer path in this
+            # build (warm transfer is Phase 15), so "escalate" means the agent speaks an
+            # apology + hand-off line only. Logged explicitly so it's obvious under test.
+            logger.warning(
+                "TOOL ▶ GET /availability → 0 slots (no availability) — agent will ESCALATE: "
+                "spoken hand-off message only, no human transfer in this build"
+            )
+            if collector:
+                collector.mark_escalation()  # overridden by a later successful confirm_booking
+            return
+        preview = ", ".join(
+            f"#{s['slot_id']} {s['display_time']} ({s['provider_name']})"
+            for s in result["slots"][:4]
+        )
+        more = "" if result["count"] <= 4 else f" (+{result['count'] - 4} more)"
+        logger.info(f"TOOL ▶ GET /availability → {result['count']} slots: {preview}{more}")
+    elif name == "hold_slot":
+        logger.info(
+            f"TOOL ▶ POST /hold-slot → held slot {result['slot_id']} "
+            f"hold_id={result['hold_id']} expires_at={result['expires_at']}"
+        )
+    elif name == "confirm_booking":
+        logger.info(
+            f"TOOL ▶ POST /confirm-booking → BOOKED confirmation_id={result['confirmation_id']} "
+            f"{result['display_time']} with {result['provider_name']} for {result['patient_name']}"
+        )
+
+
+def register_scheduling_functions(
+    llm: LLMService,
+    client: SchedulingClient,
+    collector: "LatencyCollector | None" = None,
+) -> None:
+    """Register the three scheduling functions on the LLM service (Pipecat path).
+
+    `collector` (Phase 6, optional) receives a `tool` metrics event per call — endpoint, HTTP
+    status, latency, success — and an escalation mark when availability comes back empty.
+    """
+
+    def _handler(name: str):
+        async def handle(params: FunctionCallParams) -> None:
+            result, _latency_ms, _status = await execute_tool(
+                client, name, params.arguments or {}, collector
+            )
+            await params.result_callback(result)
+
+        return handle
+
+    for tool_name in TOOL_ENDPOINTS:
+        llm.register_function(tool_name, _handler(tool_name))
 
 
 def build_tools_schema() -> ToolsSchema:
