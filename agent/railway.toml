@@ -1,22 +1,46 @@
-# Railway deploy config — Pipecat voice agent (MODE=telephony).
+# Railway deploy config — clinic voice agent (MODE=telephony).
 #
-# The agent is an OUTBOUND worker: at startup it mints a LiveKit join token and connects OUT to
-# LiveKit Cloud (room "clinic-inbound"), then waits for the inbound SIP caller. It exposes no
-# port and needs no public domain on Railway — only outbound network access. LiveKit Cloud
+# The agent is an OUTBOUND worker: it connects OUT to LiveKit Cloud and waits for callers. It
+# exposes no port and needs no public domain — only outbound network access. LiveKit Cloud
 # terminates the PSTN/SIP call and bridges media; Railway just runs the worker.
 #
-# It MUST stay up continuously: with the Direct dispatch rule, the agent has to already be
-# joined to the room when a call lands, so restartPolicyType = "always". One replica only —
-# a single process holds one audio pipeline on the event loop (see CLAUDE.md concurrency note).
+# Secrets (DEEPGRAM/ANTHROPIC/CARTESIA/LIVEKIT keys) and SCHEDULING_API_BASE_URL are injected as
+# Railway environment variables — never baked into the image. MODE=telephony and the start
+# command come from the Dockerfile.
 #
-# Secrets (DEEPGRAM/ANTHROPIC/CARTESIA/LIVEKIT keys) and SCHEDULING_API_BASE_URL (the deployed
-# API's public URL) are injected as Railway environment variables — never baked into the image.
-# MODE=telephony and the start command come from the Dockerfile.
+# WHY numReplicas = 1
+# -------------------
+# Phase 11 removed the *engine's* reason for this and left the *deployment's* reason standing.
+# Both need saying, because they are different constraints and only one of them is now fixed.
+#
+#   1. The engine used to be single-call. It is not any more. Per-call state moved into
+#      CallSession (Phase 10), and clinic_agent.core.worker.Worker hosts many of them in one
+#      process; the Tier-A load test drives 1,000 concurrent sessions in a single process with
+#      flat event-loop lag (loadtest/, docs/build_spec.md → Phase 11). The old note here said
+#      the GIL made this impossible. The GIL was real; the conclusion was wrong. The fix was
+#      making per-session work non-blocking — shared Silero weights, a bounded inference pool,
+#      buffered log sinks — not one process per caller.
+#
+#   2. The DISPATCH RULE is still Direct, and that is what pins this to one replica today.
+#      Direct routes every inbound call into one shared room, so a second replica would join
+#      the same room as the first and two agents would talk over each other on one call. This
+#      is a live phone number; changing it is an operator decision, not a deploy-config edit.
+#
+# To actually run more than one call at a time:
+#   a. switch dispatch to room-per-call:  uv run python scripts/setup_livekit_sip.py --dispatch individual
+#   b. deploy session_router/ and point the LiveKit webhook at it
+#   c. run agent replicas as registered workers (see clinic_agent.core.router_client)
+#   d. THEN raise numReplicas — a worker's capacity is the CLINIC_WORKER_CAPACITY env var, and
+#      replicas are for redundancy and headroom, not for one-call-per-process.
+#
+# Until (a)-(c) are done and verified on a live call, this stays at 1.
 
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
+# With Direct dispatch the agent must already be in the room when a call lands, so it has to
+# stay up continuously rather than scale to zero.
 restartPolicyType = "always"
 numReplicas = 1

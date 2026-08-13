@@ -654,3 +654,132 @@ against the real Anthropic API (TTFT 780 ms, correct date resolution, correct to
 the tool executor against the real scheduling API on both paths — but the media/STT/TTS adapters
 have not carried real audio. That is the remaining step before the new engine replaces the
 Pipecat path as the default.
+
+---
+
+## Phase 11 — Concurrency + load proof
+
+Phase 10 made many sessions per process *possible* by moving all per-call state into
+`CallSession`. Phase 11 makes it *true*, and measures it.
+
+The starting position was one call per process, justified in `CLAUDE.md` by the GIL: CPU-bound
+audio work on one call would stall the others. **The mechanism was real and the conclusion was
+wrong.** The fix is not a process per caller — it is making per-session work non-blocking.
+
+### The audit (measured, not guessed)
+
+| Cost | Before | After | How |
+|---|---|---|---|
+| Silero VAD per session | **7.97 MB, 23.4 ms** | **0.002 MB, 0.46 ms** | Share the ONNX session process-wide; only the ~1 KB recurrent state is per-stream (`core/vad.py`) |
+| VAD threads | 1 `ThreadPoolExecutor` **per session** | one bounded pool, sized to cores | Inference is CPU-bound; the useful ceiling is core count, not session count |
+| JSONL record write | **22.4 µs** (`open`/`write`/`close`) | **2.1 µs** shared handle, **0.9 µs** buffered | `core/jsonl.py` — metrics shares one descriptor per process; traces buffer 64 lines |
+
+At 1,000 sessions the VAD change alone is the difference between ~8 GB of byte-identical model
+weights and ~2 MB. The shared analyzer was verified to produce **bit-identical confidences over
+40 sequential frames**, recurrent state included — sharing weights must not share state, and a
+reused analyzer is explicitly `reset()` on assignment so caller #2 does not start inside caller
+#1's audio.
+
+### Components
+
+| Piece | What it does |
+|---|---|
+| `core/worker.py` | Hosts N `CallSession`s. Capacity limits, a **prewarmed** analyzer pool (cold start belongs at boot, not in the caller's first impression), graceful `drain()` that sheds new calls while letting in-flight ones finish, and per-outcome stats. |
+| `core/router_client.py` | Worker side of the control plane: register, heartbeat, poll assignments. **A router outage never ends live calls** — losing the coordinator must not become a data-plane outage. |
+| `session_router/registry.py` | Placement policy. No I/O, no clock of its own — every method takes `now`, so worker death and heartbeat expiry are deterministic in tests instead of `sleep`-driven. |
+| `session_router/app.py` | LiveKit `room_started`/`room_finished` webhooks, worker register/heartbeat/drain, `/status`. |
+| `loadtest/` | Tier-A harness: seeded synthetic providers + the real loop, plus a dependency-free SVG chart. |
+
+### Tier-A results (measured)
+
+Vendors are replaced by **fixed** seeded latency distributions drawn from this project's own
+measurements, so any growth in voice-to-voice latency as concurrency rises is the orchestrator.
+Both sweeps run the production path: real queue, real `reduce()`, real action dispatch, real
+metrics. 10-core M-series laptop, one process.
+
+**Loop mode** (no audio — bounds the event loop, reducer, and queue):
+
+| concurrency | e2e p50 | e2e p95 | loop lag p95 | CPU/session | peak RSS |
+|---|---|---|---|---|---|
+| 1 | 1532 ms | 2982 ms | 0.7 ms | 0.388 s | 193 MB |
+| 10 | 1345 | 3174 | 0.7 | 0.117 | 193 |
+| 100 | 1345 | 2773 | 0.8 | 0.072 | 193 |
+| 500 | 1395 | 3004 | 0.7 | 0.024 | 193 |
+| **1000** | **1394** | **2871** | **0.7** | **0.018** | **193** |
+
+6,000 turns across 1,000 concurrent sessions, **zero timeouts**, in 47.8 s wall.
+
+**Audio mode** (synthetic PCM through the real `TurnEngine` at real-time pace — real
+`frame_rms`, real Silero, 50 frames/s/session):
+
+| concurrency | e2e p50 | e2e p95 | loop lag p95 | CPU/session | peak RSS |
+|---|---|---|---|---|---|
+| 5 | 1370 ms | 2645 ms | 0.8 ms | 0.312 s | 197 MB |
+| 100 | 1343 | 2752 | 0.9 | 0.102 | 197 |
+| 400 | 1387 | 2906 | 1.4 | 0.052 | 197 |
+| 800 | 1403 | 2865 | 3.4 | 0.048 | 206 |
+| 1600 | 1479 | 3021 | **15.2** | 0.056 | 234 |
+
+Charts: `loadtest/results/tierA-loop.svg`, `loadtest/results/tierA-audio.svg`.
+
+### What the knee actually is — stated precisely
+
+**The latency knee was not reached.** Voice-to-voice p50 and p95 are flat from 1 to 1,000
+sessions (loop) and 5 to 1,600 (audio, with real VAD on every 20 ms frame). Claiming a knee we
+did not observe would be inventing a number.
+
+What *does* move is **event-loop lag**, and it moves superlinearly past ~400: 1.4 ms → 3.4 ms →
+15.2 ms across two doublings. That is the worker reporting that its scheduling headroom is
+eroding while callers still cannot hear any difference — 15 ms of scheduling delay is invisible
+next to a 1.4 s turn. So the honest finding is:
+
+> On this hardware, a single worker process carries **at least 1,600 concurrent sessions**
+> without measurable latency degradation. Scheduling headroom begins eroding around **800**,
+> which is where a capacity limit should be set — with the ceiling above, not at, that number.
+
+Three caveats that keep this from being oversold:
+
+1. **Synthetic providers do not backpressure.** Real Deepgram and Cartesia mean 2N websockets,
+   TLS, and inbound frame decoding, none of which is in this measurement.
+2. **`--mode audio` feeds silence.** Silero's cost is fixed per frame so the CPU is
+   representative, but the STT/TTS network path is not exercised.
+3. **One machine, one process.** This measures a worker's ceiling, not a fleet's.
+
+A methodological bug is worth recording because the first run reported a knee that did not
+exist: at concurrency 1 with 6 turns there are **six** e2e samples, so its "p95" is the
+sixth-largest of six — it misses the tool-call turns entirely and reads low, making every higher
+level look like a regression. Low-concurrency levels are now repeated until they carry
+comparable sample counts (`--min-samples`, default 60), and under-sampled levels are flagged in
+the output.
+
+### SIP dispatch — opt-in, and why
+
+`scripts/setup_livekit_sip.py --dispatch individual` creates the room-per-call rule that real
+concurrency needs. It is **not the default**, deliberately: switching it changes how a live
+phone number behaves, and an agent sitting in the old shared room will never see another call —
+so flipping it before the router and workers are running takes `+14842950169` off the air. The
+script also never deletes the rule of the other kind; it reports the conflict and leaves the
+removal as a deliberate step. `agent/railway.toml` documents why `numReplicas` stays at 1: the
+*engine* constraint is gone, the *dispatch* constraint is not.
+
+### Verification
+
+- `agent/tests/` — **88 passing** (18 new in `test_worker.py`: shared-VAD identity and state
+  isolation, capacity limits and rejection, prewarm hit/miss, drain vs. timeout, one failing
+  session not taking the worker down, and concurrent sessions sharing no conversation state).
+- `session_router/tests/` — **26 passing** (15 registry + 11 HTTP), all clock-injected: least-
+  loaded placement, duplicate-webhook suppression, full-fleet vs empty-fleet rejection reported
+  distinctly, heartbeat expiry, orphan re-dispatch, and clean drain.
+
+### Not done — Tier B
+
+**Tier B (25–50 concurrent real calls) has not been run.** It needs real PSTN capacity and real
+provider spend against live keys, and it is the only thing that produces a true cost-per-minute
+and validates the vendor path under concurrency. Everything it needs is built; the number is not
+claimed. Also outstanding from Phase 10: **no live phone call has been placed through the
+in-house engine at all**, which is the gate before any of this reaches the demo number.
+
+The router's LiveKit webhook is **not authenticated** — LiveKit signs webhooks with an
+Authorization JWT and this build does not verify it. Acceptable for a load-test control plane on
+a private network; a prerequisite for deploying it anywhere public, where an unauthenticated
+caller could spawn agent sessions at will.

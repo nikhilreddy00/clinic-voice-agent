@@ -117,6 +117,9 @@ def trace_file(tmp_path, monkeypatch):
     for event in booking_call():
         recorder.record(event)
     assert recorder.enabled and recorder.count == len(booking_call())
+    # Phase 11: traces buffer (64 lines) so a worker holds a descriptor only while flushing.
+    # close() flushes the tail — CallSession does this at teardown.
+    recorder.close()
     return recorder.path
 
 

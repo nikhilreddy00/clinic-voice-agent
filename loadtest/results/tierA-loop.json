@@ -1,0 +1,201 @@
+{
+  "generated_at": "2026-08-13T21:59:48.203673+00:00",
+  "mode": "loop",
+  "turns_per_call": 6,
+  "seed": 1337,
+  "cpu_count": 10,
+  "min_samples": 60,
+  "knee_concurrency": null,
+  "levels": [
+    {
+      "concurrency": 1,
+      "mode": "loop",
+      "repeats": 10,
+      "undersampled": false,
+      "sessions_started": 10,
+      "sessions_completed": 10,
+      "turns_completed": 60,
+      "turns_timed_out": 0,
+      "booked": 10,
+      "wall_secs": 331.71,
+      "cpu_secs": 3.88,
+      "rss_mb": 193.3,
+      "e2e": {
+        "p50": 1532.2,
+        "p95": 2982.2,
+        "p99": 4391.3,
+        "count": 60
+      },
+      "loop_lag_ms": {
+        "p50": 0.6,
+        "p95": 0.7,
+        "max": 9.1,
+        "count": 6559
+      },
+      "audio_frames": 0
+    },
+    {
+      "concurrency": 10,
+      "mode": "loop",
+      "repeats": 1,
+      "undersampled": false,
+      "sessions_started": 10,
+      "sessions_completed": 10,
+      "turns_completed": 60,
+      "turns_timed_out": 0,
+      "booked": 10,
+      "wall_secs": 36.43,
+      "cpu_secs": 1.17,
+      "rss_mb": 193.3,
+      "e2e": {
+        "p50": 1345.1,
+        "p95": 3174.4,
+        "p99": 5881.6,
+        "count": 60
+      },
+      "loop_lag_ms": {
+        "p50": 0.5,
+        "p95": 0.7,
+        "max": 10.3,
+        "count": 721
+      },
+      "audio_frames": 0
+    },
+    {
+      "concurrency": 50,
+      "mode": "loop",
+      "repeats": 1,
+      "undersampled": false,
+      "sessions_started": 50,
+      "sessions_completed": 50,
+      "turns_completed": 300,
+      "turns_timed_out": 0,
+      "booked": 50,
+      "wall_secs": 46.4,
+      "cpu_secs": 3.91,
+      "rss_mb": 193.3,
+      "e2e": {
+        "p50": 1442.4,
+        "p95": 3249.7,
+        "p99": 4484.7,
+        "count": 300
+      },
+      "loop_lag_ms": {
+        "p50": 0.4,
+        "p95": 0.8,
+        "max": 7.8,
+        "count": 920
+      },
+      "audio_frames": 0
+    },
+    {
+      "concurrency": 100,
+      "mode": "loop",
+      "repeats": 1,
+      "undersampled": false,
+      "sessions_started": 100,
+      "sessions_completed": 100,
+      "turns_completed": 600,
+      "turns_timed_out": 0,
+      "booked": 100,
+      "wall_secs": 49.58,
+      "cpu_secs": 7.18,
+      "rss_mb": 193.3,
+      "e2e": {
+        "p50": 1345.4,
+        "p95": 2773.3,
+        "p99": 3965.4,
+        "count": 600
+      },
+      "loop_lag_ms": {
+        "p50": 0.4,
+        "p95": 0.8,
+        "max": 2.4,
+        "count": 983
+      },
+      "audio_frames": 0
+    },
+    {
+      "concurrency": 250,
+      "mode": "loop",
+      "repeats": 1,
+      "undersampled": false,
+      "sessions_started": 250,
+      "sessions_completed": 250,
+      "turns_completed": 1500,
+      "turns_timed_out": 0,
+      "booked": 250,
+      "wall_secs": 43.47,
+      "cpu_secs": 11.05,
+      "rss_mb": 193.3,
+      "e2e": {
+        "p50": 1395.5,
+        "p95": 3010.7,
+        "p99": 4182.7,
+        "count": 1500
+      },
+      "loop_lag_ms": {
+        "p50": 0.2,
+        "p95": 0.8,
+        "max": 19.7,
+        "count": 862
+      },
+      "audio_frames": 0
+    },
+    {
+      "concurrency": 500,
+      "mode": "loop",
+      "repeats": 1,
+      "undersampled": false,
+      "sessions_started": 500,
+      "sessions_completed": 500,
+      "turns_completed": 3000,
+      "turns_timed_out": 0,
+      "booked": 500,
+      "wall_secs": 54.96,
+      "cpu_secs": 11.8,
+      "rss_mb": 193.3,
+      "e2e": {
+        "p50": 1394.9,
+        "p95": 3003.7,
+        "p99": 4272.0,
+        "count": 3000
+      },
+      "loop_lag_ms": {
+        "p50": 0.2,
+        "p95": 0.7,
+        "max": 8.8,
+        "count": 1090
+      },
+      "audio_frames": 0
+    },
+    {
+      "concurrency": 1000,
+      "mode": "loop",
+      "repeats": 1,
+      "undersampled": false,
+      "sessions_started": 1000,
+      "sessions_completed": 1000,
+      "turns_completed": 6000,
+      "turns_timed_out": 0,
+      "booked": 1000,
+      "wall_secs": 47.75,
+      "cpu_secs": 18.32,
+      "rss_mb": 193.3,
+      "e2e": {
+        "p50": 1394.4,
+        "p95": 2870.7,
+        "p99": 4145.1,
+        "count": 6000
+      },
+      "loop_lag_ms": {
+        "p50": 0.1,
+        "p95": 0.7,
+        "max": 27.1,
+        "count": 946
+      },
+      "audio_frames": 0
+    }
+  ],
+  "lag_inflection_concurrency": null
+}

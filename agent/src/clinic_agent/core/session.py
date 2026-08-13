@@ -255,6 +255,7 @@ class CallSession:
             f"interruptions={self.state.interruptions} events={self._seq}"
         )
         self.metrics.finalize()
+        self._recorder.close()  # flush the buffered tail and release the descriptor
 
         for closer in (self._stt.aclose, self._tts.aclose, self.media.aclose,
                        self._tools.aclose, self._llm.aclose):

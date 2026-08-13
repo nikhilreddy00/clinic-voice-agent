@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 460" width="860" height="460" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+<rect width="860" height="460" fill="#ffffff"/>
+<text x="78" y="24" font-size="16" font-weight="600" fill="#0f172a">Tier-A: concurrency vs voice-to-voice latency (loop mode)</text>
+<text x="78" y="40" font-size="11" fill="#64748b">synthetic providers at fixed latency, so growth is orchestrator overhead · 6 turns/call · 10 cores · seed 1337</text>
+<line x1="78" y1="398.0" x2="710" y2="398.0" stroke="#e2e8f0" stroke-width="1"/>
+<text x="68" y="402.0" font-size="11" fill="#64748b" text-anchor="end">0</text>
+<line x1="78" y1="327.6" x2="710" y2="327.6" stroke="#e2e8f0" stroke-width="1"/>
+<text x="68" y="331.6" font-size="11" fill="#64748b" text-anchor="end">800</text>
+<line x1="78" y1="257.2" x2="710" y2="257.2" stroke="#e2e8f0" stroke-width="1"/>
+<text x="68" y="261.2" font-size="11" fill="#64748b" text-anchor="end">1,600</text>
+<line x1="78" y1="186.8" x2="710" y2="186.8" stroke="#e2e8f0" stroke-width="1"/>
+<text x="68" y="190.8" font-size="11" fill="#64748b" text-anchor="end">2,400</text>
+<line x1="78" y1="116.4" x2="710" y2="116.4" stroke="#e2e8f0" stroke-width="1"/>
+<text x="68" y="120.4" font-size="11" fill="#64748b" text-anchor="end">3,200</text>
+<line x1="78" y1="46.0" x2="710" y2="46.0" stroke="#e2e8f0" stroke-width="1"/>
+<text x="68" y="50.0" font-size="11" fill="#64748b" text-anchor="end">4,000</text>
+<text x="78.0" y="418.0" font-size="11" fill="#64748b" text-anchor="middle">1</text>
+<text x="288.7" y="418.0" font-size="11" fill="#64748b" text-anchor="middle">10</text>
+<text x="435.9" y="418.0" font-size="11" fill="#64748b" text-anchor="middle">50</text>
+<text x="499.3" y="418.0" font-size="11" fill="#64748b" text-anchor="middle">100</text>
+<text x="583.2" y="418.0" font-size="11" fill="#64748b" text-anchor="middle">250</text>
+<text x="646.6" y="418.0" font-size="11" fill="#64748b" text-anchor="middle">500</text>
+<text x="710.0" y="418.0" font-size="11" fill="#64748b" text-anchor="middle">1000</text>
+<polyline points="78.0,135.6 288.7,118.7 435.9,112.0 499.3,153.9 583.2,133.1 646.6,133.7 710.0,145.4" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="78.0" cy="135.6" r="3.5" fill="#2563eb"/>
+<circle cx="288.7" cy="118.7" r="3.5" fill="#2563eb"/>
+<circle cx="435.9" cy="112.0" r="3.5" fill="#2563eb"/>
+<circle cx="499.3" cy="153.9" r="3.5" fill="#2563eb"/>
+<circle cx="583.2" cy="133.1" r="3.5" fill="#2563eb"/>
+<circle cx="646.6" cy="133.7" r="3.5" fill="#2563eb"/>
+<circle cx="710.0" cy="145.4" r="3.5" fill="#2563eb"/>
+<line x1="726" y1="54" x2="750" y2="54" stroke="#2563eb" stroke-width="2.5"/>
+<text x="756" y="58" font-size="11" fill="#334155">e2e p95 (ms)</text>
+<polyline points="78.0,263.2 288.7,279.6 435.9,271.1 499.3,279.6 583.2,275.2 646.6,275.2 710.0,275.3" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="78.0" cy="263.2" r="3.5" fill="#dc2626"/>
+<circle cx="288.7" cy="279.6" r="3.5" fill="#dc2626"/>
+<circle cx="435.9" cy="271.1" r="3.5" fill="#dc2626"/>
+<circle cx="499.3" cy="279.6" r="3.5" fill="#dc2626"/>
+<circle cx="583.2" cy="275.2" r="3.5" fill="#dc2626"/>
+<circle cx="646.6" cy="275.2" r="3.5" fill="#dc2626"/>
+<circle cx="710.0" cy="275.3" r="3.5" fill="#dc2626"/>
+<line x1="726" y1="74" x2="750" y2="74" stroke="#dc2626" stroke-width="2.5"/>
+<text x="756" y="78" font-size="11" fill="#334155">e2e p50 (ms)</text>
+<polyline points="78.0,397.9 288.7,397.9 435.9,397.9 499.3,397.9 583.2,397.9 646.6,397.9 710.0,397.9" fill="none" stroke="#059669" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="78.0" cy="397.9" r="3.5" fill="#059669"/>
+<circle cx="288.7" cy="397.9" r="3.5" fill="#059669"/>
+<circle cx="435.9" cy="397.9" r="3.5" fill="#059669"/>
+<circle cx="499.3" cy="397.9" r="3.5" fill="#059669"/>
+<circle cx="583.2" cy="397.9" r="3.5" fill="#059669"/>
+<circle cx="646.6" cy="397.9" r="3.5" fill="#059669"/>
+<circle cx="710.0" cy="397.9" r="3.5" fill="#059669"/>
+<line x1="726" y1="94" x2="750" y2="94" stroke="#059669" stroke-width="2.5"/>
+<text x="756" y="98" font-size="11" fill="#334155">event-loop lag p95 (ms)</text>
+<text x="394" y="442" font-size="12" fill="#334155" text-anchor="middle">concurrent sessions (log scale)</text>
+<text transform="translate(20,222) rotate(-90)" font-size="12" fill="#334155" text-anchor="middle">milliseconds</text>
+</svg>

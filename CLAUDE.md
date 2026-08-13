@@ -144,7 +144,18 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
   - **`scheduling_tools.execute_tool()` is shared by both engines.** Change tool behavior there,
     never in one path only.
   - Adapters are built via overridable `_build_*` methods on `CallSession` — that seam is what
-    Phase 11's Tier-A load test (fake adapters, injected latency) will use.
+    Phase 11's Tier-A load test (fake adapters, injected latency) uses.
+- **Phase 11 — concurrency + load proof.** ✅ `core/worker.py` (N sessions per process, prewarmed
+  analyzer pool, graceful drain), `core/router_client.py`, `session_router/` (LiveKit
+  `room_started` webhook → least-loaded worker, heartbeat expiry, orphan re-dispatch), and
+  `loadtest/` (Tier-A harness + SVG chart). Measured on one process: **1,000 concurrent sessions
+  loop-mode and 1,600 with real VAD on every frame, with flat p50/p95 and zero timeouts**;
+  event-loop lag starts growing superlinearly past ~400, so **capacity should be set near 800**.
+  Full numbers + caveats: `docs/build_spec.md` → *Phase 11*. Notes:
+  - **The latency knee was never reached** — do not quote one. What moves is loop lag.
+  - **Tier B (real concurrent calls) is NOT run** — no cost-per-minute number exists yet.
+  - The router's LiveKit webhook is **unauthenticated**; verify the signing JWT before deploying
+    it anywhere public.
 
 ## Conventions & governance
 
@@ -154,14 +165,26 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
 - **AI disclosure** is mandatory in the greeting; call-recording consent is required once
   telephony lands (Phase 7). See `agent/src/clinic_agent/prompts.py`.
 - Keep the agent and scheduling API decoupled — the agent talks to the API over HTTP.
-- **One container per voice session (concurrency).** A running agent process holds one live
-  audio pipeline on the asyncio event loop; Python's GIL means multiple concurrent voice
-  sessions must **not** share a single process — CPU-bound audio/VAD/serialization work on one
-  call would stall the others. For now (single demo call, `MODE=telephony` with a Direct
-  dispatch rule → one shared room) this is a non-issue. But Phase 6 Dockerization must run
-  **one container per session**: switch the LiveKit dispatch rule from Direct to Individual
-  (room-per-call) and start one agent process/container per room. Noted here so Phase 6 gets
-  the isolation model right instead of trying to multiplex sessions in one process.
+- **Concurrency: N sessions per process (superseded rule).** This file used to say one
+  container per voice session was mandatory, because the GIL means CPU-bound audio/VAD work on
+  one call would stall the others. **The mechanism was real; the conclusion was wrong**, and
+  Phase 11 measured it. The fix is making per-session work non-blocking, not giving each caller
+  a process:
+  - shared Silero ONNX weights + a bounded inference pool (`core/vad.py`) — **7.97 MB → 0.002 MB
+    and 23.4 ms → 0.46 ms per session**, bit-identical output;
+  - buffered/shared JSONL sinks (`core/jsonl.py`) instead of `open/write/close` per event on the
+    loop (22.4 µs → 0.9 µs per record);
+  - vectorized `frame_rms` (Phase 10), which runs 50×/second/session.
+
+  `core/worker.Worker` hosts N `CallSession`s with a prewarmed pool; `loadtest/` drives 1,000
+  concurrent sessions in one process. See `docs/build_spec.md` → *Phase 11* for the measured
+  curve and the knee.
+
+  **What still pins production to one replica is the SIP dispatch rule, not the engine.** Direct
+  dispatch puts every caller in one shared room, so a second replica would talk over the first.
+  Room-per-call requires `scripts/setup_livekit_sip.py --dispatch individual` **plus** the
+  session router and registered workers — and it takes the live demo number off the air until
+  all three are running, so it is a deliberate operator step (see `agent/railway.toml`).
 
 ## Running the services
 
@@ -212,7 +235,16 @@ cd agent && uv run python -m clinic_agent.pipeline
 # Telephony either way needs the one-time, idempotent SIP trunk + dispatch rule:
 cd agent && uv run python scripts/setup_livekit_sip.py
 
-cd agent && uv run pytest        # 70 tests, no network/keys needed
+cd agent && uv run pytest        # 88 tests, no network/keys needed
+
+# Session router (Phase 11 control plane) — only needed for room-per-call dispatch
+cd session_router && uv sync --extra dev && uv run pytest    # 26 tests
+cd session_router && uv run uvicorn app:app --port 8080
+
+# Tier-A load test (no keys, no network — synthetic providers, real orchestrator)
+agent/.venv/bin/python loadtest/tier_a.py --mode loop  --concurrency 1,10,100,1000 --turns 6
+agent/.venv/bin/python loadtest/tier_a.py --mode audio --concurrency 5,100,800,1600 --turns 4
+agent/.venv/bin/python loadtest/tier_a.py --rechart loadtest/results/tierA-loop.json
 ```
 
 `MODE` (default `local`) is the only switch between the laptop mic/speaker path and the LiveKit
@@ -221,12 +253,17 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 10 of 17.**
-Phase 8 (model bake-off harness) is built but the sweep has not been run; Phase 9 (Postgres +
-Supabase) and Phase 10 (in-house event loop) are done. **Next: Phase 11 — concurrency + load
-proof** (Individual SIP dispatch → room-per-call, multi-session worker, session router, Tier-A/B
-load tests). The one open item from Phase 10 is a live phone call through the new engine before
-it becomes the default.
+**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 11 of 17.**
+Phase 8 (model bake-off harness) is built but the sweep has not been run; Phases 9 (Postgres +
+Supabase), 10 (in-house event loop), and 11 (concurrency + load proof) are done. **Next: Phase 12
+— reasoning layer** (intent classifier with a hard-coded emergency path, LLM tier routing).
+
+Two open items carried forward, both requiring real-world execution rather than code:
+- **No live phone call has been placed through the in-house engine.** The LLM and tool paths are
+  verified against real services and a full booking runs text-in-the-loop, but the media/STT/TTS
+  adapters have never carried real audio. This gates making `core` the default.
+- **Tier B load (25–50 real concurrent calls) is not run**, so there is no cost-per-minute
+  number. The harness and control plane exist; the spend and PSTN capacity do not.
 
 The original Phase 0–7 record follows. Phases 0–5 are done (scaffold + mock API, live
 ASR→LLM→TTS loop, scheduling-API tool calls, dialogue hardening + headless eval, barge-in, and
