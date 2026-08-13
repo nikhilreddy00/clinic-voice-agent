@@ -1,6 +1,5 @@
 # One-command local start for the whole stack: `docker compose up --build`.
 #
-#   postgres        — appointment state (Phase 9; replaced SQLite)
 #   scheduling_api  — FastAPI backend + /metrics + /dashboard, published on :8000
 #   agent           — Pipecat voice agent in MODE=telephony (inbound LiveKit SIP calls)
 #
@@ -9,8 +8,18 @@
 # an image. logs/ is a shared bind mount: the agent writes calls.jsonl, the API reads it for the
 # dashboard.
 
+# DATABASE: Supabase by default. Set CLINIC_DATABASE_URL in your shell or a root .env to the
+# project's SESSION POOLER string (port 5432 on aws-<region>.pooler.supabase.com) — the direct
+# host is IPv6-only without the paid add-on and will hang on an IPv4 network.
+#
+# The local `postgres` service below is an OPT-IN fallback for offline work, not the default:
+#     docker compose --profile local-db up
+#     CLINIC_DATABASE_URL=postgresql://postgres:postgres@postgres:5432/clinic
+# Without that profile it never starts, and scheduling_api talks to Supabase.
+
 services:
   postgres:
+    profiles: ["local-db"]           # opt-in only; Supabase is the default backend
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: postgres
@@ -34,13 +43,12 @@ services:
     environment:
       CLINIC_LOG_DIR: /logs
       CLINIC_DASHBOARD_DIR: /app/dashboard
-      CLINIC_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/clinic
+      # Required. Supabase session-pooler URL, or the local-db profile's URL.
+      CLINIC_DATABASE_URL: ${CLINIC_DATABASE_URL:?set CLINIC_DATABASE_URL (Supabase session pooler)}
+      CLINIC_API_TOKEN: ${CLINIC_API_TOKEN:-}
     volumes:
       - ./logs:/logs                 # read the agent's calls.jsonl
       - ./dashboard:/app/dashboard:ro # serve the static dashboard at /dashboard
-    depends_on:
-      postgres:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
       interval: 10s

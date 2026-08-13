@@ -17,7 +17,7 @@ RUN uv sync --frozen --no-dev
 # Both paths are provided by docker-compose as a shared volume + bind mount.
 ENV CLINIC_LOG_DIR=/logs \
     CLINIC_DASHBOARD_DIR=/app/dashboard \
-    CLINIC_DATABASE_URL=postgresql://postgres:postgres@postgres:5432/clinic
+    # CLINIC_DATABASE_URL is injected at run time (it carries a password) — never baked in.
 
 EXPOSE 8000
 CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
