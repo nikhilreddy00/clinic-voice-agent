@@ -96,7 +96,7 @@ class FakeLLM:
         self._tasks: dict[str, asyncio.Task] = {}
         self._step = 0
 
-    def start(self, request_id: str, messages) -> None:
+    def start(self, request_id: str, messages, *, tier=None, intent=None, routing_reason="") -> None:
         self._tasks[request_id] = asyncio.create_task(self._run(request_id))
 
     def cancel(self, request_id: str) -> None:
@@ -304,3 +304,13 @@ class FakeSTT:
         for task in list(self._tasks):
             task.cancel()
         self._tasks.clear()
+
+
+class FakeClassifier:
+    """No-op classifier for load runs: intent scoping is not what Tier A measures."""
+
+    def classify(self, utterance: str) -> None:
+        pass
+
+    async def aclose(self) -> None:
+        pass

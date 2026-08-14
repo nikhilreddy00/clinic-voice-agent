@@ -53,11 +53,13 @@ class FakeLLM:
         self._emit = emit
         self._script = script
         self.requests: list[tuple[str, tuple]] = []
+        self.tiers: list = []
         self.cancelled: list[str] = []
         self.closed = False
 
-    def start(self, request_id, messages):
+    def start(self, request_id, messages, *, tier=None, intent=None, routing_reason=""):
         self.requests.append((request_id, messages))
+        self.tiers.append(tier)
         step = self._script[len(self.requests) - 1] if len(self.requests) <= len(self._script) else []
         for event in step:
             from dataclasses import replace as _replace
@@ -156,6 +158,20 @@ class FakeTTS:
         self.closed = True
 
 
+class FakeClassifier:
+    """Records classification requests; never answers unless a test makes it."""
+
+    def __init__(self):
+        self.requests: list[str] = []
+        self.closed = False
+
+    def classify(self, utterance):
+        self.requests.append(utterance)
+
+    async def aclose(self):
+        self.closed = True
+
+
 class FakeSTT:
     def __init__(self):
         self.closed = False
@@ -192,6 +208,9 @@ class ScriptedSession(CallSession):
 
     def _build_stt(self):
         return FakeSTT()
+
+    def _build_classifier(self):
+        return FakeClassifier()
 
 
 async def drive(session: CallSession, caller_turns: list[str]) -> None:

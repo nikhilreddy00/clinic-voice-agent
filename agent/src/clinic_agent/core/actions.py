@@ -14,6 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..intents import Intent
+from .llm_router import Tier
+
 
 @dataclass(frozen=True, slots=True)
 class Action:
@@ -31,6 +34,12 @@ class StartLLM(Action):
 
     request_id: str
     messages: tuple[dict[str, Any], ...] = ()
+    # Phase 12: the reducer chooses a TIER (a dialogue decision, pure and replayable) and the
+    # intent that scopes the system prompt and tool subset. The adapter maps tier -> model,
+    # because that mapping reads environment variables and must stay out of the reducer.
+    tier: Tier = Tier.STANDARD
+    intent: Intent | None = None
+    routing_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,3 +96,32 @@ class EndCall(Action):
     """Tear the session down."""
 
     reason: str = "hangup"
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifyIntent(Action):
+    """Classify one utterance, off the critical path.
+
+    Fired alongside ``StartLLM``, never before it. The dialogue turn does not wait for the
+    answer; it arrives as an :class:`~clinic_agent.core.events.IntentClassified` event and
+    scopes the *next* request, or re-plans the current one if it materially disagrees.
+    """
+
+    utterance: str
+
+
+@dataclass(frozen=True, slots=True)
+class TransferToHuman(Action):
+    """Hand the caller to a person, with a reason and enough context for the handoff.
+
+    A first-class action rather than only a failure path — an agent that knows what it cannot
+    do is more useful than one that improvises. **There is no live transfer in this build**:
+    Phase 15 implements the warm transfer over LiveKit SIP. Until then the session logs it
+    loudly and the call closes after the spoken hand-off, which is what already happened for
+    no-availability escalations; making it an action means the intent is recorded in the trace
+    rather than being implied by a log line.
+    """
+
+    reason: str
+    summary: str = ""
+    urgent: bool = False

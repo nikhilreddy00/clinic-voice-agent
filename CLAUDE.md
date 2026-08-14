@@ -145,6 +145,24 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
     never in one path only.
   - Adapters are built via overridable `_build_*` methods on `CallSession` — that seam is what
     Phase 11's Tier-A load test (fake adapters, injected latency) uses.
+- **Phase 12 — reasoning layer.** ✅ `core/intent.py` (deterministic emergency detector + the
+  classifier contract), `core/llm_router.py` (pure `select_tier` + tier→model resolution),
+  intent-scoped prompts (`prompts.build_system_prompt`) and tool subsets
+  (`build_tools_schema(intent)`), `core/adapters/classifier.py`, and
+  `eval/run_intent_eval.py`. Measured: **emergency recall 100%** (61 cases, 0 false positives),
+  **intent accuracy 98.3%**, non-scheduling prompts **−80%** (9.5 KB → ~1.9 KB). Full detail:
+  `docs/build_spec.md` → *Phase 12*. Rules that are easy to break:
+  - **The emergency path never touches a model.** `detect_emergency` is pure and runs in the
+    reducer before any request exists. Do not "improve" it by asking an LLM — that makes the
+    highest-stakes control probabilistic and kills replayability.
+  - **Never apply a general negation rule to emergency phrases.** "can't breathe" / "not
+    breathing" carry their own polarity; the narrow guard applies ONLY to `NEGATABLE_PATTERNS`.
+  - **Intent is sticky** (`intents.resolve_intent`). Mid-booking slot-fill answers classify as
+    `unknown` in isolation; letting them overwrite the intent strips the scheduling tools and
+    breaks booking outright. This actually happened — see the Phase-12 regression note.
+  - Classifier latency is **928 ms p50, not the planned <150 ms** — Haiku is not a fast-tier
+    model. It costs the caller nothing (it runs in parallel) but scoping applies from the next
+    turn. `CLINIC_MODEL_FAST` points the tier elsewhere once Phase 8's bake-off runs.
 - **Phase 11 — concurrency + load proof.** ✅ `core/worker.py` (N sessions per process, prewarmed
   analyzer pool, graceful drain), `core/router_client.py`, `session_router/` (LiveKit
   `room_started` webhook → least-loaded worker, heartbeat expiry, orphan re-dispatch), and
@@ -235,7 +253,11 @@ cd agent && uv run python -m clinic_agent.pipeline
 # Telephony either way needs the one-time, idempotent SIP trunk + dispatch rule:
 cd agent && uv run python scripts/setup_livekit_sip.py
 
-cd agent && uv run pytest        # 88 tests, no network/keys needed
+cd agent && uv run pytest        # 234 tests, no network/keys needed
+
+# Phase-12 intent eval. --detector-only runs the SAFETY half with no API calls and no cost.
+agent/.venv/bin/python eval/run_intent_eval.py --detector-only
+agent/.venv/bin/python eval/run_intent_eval.py
 
 # Session router (Phase 11 control plane) — only needed for room-per-call dispatch
 cd session_router && uv sync --extra dev && uv run pytest    # 26 tests
@@ -253,10 +275,11 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 11 of 17.**
+**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 12 of 17.**
 Phase 8 (model bake-off harness) is built but the sweep has not been run; Phases 9 (Postgres +
-Supabase), 10 (in-house event loop), and 11 (concurrency + load proof) are done. **Next: Phase 12
-— reasoning layer** (intent classifier with a hard-coded emergency path, LLM tier routing).
+Supabase), 10 (in-house event loop), 11 (concurrency + load proof), and 12 (reasoning layer) are
+done. **Next: Phase 13 — agent memory + expanded tool surface** (caller memory by ANI, the
+DOB verification gate, reschedule/cancel/refill tools).
 
 Two open items carried forward, both requiring real-world execution rather than code:
 - **No live phone call has been placed through the in-house engine.** The LLM and tool paths are

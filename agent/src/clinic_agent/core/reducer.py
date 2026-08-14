@@ -28,9 +28,22 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from ..prompts import SYSTEM_ERROR_LINE, greeting_for
+from ..intents import Intent, needs_clarification, resolve_intent
+from ..prompts import EMERGENCY_RESPONSE, SYSTEM_ERROR_LINE, greeting_for
 from . import events as ev
-from .actions import Action, CancelLLM, CancelSpeech, EndCall, InvokeTool, Speak, StartLLM
+from .actions import (
+    Action,
+    CancelLLM,
+    CancelSpeech,
+    ClassifyIntent,
+    EndCall,
+    InvokeTool,
+    Speak,
+    StartLLM,
+    TransferToHuman,
+)
+from .intent import detect_emergency
+from .llm_router import select_tier
 from .state import CallState, Phase
 
 # Flush a sentence to TTS as soon as its terminating punctuation is followed by whitespace —
@@ -115,7 +128,11 @@ def _ordered_results(state: CallState, extra: dict[str, dict[str, Any]]) -> list
 
 
 def _next_request(state: CallState) -> tuple[CallState, StartLLM]:
-    """Allocate the next request id and build the StartLLM action for the current history."""
+    """Allocate the next request id and build the StartLLM action for the current history.
+
+    The tier is selected here — pure, from state — so it lands in the replayable action rather
+    than being decided inside an adapter that reads environment variables.
+    """
     seq = state.request_seq + 1
     request_id = f"req-{seq}"
     state = replace(
@@ -127,7 +144,16 @@ def _next_request(state: CallState) -> tuple[CallState, StartLLM]:
         turn_tool_uses=(),
         phase=Phase.THINKING,
     )
-    return state, StartLLM(request_id=request_id, messages=tuple(state.messages))
+    tier, reason = select_tier(
+        intent=state.intent, turn_index=state.turn_index, degraded=state.degraded
+    )
+    return state, StartLLM(
+        request_id=request_id,
+        messages=tuple(state.messages),
+        tier=tier,
+        intent=state.intent,
+        routing_reason=reason,
+    )
 
 
 def _open_utterance(state: CallState) -> tuple[CallState, str]:
@@ -237,19 +263,76 @@ def _on_partial(state: CallState, e: ev.PartialTranscript):
 
 
 def _on_final_transcript(state: CallState, e: ev.FinalTranscript):
-    """A caller utterance is final: cancel anything in flight and generate a reply."""
-    if not e.text.strip():
+    """A caller utterance is final: check for an emergency, then generate a reply."""
+    text = e.text.strip()
+    if not text:
         return state, []
+
+    # THE EMERGENCY CHECK COMES FIRST, before any model request exists. detect_emergency is a
+    # pure function, so this fires identically on every call, on every model, during a provider
+    # outage, and while the API is timing out — and it replays from a trace with no network.
+    # Nothing below this line gets to run if it matches.
+    emergency = detect_emergency(text)
+    if emergency is not None:
+        return _enter_emergency(state, text, emergency)
+
+    if state.phase is Phase.EMERGENCY:
+        # Already handed off. Repeat the guidance rather than resuming a booking flow — an
+        # automated scheduler should not be talking someone out of calling 911.
+        state, utterance_id = _open_utterance(state)
+        return state, [
+            Speak(
+                utterance_id=utterance_id,
+                text=EMERGENCY_RESPONSE,
+                final=True,
+                deterministic=True,
+            )
+        ]
 
     state, actions = _abort_in_flight(state)
     state = replace(
         state,
-        messages=state.messages + ({"role": "user", "content": e.text.strip()},),
+        messages=state.messages + ({"role": "user", "content": text},),
         turn_index=state.turn_index + 1,
         last_partial="",
     )
     state, start = _next_request(state)
-    return state, actions + [start]
+    # Classification runs ALONGSIDE the turn, never before it. Intent is an optimization on the
+    # prompt and tool surface; making the caller wait for it would spend its entire latency
+    # budget on their first impression.
+    return state, actions + [start, ClassifyIntent(utterance=text)]
+
+
+def _enter_emergency(state: CallState, text: str, emergency):
+    """Scripted 911 hand-off. No model is consulted, now or for the rest of the call."""
+    state, actions = _abort_in_flight(state)
+    state, utterance_id = _open_utterance(state)
+    state = replace(
+        state,
+        phase=Phase.EMERGENCY,
+        emergency=True,
+        emergency_category=emergency.category,
+        intent=Intent.EMERGENCY,
+        intent_confidence=1.0,
+        turn_index=state.turn_index + 1,
+        last_partial="",
+        # The utterance is deliberately NOT appended to `messages`. There is no model on this
+        # path, and keeping a crisis description out of the conversation history means it never
+        # reaches a provider on a later turn either.
+    )
+    return state, actions + [
+        Speak(
+            utterance_id=utterance_id,
+            text=EMERGENCY_RESPONSE,
+            final=True,
+            deterministic=True,
+        ),
+        TransferToHuman(
+            reason=f"emergency:{emergency.category}",
+            summary=f"Caller described a possible {emergency.category} emergency.",
+            urgent=True,
+        ),
+    ]
 
 
 def _on_user_interrupted(state: CallState, e: ev.UserInterrupted):
@@ -412,6 +495,59 @@ def _on_bot_stopped(state: CallState, e: ev.BotStoppedSpeaking):
     return state, []
 
 
+def _on_intent_classified(state: CallState, e: ev.IntentClassified):
+    """Record the classified intent, and re-plan only when it changes the tool surface.
+
+    Re-planning cancels an in-flight request and pays its latency again, so it is gated on a
+    change that actually matters: switching between a flow that can call the scheduling tools
+    and one that cannot. A confidence nudge, or a move between two hand-off intents, changes
+    nothing the caller would notice and is not worth the restart.
+    """
+    try:
+        intent = Intent(e.intent)
+    except ValueError:
+        return state, []  # unknown value from a model that ignored the enum
+
+    previous = state.intent
+    # Sticky: an established intent is only replaced by a confident, genuinely different one.
+    # Without this, mid-booking slot-fill answers classify as `unknown` in isolation and strip
+    # the scheduling tools from the next request — see intents.resolve_intent.
+    resolved = resolve_intent(previous, intent, e.confidence)
+    state = replace(
+        state,
+        intent=resolved,
+        intent_confidence=e.confidence,
+        # We are awaiting clarification exactly when we still do not know what the caller
+        # wants — which, once an intent is established, is never.
+        awaiting_clarification=resolved is None or resolved is Intent.UNKNOWN,
+    )
+    intent = resolved
+
+    if state.phase is not Phase.THINKING or state.request_id is None:
+        return state, []  # nothing in flight; it scopes the next request
+    if _tool_surface(previous) == _tool_surface(intent):
+        return state, []
+
+    state, actions = _abort_in_flight(state)
+    state, start = _next_request(state)
+    return state, actions + [start]
+
+
+def _tool_surface(intent: Intent | None) -> bool:
+    """Whether this intent gets the scheduling tools. The only difference worth re-planning for."""
+    return intent is None or intent is Intent.SCHEDULE_APPOINTMENT
+
+
+def _on_intent_failed(state: CallState, e: ev.IntentClassificationFailed):
+    """Classification is an optimization, not a dependency — the turn already ran without it."""
+    return state, []
+
+
+def _on_model_routed(state: CallState, e: ev.ModelRouted):
+    """Emitted by the adapter for trace visibility; the decision was already made."""
+    return state, []
+
+
 def _on_provider_degraded(state: CallState, e: ev.ProviderDegraded):
     if e.provider in state.degraded:
         return state, []
@@ -441,6 +577,9 @@ _HANDLERS = {
     ev.ToolCompleted: _on_tool_completed,
     ev.BotStartedSpeaking: _on_bot_started,
     ev.BotStoppedSpeaking: _on_bot_stopped,
+    ev.IntentClassified: _on_intent_classified,
+    ev.IntentClassificationFailed: _on_intent_failed,
+    ev.ModelRouted: _on_model_routed,
     ev.ProviderDegraded: _on_provider_degraded,
     ev.Hangup: _on_hangup,
 }

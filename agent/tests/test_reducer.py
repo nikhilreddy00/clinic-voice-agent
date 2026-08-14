@@ -16,11 +16,13 @@ from clinic_agent.core import events as ev
 from clinic_agent.core.actions import (
     CancelLLM,
     CancelSpeech,
+    ClassifyIntent,
     EndCall,
     InvokeTool,
     Speak,
     StartLLM,
 )
+from clinic_agent.core.llm_router import Tier
 from clinic_agent.core.reducer import _split_speakable, reduce
 from clinic_agent.core.state import CallState, Phase
 from clinic_agent.prompts import GREETING, TELEPHONY_GREETING
@@ -93,7 +95,13 @@ def test_final_transcript_starts_an_llm_request_with_full_history():
         StartLLM(
             request_id="req-1",
             messages=({"role": "user", "content": "I'd like to book an appointment."},),
-        )
+            tier=Tier.STANDARD,
+            intent=None,
+            routing_reason="intent not yet known",
+        ),
+        # Phase 12: classification is fired alongside the turn, never before it. Its position
+        # here is the contract — a caller must not wait on a side model for their first reply.
+        ClassifyIntent(utterance="I'd like to book an appointment."),
     ]
     assert d.state.phase is Phase.THINKING
     assert d.state.turn_index == 1

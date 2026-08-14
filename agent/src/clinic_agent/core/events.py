@@ -227,6 +227,51 @@ class BotStoppedSpeaking(Event):
     kind: ClassVar[str] = "BotStoppedSpeaking"
 
 
+# --- reasoning layer (Phase 12) ------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class IntentClassified(Event):
+    """The classifier answered. Arrives asynchronously, in parallel with the dialogue turn.
+
+    Never blocks a turn: if it lands after generation started and materially contradicts the
+    flow in progress, the reducer re-plans. Putting it in series would spend its whole latency
+    budget on the caller's very first impression.
+    """
+
+    intent: str = "unknown"
+    confidence: float = 0.0
+    latency_ms: float = 0.0
+
+    kind: ClassVar[str] = "IntentClassified"
+
+
+@dataclass(frozen=True, slots=True)
+class IntentClassificationFailed(Event):
+    """The classifier errored or timed out. The call continues unscoped — it is an optimization,
+    not a dependency, and a caller must never lose a turn because a side model was unavailable."""
+
+    error: str = ""
+
+    kind: ClassVar[str] = "IntentClassificationFailed"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRouted(Event):
+    """Which model served a turn, and why. Emitted when the adapter resolves the reducer's tier.
+
+    Exists so the routing decision is visible in the call trace next to its latency and cost,
+    rather than being an invisible property of a policy table someone has to go read.
+    """
+
+    request_id: str = ""
+    tier: str = ""
+    model: str = ""
+    reason: str = ""
+
+    kind: ClassVar[str] = "ModelRouted"
+
+
 # --- provider health ---------------------------------------------------------------------
 
 
@@ -263,6 +308,9 @@ _EVENT_TYPES: dict[str, type[Event]] = {
         BotStartedSpeaking,
         BotStoppedSpeaking,
         ProviderDegraded,
+        IntentClassified,
+        IntentClassificationFailed,
+        ModelRouted,
     )
 }
 

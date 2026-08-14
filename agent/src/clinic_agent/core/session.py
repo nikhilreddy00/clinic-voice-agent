@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from loguru import logger
 
@@ -40,17 +41,21 @@ from .actions import (
     Action,
     CancelLLM,
     CancelSpeech,
+    ClassifyIntent,
     EndCall,
     InvokeTool,
     Speak,
     StartLLM,
+    TransferToHuman,
 )
+from .adapters.classifier import IntentClassifier
 from .adapters.llm import AnthropicLLM
 from .adapters.media import LiveKitMedia, LocalMedia, MediaAdapter
 from .adapters.stt import DeepgramSTT
 from .adapters.tools import ToolExecutor
 from .adapters.tts import CartesiaTTS
 from .adapters.turn import TurnEngine
+from .llm_router import LLMRouter
 from .recorder import TraceRecorder
 from .reducer import reduce
 from .state import CallState, Phase
@@ -89,7 +94,12 @@ class CallSession:
         #
         # Construction order matters: media owns playback, so TTS needs it; STT owns the
         # socket, so the TurnEngine needs it.
+        # Pinned once per call so every per-intent prompt shares one date table, and so a long
+        # call cannot silently re-ground itself across midnight mid-conversation.
+        self._now = datetime.now(timezone.utc)
+        self._router = LLMRouter()
         self._llm = self._build_llm()
+        self._classifier = self._build_classifier()
         self._tools = self._build_tools()
         self.media: MediaAdapter = self._build_media()
         self._tts = self._build_tts()
@@ -106,8 +116,18 @@ class CallSession:
         return AnthropicLLM(
             api_key=self.settings.anthropic_api_key,
             model=self.settings.anthropic_model,
-            system_prompt=build_phase2_system_prompt(),
+            system_prompt=build_phase2_system_prompt(self._now),
             tools=build_tools_schema(),
+            emit=self.emit,
+            router=self._router,
+            now=self._now,
+        )
+
+    def _build_classifier(self):
+        """Intent classifier — always the fast tier, always off the critical path."""
+        return IntentClassifier(
+            api_key=self.settings.anthropic_api_key,
+            spec=self._router.classifier_spec(),
             emit=self.emit,
         )
 
@@ -224,7 +244,25 @@ class CallSession:
 
     async def _execute(self, action: Action) -> None:
         if isinstance(action, StartLLM):
-            self._llm.start(action.request_id, action.messages)
+            self._llm.start(
+                action.request_id,
+                action.messages,
+                tier=action.tier,
+                intent=action.intent,
+                routing_reason=action.routing_reason,
+            )
+        elif isinstance(action, ClassifyIntent):
+            self._classifier.classify(action.utterance)
+        elif isinstance(action, TransferToHuman):
+            # No live transfer exists in this build — Phase 15 implements the warm handoff over
+            # LiveKit SIP. Logged at WARNING because a silent no-op here would look like a
+            # working escalation in the logs of a call where nobody was actually reached.
+            level = logger.error if action.urgent else logger.warning
+            level(
+                f"[transfer] NOT IMPLEMENTED — would transfer to a human "
+                f"(reason={action.reason!r}, urgent={action.urgent}): {action.summary}"
+            )
+            self.state = replace(self.state, escalated=True)
         elif isinstance(action, CancelLLM):
             self._llm.cancel(action.request_id)
         elif isinstance(action, Speak):
@@ -252,13 +290,15 @@ class CallSession:
         )
         logger.info(
             f"[session] outcome={self.state.outcome} turns={self.state.turn_index} "
-            f"interruptions={self.state.interruptions} events={self._seq}"
+            f"interruptions={self.state.interruptions} events={self._seq} "
+            f"intent={self.state.intent.value if self.state.intent else 'unclassified'}"
+            + (f" EMERGENCY({self.state.emergency_category})" if self.state.emergency else "")
         )
         self.metrics.finalize()
         self._recorder.close()  # flush the buffered tail and release the descriptor
 
         for closer in (self._stt.aclose, self._tts.aclose, self.media.aclose,
-                       self._tools.aclose, self._llm.aclose):
+                       self._tools.aclose, self._llm.aclose, self._classifier.aclose):
             try:
                 await closer()
             except Exception as exc:  # noqa: BLE001 - one failed close must not skip the rest

@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from ..intents import Intent
+
 
 class Phase(str, Enum):
     """Where the call is in the turn cycle.
@@ -38,6 +40,7 @@ class Phase(str, Enum):
     THINKING = "thinking"    # LLM request in flight
     TOOL_WAIT = "tool_wait"  # one or more scheduling-API calls in flight
     SPEAKING = "speaking"    # streaming the model's reply to TTS / playback
+    EMERGENCY = "emergency"  # scripted 911 hand-off; the model is out of the loop for good
     CLOSED = "closed"        # terminal
 
 
@@ -86,6 +89,20 @@ class CallState:
     user_speaking: bool = False
     last_partial: str = ""
 
+    # --- reasoning layer (Phase 12) ------------------------------------------------------
+    # None until the classifier answers. The distinction from UNKNOWN matters: None means
+    # "not asked yet" (use the full scheduling prompt, which is what this line is for),
+    # while UNKNOWN means "asked, and the caller was genuinely ambiguous" (ask a question).
+    intent: Intent | None = None
+    intent_confidence: float = 0.0
+    awaiting_clarification: bool = False
+
+    # Set by the deterministic detector in the reducer, never by a model. Terminal: once an
+    # emergency is recognized the agent does not resume booking, because "are you sure?" is
+    # not a question an automated scheduler should be asking someone describing a crisis.
+    emergency: bool = False
+    emergency_category: str = ""
+
     # --- counters / outcome -------------------------------------------------------------
     turn_index: int = 0
     interruptions: int = 0
@@ -98,7 +115,9 @@ class CallState:
     @property
     def busy(self) -> bool:
         """True when the engine owns the floor — generating, calling tools, or speaking."""
-        return self.phase in (Phase.GREETING, Phase.THINKING, Phase.TOOL_WAIT, Phase.SPEAKING)
+        return self.phase in (
+            Phase.GREETING, Phase.THINKING, Phase.TOOL_WAIT, Phase.SPEAKING, Phase.EMERGENCY
+        )
 
     @property
     def outcome(self) -> str:
@@ -107,6 +126,8 @@ class CallState:
         A successful booking outranks an escalation: a call that hit an empty availability
         window and then found a slot on a second look is booked, not escalated.
         """
+        if self.emergency:
+            return "emergency"
         if self.booked:
             return "booked"
         if self.escalated:

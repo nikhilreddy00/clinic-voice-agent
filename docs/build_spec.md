@@ -783,3 +783,157 @@ The router's LiveKit webhook is **not authenticated** — LiveKit signs webhooks
 Authorization JWT and this build does not verify it. Acceptable for a load-test control plane on
 a private network; a prerequisite for deploying it anywhere public, where an unauthenticated
 caller could spawn agent sessions at will.
+
+---
+
+## Phase 12 — Reasoning layer: intent classification + LLM routing
+
+Two mechanisms, deliberately not the same kind of thing.
+
+### The emergency path is a pure function, and never a model
+
+`core/intent.detect_emergency()` is called by the reducer on **every** finalized caller
+utterance, before any LLM request exists. A caller saying they cannot breathe must get the same
+scripted response on every call, on every model, during a provider outage, and at 3 a.m. while
+the API is timing out. Routing that through a language model would make the highest-stakes
+control in the system probabilistic and non-replayable.
+
+Because it is pure it also replays from a recorded trace with no network, so the check can be
+asserted on forever.
+
+| | Result |
+|---|---|
+| **Emergency recall** | **100%** (61 utterances across 9 categories) |
+| False positives on ordinary scheduling speech | **0** / 55 |
+| Cost | ~microseconds, no API call |
+
+`EMERGENCY_RESPONSE` is a constant, not a prompt: it leads with the instruction rather than an
+apology (the caller may stop listening at any moment), asks no follow-up, attempts no triage,
+and offers no appointment.
+
+**The recall/precision trade is explicit.** Recall is non-negotiable; precision is sacrificed to
+it. But unlimited false positives are their own harm — telling a caller who wanted a checkup to
+hang up and dial 911 delays real care and destroys trust — so a *narrow* negation guard
+suppresses explicit denials of a small set of symptom nouns ("I don't have chest pain"). The
+guard is applied **only** to `NEGATABLE_PATTERNS` and never to phrases carrying their own
+polarity: "can't breathe" and "not breathing" contain negation words and are the most urgent
+strings in the module. A general-purpose negation rule would silently invert exactly the check
+it was added to improve, and there are tests in both directions for precisely that.
+
+Bare `"emergency"` is deliberately not a trigger — "can I get an emergency appointment" is
+ordinary scheduling speech.
+
+### Intent classification is a model call, off the critical path
+
+Constrained decoding: one tool, a strict enum, forced via `tool_choice`. The model cannot answer
+in prose, invent an intent, or decline. Only the current utterance is sent — no history — which
+keeps it small and keeps the question honest.
+
+It is fired **alongside** `StartLLM`, never before it. The turn never waits.
+
+| | Result |
+|---|---|
+| Intent accuracy | **98.3%** (59/60) — target ≥ 95% ✅ |
+| Classifier emergency recall | 100% (redundancy, *not* the control) |
+| Classifier latency | **p50 928 ms · p95 1563 ms** — target < 150 ms ❌ |
+
+**The latency target was missed by ~6×, and it matters less than it looks.** Haiku 4.5 is not a
+150 ms model; that target assumed Llama-8B on Groq or Cerebras (~180 ms TTFT). Because
+classification runs in parallel, the cost to the caller is zero — but the practical consequence
+is that the mid-turn re-plan path essentially never fires inside turn one, so intent scoping
+takes effect from the *next* turn. `CLINIC_MODEL_FAST` exists to point the fast tier at a
+faster provider; that is a Phase-8 bake-off decision and the bake-off has not been run.
+
+The single misclassification is instructive: *"Something came up, I can't make my appointment"*
+→ `cancel_appointment` instead of `reschedule_appointment`, at 0.95 confidence. It is genuinely
+ambiguous — a human receptionist would ask — and in this build both intents are hand-offs with
+the same (empty) tool surface, so the miss has **no behavioral consequence**. The overconfidence
+is the more interesting signal.
+
+### Intent-scoped prompts and tools
+
+Through Phase 11 every turn carried a 9,485-character prompt and all three tool schemas,
+whatever the caller wanted.
+
+| Intent | Prompt | vs. baseline |
+|---|---|---|
+| `schedule_appointment` (and unclassified) | 9,486 | unchanged |
+| `reschedule` / `cancel` | 3,198 | −66% |
+| `clinical_question` | 1,964 | −79% |
+| `billing_question` | 1,850 | −80% |
+| `hours_location` | 1,776 | −81% |
+| `unknown` | 1,668 | −82% |
+
+Non-scheduling turns land at ~2 KB, which is the target. **Scheduling turns are unchanged, and
+that is deliberate**: every rule in the booking block fixes a defect the Phase-4 eval caught, and
+deleting them to hit a size target would trade a real regression for a nice number. The plan's
+"9.5 KB → 2 KB" holds for the intents that are not the main flow.
+
+Non-scheduling intents get **no tools at all** (2,951 chars → 2). That is the point rather than a
+limitation: those flows end in a hand-off, and a model with no booking tool cannot invent a
+booking for someone who called about a prescription.
+
+*Caching interaction, worth knowing before optimizing further:* Phase 8 measured the cacheable
+prefix at 3,811 tokens against Haiku 4.5's 4,096 floor. Shrinking prompts pushes them **further**
+below it. The resolution is a model whose floor the prompt clears, not a smaller prompt.
+
+### Model routing
+
+`select_tier()` is **pure** — the reducer picks a tier (a dialogue decision, replayable), and the
+adapter maps tier → model (a deployment detail that reads env vars). Collapsing the two would
+drag `os.getenv` into the reducer and make a recorded call replay differently on a different
+machine. Every decision is emitted as a `ModelRouted` event, so it appears in the trace.
+
+| Condition | Tier |
+|---|---|
+| escalating | `strong` |
+| intent unknown / not yet classified | `standard` (turn one is the most latency-sensitive turn there is) |
+| clinical / billing / speak-to-human | `strong` (each precedes a hand-off decision) |
+| everything else | `standard` |
+| `llm` degraded + `strong` | downgraded to `standard` — a slower answered turn beats dead air |
+
+All three tiers currently point at Haiku 4.5, because Phase 8's bake-off has not been run and
+pretending otherwise would be inventing a decision. The table exists so switching is one line
+with a measured justification.
+
+### The regression an end-to-end run caught and unit tests did not
+
+The first live run after wiring the classifier **broke booking entirely**: ten turns, zero tool
+calls, outcome `abandoned`.
+
+The classifier sees only the current utterance — that is what keeps it fast. So mid-booking
+answers have no intent in isolation: *"Dana Reyes."* → `unknown` @ 1.00, *"I'm a new patient."*
+→ `unknown` @ 0.45, *"I've been feeling a bit run down lately"* → `clinical_question` @ 0.75.
+Each of those overwrote `schedule_appointment`, which stripped the scheduling tools from the
+next request. **Slot-filling answers are not topic shifts.**
+
+Fix (`intents.resolve_intent`, pure and tested): `unknown` never overwrites an established
+intent; establishing the first one needs 0.6; *switching* an established one needs 0.85. On the
+re-run the same `clinical_question` @ 0.75 correctly did not override, and the booking completed
+with all three tool calls. A confident change of subject (`medication_refill` @ 0.93) still
+switches — stickiness must not become deafness, and there is a test for that too.
+
+Every unit test passed throughout. Only running the thing found it.
+
+### Verification
+
+- `agent/tests/` — **234 passing**. New: `test_emergency.py` (100 cases: recall, precision, and
+  the negation guard in both directions) and `test_reasoning.py` (46: the emergency path through
+  the engine, intent stickiness, re-plan gating, tier policy, prompt/tool scoping).
+- `eval/run_intent_eval.py` — 60 labeled utterances, confusion matrix, both exit criteria.
+  `--detector-only` runs the safety half with no API calls and no cost.
+- **Text-in-the-loop re-verified**: real Claude, real scheduling API, full 10-turn booking with
+  `check_availability ×2 → hold_slot → confirm_booking`, and the recorded trace replays to an
+  identical final state.
+
+### Not done
+
+- **`emergency` still has no live transfer.** `TransferToHuman` is a first-class action and the
+  reducer emits it with `urgent=True`, but the session logs it at ERROR and closes — Phase 15
+  implements the warm handoff over LiveKit SIP. A caller in crisis is told to dial 911, which is
+  the correct instruction, but nobody is reached on their behalf.
+- **Emergency recall is 100% on a 61-utterance test set**, not in general. The set is ours and
+  English-only; it does not cover accented ASR errors, indirect phrasing, or a caller describing
+  someone else's symptoms in the third person beyond the cases listed.
+- Reschedule and cancel are classified correctly and then handed off — the tools that would let
+  the agent act on an existing booking arrive in Phase 13.

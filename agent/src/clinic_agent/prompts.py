@@ -15,6 +15,8 @@ from datetime import date, timedelta, timezone
 from datetime import datetime as _datetime
 from zoneinfo import ZoneInfo
 
+from .intents import SCHEDULING_INTENTS, Intent
+
 # timezone: US/Eastern (America/New_York) — agent operates in clinic local time. The current
 # time, "today", and the date→weekday reference table injected into the prompt are all resolved
 # in this zone so the model reasons about the clinic's wall clock (e.g. "12:17 AM EDT, Tuesday
@@ -59,6 +61,30 @@ SYSTEM_ERROR_LINE = (
     "Sorry, I'm having trouble on my end. Could you say that again?"
 )
 
+# --- Emergency response (Phase 12) -------------------------------------------------------
+# The single highest-stakes string in this repo, and the reason it is a constant rather than a
+# prompt: a caller who says they cannot breathe must hear THESE words, identically, on every
+# call, on every model, during a provider outage, and while the API is timing out. Nothing
+# about this sentence is a judgement call the model should be making.
+#
+# It leads with the instruction rather than an apology or a preamble, because the caller may
+# stop listening — or stop being able to listen — at any moment. It does not ask a follow-up
+# question, does not attempt triage, and does not offer to book anything.
+EMERGENCY_RESPONSE = (
+    "This sounds like a medical emergency. Please hang up and call 9-1-1 right now, "
+    "or go to your nearest emergency room. "
+    "I'm an automated assistant and I can't help with emergencies."
+)
+
+# Only used if a model is ever put on this path, which it currently is not. Kept so the
+# instruction exists in one place if Phase 15's warm transfer ever needs a model-mediated
+# variant — and worded to forbid exactly the improvisation that would make it dangerous.
+EMERGENCY_INSTRUCTION = (
+    "The caller is describing a medical emergency. Do NOT triage, reassure, assess severity, "
+    "ask follow-up medical questions, or offer an appointment. Tell them to hang up and call "
+    "9-1-1 or go to the nearest emergency room, and say you cannot help with emergencies."
+)
+
 
 def greeting_for(mode: str) -> str:
     """Return the greeting for the given runtime mode.
@@ -97,15 +123,51 @@ never request detailed medical information.
 # dialogue flow, tool-usage rules, the two hard branch cases (no availability, caller changes
 # their mind), and PHI minimization. `{today}` is injected at build time so relative dates
 # like "tomorrow" / "next Tuesday" resolve correctly — build via build_phase2_system_prompt().
-_PHASE2_SYSTEM_PROMPT_TEMPLATE = """\
+# --- Phase 12: composable, intent-scoped prompt ------------------------------------------
+# Through Phase 11 this was one 9,485-character template sent on every single turn, whatever
+# the caller wanted. Most of it is the booking flow — the tool-usage rules, the offer/hold/
+# confirm gate, the branch cases — which is dead weight when someone is asking for the address.
+#
+# It is now assembled per turn from a shared CORE plus the fragment the classified intent
+# actually needs (see build_system_prompt). Measured effect, with the exact numbers in
+# docs/build_spec.md: scheduling turns stay ~9 KB because those rules are load-bearing (every
+# one of them fixes a defect the Phase-4 eval caught, and deleting them to hit a size target
+# would trade a real regression for a nice number), while non-scheduling turns drop to ~2 KB.
+#
+# Caching interaction, worth knowing before "optimizing" this further: Phase 8 measured the
+# cacheable prefix at 3,811 tokens against Haiku 4.5's 4,096 minimum. Shrinking prompts pushes
+# them FURTHER below that floor. The right resolution is a model whose floor the prompt clears
+# (Sonnet 4.6/5 and Opus 4.8 are 1,024), not a smaller prompt.
+
+_CORE_TEMPLATE = """\
 You are the virtual scheduling assistant for Grove Family Clinic, speaking with a caller by
 phone. You have already greeted the caller and disclosed that you are an automated AI
-assistant. Your job this call is to book ONE appointment, end to end.
+assistant.
 
 Today's date is {today} ({weekday}), and the current time is {now_local} — this is the clinic's
 local time (US/Eastern). Reason about time in the clinic's local timezone. Speak appointment
 times naturally (e.g. "Monday, July 6th at 9 AM"), never as raw timestamps.
 
+STYLE: keep every reply to one or two short, natural sentences suitable for text-to-speech.
+Ask for one thing at a time. Never read out slot_id, hold_id, or reason_category codes — those
+are internal. Whenever you still need something from the caller (their name, a reason, a
+preferred day, a slot choice, or a yes/no), END your turn with a direct question for exactly
+that — don't leave your turn on a statement when it is the caller's turn to answer.
+
+PII MINIMIZATION: never read a caller's full name together with another identifier (a date of
+birth, a phone number) in the same sentence — confirm one identifier per sentence. The final
+read-back does state the name and the date of birth, but in SEPARATE sentences, never joined in
+one. Do not repeat back a phone number or any government ID at all unless the caller explicitly
+asks; keep the reason to a short phrase and the symptom note to one sentence, never a detailed
+medical history.
+
+Never invent clinic facts (addresses, providers, hours, prices). All data is synthetic; never
+solicit detailed medical information.
+"""
+
+# Date grounding. Only scheduling intents need it, and it is ~1 KB of the prompt — the Phase-4
+# fix that turned "next Tuesday" from weekday arithmetic (which models get wrong) into a lookup.
+_DATE_BLOCK = """\
 DATE RESOLUTION — resolve every relative day the caller says ("today", "tomorrow", "next
 Tuesday", "the 9th") into a concrete YYYY-MM-DD using THIS reference table. Do NOT do weekday
 arithmetic in your head — LLMs get it wrong; just look the day up here:
@@ -119,12 +181,12 @@ arithmetic in your head — LLMs get it wrong; just look the day up here:
     read any date back, so the weekday and the calendar date never disagree.
   - Only ever offer or confirm times in the FUTURE. Never offer or read back a slot earlier
     today than the current clinic-local time ({now_local}).
+"""
 
-STYLE: keep every reply to one or two short, natural sentences suitable for text-to-speech.
-Ask for one thing at a time. Never read out slot_id, hold_id, or reason_category codes — those
-are internal. Whenever you still need something from the caller (their name, a reason, a
-preferred day, a slot choice, or a yes/no), END your turn with a direct question for exactly
-that — don't leave your turn on a statement when it is the caller's turn to answer.
+# The full booking flow: what to collect, the three tools, the offer/hold/confirm gate, and the
+# two hard branch cases. Every rule here traces to a defect the Phase-4 eval caught.
+_BOOKING_BLOCK = """\
+Your job this call is to book ONE appointment, end to end.
 
 INFORMATION TO COLLECT (conversationally, in roughly this order — ask for ONE thing per turn):
   1. Confirm the caller wants to book an appointment. If they want something else (billing,
@@ -208,17 +270,70 @@ BRANCH CASES YOU MUST HANDLE:
   - A tool result with "ok": false means it failed (slot just taken, hold expired, or the
     system is unreachable). Apologize briefly and recover: for a taken slot or expired hold,
     offer another available slot; if the system is unreachable, offer to have staff call back.
-
-PII MINIMIZATION: never read a caller's full name together with another identifier (a date of
-birth, a phone number) in the same sentence — confirm one identifier per sentence. The final
-read-back does state the name and the date of birth, but in SEPARATE sentences, never joined in
-one. Do not repeat back a phone number or any government ID at all unless the caller explicitly
-asks; keep the reason to a short phrase and the symptom note to one sentence, never a detailed
-medical history.
-
-Never invent clinic facts (addresses, providers, hours, prices). All data is synthetic; never
-solicit detailed medical information.
 """
+
+# Fragments for intents this build cannot complete. Each is deliberately short and ends the
+# same way: say what you can do, then hand off. An agent that improvises a capability it does
+# not have is worse than one that admits the limit — it wastes the caller's time and, for
+# refills and results, it is a safety problem.
+_HANDOFF = (
+    "Do NOT attempt to handle this yourself and do NOT invent details. Tell the caller you'll "
+    "pass them to a staff member, and offer to book an appointment if that would help. There is "
+    "no live transfer in this build — say it warmly and close."
+)
+
+_INTENT_FRAGMENTS: dict[Intent, str] = {
+    Intent.RESCHEDULE_APPOINTMENT: (
+        "The caller wants to change an EXISTING appointment. You cannot look up or modify "
+        f"existing bookings in this build. {_HANDOFF}"
+    ),
+    Intent.CANCEL_APPOINTMENT: (
+        "The caller wants to cancel an existing appointment. You cannot look up or modify "
+        f"existing bookings in this build. {_HANDOFF}"
+    ),
+    Intent.MEDICATION_REFILL: (
+        "The caller wants a prescription refill. You must NEVER approve, deny, or discuss the "
+        f"appropriateness of a medication. {_HANDOFF}"
+    ),
+    Intent.BILLING_QUESTION: (
+        f"The caller has a billing or payment question. You have no access to billing. {_HANDOFF}"
+    ),
+    Intent.CLINICAL_QUESTION: (
+        "The caller is asking for medical advice. You must NOT give any — no triage, no "
+        "reassurance about whether something is serious, no treatment suggestions. Say a "
+        f"clinician needs to answer that. {_HANDOFF}"
+    ),
+    Intent.TEST_RESULTS: (
+        "The caller is asking about lab or imaging results. These are protected health "
+        f"information and you must NOT read out or confirm any of them. {_HANDOFF}"
+    ),
+    Intent.INSURANCE_VERIFICATION: (
+        "The caller is asking about insurance coverage. You have no coverage data and must not "
+        f"guess which plans are accepted. {_HANDOFF}"
+    ),
+    Intent.HOURS_LOCATION: (
+        "The caller wants hours, the address, or directions. You do NOT have these facts and "
+        "must not invent them — a wrong address sends a sick person to the wrong place. Say a "
+        "staff member can confirm the details, and offer to book an appointment."
+    ),
+    Intent.SPEAK_TO_HUMAN: (
+        "The caller has asked for a person. Do not try to talk them out of it or resolve the "
+        f"issue yourself. {_HANDOFF}"
+    ),
+    Intent.UNKNOWN: (
+        "You do not yet know what the caller needs. Ask ONE short, open question to find out. "
+        "Do not assume they want to book an appointment."
+    ),
+}
+
+
+def _core_prompt(now_local, today) -> str:
+    return _CORE_TEMPLATE.format(
+        today=today.isoformat(),
+        weekday=today.strftime("%A"),
+        # e.g. "12:17 AM EDT" — includes the tz abbrev so the model knows which clock it's on.
+        now_local=now_local.strftime("%-I:%M %p %Z"),
+    )
 
 
 # How many days of the date-resolution reference table to inject (today + this many).
@@ -241,30 +356,66 @@ def _build_date_table(today: date) -> str:
     return "\n".join(lines)
 
 
-def build_phase2_system_prompt(now: _datetime | None = None) -> str:
-    """Return the Phase-2 system prompt with today's clinic-local date and time injected.
+def build_system_prompt(
+    intent: Intent | None = None, now: _datetime | None = None
+) -> str:
+    """Assemble the system prompt for one turn, scoped to the caller's classified intent.
 
-    The injected date table + current time are what let the LLM resolve relative phrases
-    ("next Tuesday") to the concrete YYYY-MM-DD the scheduling API filters on, and to reject
-    already-passed times. Everything is resolved in CLINIC_TZ (US/Eastern) so the model reasons
-    in the clinic's wall clock — near midnight local, the UTC date can already be "tomorrow",
-    which previously threw the day-of-week table and "has this time passed?" off by a day.
+    ``intent=None`` (turn one, before the classifier has answered) gets the full scheduling
+    prompt. That default is deliberate: scheduling is what this clinic line is for, and being
+    briefly over-equipped costs tokens, whereas being under-equipped on the caller's opening
+    sentence costs a wrong first reply.
 
-    `now` defaults to the current moment; a passed-in value may be naive (assumed UTC) or
-    tz-aware, and is converted to clinic-local before any date/time is derived.
+    Everything is resolved in CLINIC_TZ (US/Eastern) so the model reasons in the clinic's wall
+    clock — near midnight local the UTC date is already "tomorrow", which used to throw the
+    day-of-week table and "has this time passed?" off by a day. `now` may be naive (assumed
+    UTC) or tz-aware.
     """
     now = now or _datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     now_local = now.astimezone(CLINIC_TZ)
     today = now_local.date()
-    return _PHASE2_SYSTEM_PROMPT_TEMPLATE.format(
-        today=today.isoformat(),
-        weekday=today.strftime("%A"),
-        # e.g. "12:17 AM EDT" — includes the tz abbrev so the model knows which clock it's on.
-        now_local=now_local.strftime("%-I:%M %p %Z"),
-        date_table=_build_date_table(today),
-    )
+
+    parts = [_core_prompt(now_local, today)]
+
+    if intent is None or intent in SCHEDULING_INTENTS:
+        # The date block also references the current clinic-local time — it is what backs the
+        # Phase-4 "never offer a slot earlier today than now" rule.
+        parts.append(
+            _DATE_BLOCK.format(
+                date_table=_build_date_table(today),
+                now_local=now_local.strftime("%-I:%M %p %Z"),
+            )
+        )
+
+    if intent is None or intent is Intent.SCHEDULE_APPOINTMENT:
+        parts.append(_BOOKING_BLOCK)
+    elif intent is Intent.EMERGENCY:
+        # Recorded for completeness. The emergency path is scripted and never reaches a model
+        # (core/intent.detect_emergency), so this prompt is not used on that path.
+        parts.append(EMERGENCY_INSTRUCTION)
+    else:
+        parts.append(_INTENT_FRAGMENTS.get(intent, _INTENT_FRAGMENTS[Intent.UNKNOWN]))
+
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def build_phase2_system_prompt(now: _datetime | None = None) -> str:
+    """The full booking prompt. Retained as the name the Pipecat pipeline and eval import."""
+    return build_system_prompt(Intent.SCHEDULE_APPOINTMENT, now)
+
+
+def prompt_sizes(now: _datetime | None = None) -> dict[str, int]:
+    """Character count of the assembled prompt per intent — the Phase-12 size measurement.
+
+    Exposed rather than computed in a script so the number in the docs and the number the agent
+    actually sends cannot drift apart.
+    """
+    sizes = {"__unscoped__": len(build_system_prompt(None, now))}
+    for intent in Intent:
+        sizes[intent.value] = len(build_system_prompt(intent, now))
+    return sizes
 
 
 # NOTE: the original Phase-0 SYSTEM_PROMPT placeholder was superseded and removed. The full

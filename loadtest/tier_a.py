@@ -53,6 +53,7 @@ from clinic_agent.core.session import CallSession  # noqa: E402
 from clinic_agent.core.state import Phase  # noqa: E402
 from clinic_agent.core.worker import Worker  # noqa: E402
 from fake_adapters import (  # noqa: E402
+    FakeClassifier,
     FakeLLM,
     FakeMedia,
     FakeSTT,
@@ -116,6 +117,9 @@ class LoadSession(CallSession):
 
     def _build_stt(self):
         return FakeSTT(self.emit, self._sampler)
+
+    def _build_classifier(self):
+        return FakeClassifier()
 
 
 # --- instrumentation ------------------------------------------------------------------------

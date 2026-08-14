@@ -37,6 +37,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams, LLMService
 
 if TYPE_CHECKING:
+    from .intents import Intent
     from .metrics import LatencyCollector
 
 # Coarse, non-clinical reason categories a slot can be tagged with. Mirrors
@@ -346,8 +347,28 @@ def register_scheduling_functions(
         llm.register_function(tool_name, _handler(tool_name))
 
 
-def build_tools_schema() -> ToolsSchema:
-    """The tool/function schema the LLM is allowed to call (Phase 2)."""
+def build_tools_schema(intent: "Intent | None" = None) -> ToolsSchema:
+    """The tool/function schema the LLM is allowed to call, scoped to the caller's intent.
+
+    Phase 12 added the scoping. Through Phase 11 every turn carried all three schemas (2,951
+    characters) whatever the caller wanted, which costs tokens on every request and — the part
+    that actually matters — costs accuracy: a model shown a booking tool while the caller is
+    asking about a bill has an option it should not have. Smaller schemas measurably improve
+    both latency and tool-selection accuracy.
+
+    ``intent=None`` (turn one, before the classifier has answered) gets the full set, matching
+    ``prompts.build_system_prompt``: this is a scheduling line, so being briefly over-equipped
+    beats being under-equipped on the caller's opening sentence.
+
+    Every non-scheduling intent gets **no tools at all**. That is the point rather than a
+    limitation — those flows end in a hand-off, and a model with no tools cannot invent a
+    booking for someone who called about a prescription.
+    """
+    from .intents import Intent as _Intent
+
+    if intent is not None and intent is not _Intent.SCHEDULE_APPOINTMENT:
+        return ToolsSchema(standard_tools=[])
+
     reasons_list = "/".join(REASON_CATEGORIES)
     return ToolsSchema(
         standard_tools=[

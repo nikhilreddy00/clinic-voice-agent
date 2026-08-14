@@ -20,7 +20,16 @@ from clinic_agent.core.state import Phase
 from clinic_agent.core.vad import SharedSileroVAD, shared_executor, shared_inference_session
 from clinic_agent.core.worker import Worker
 
-from test_session import FakeLLM, FakeMedia, FakeSTT, FakeTools, FakeTTS, _settle, settings
+from test_session import (
+    FakeClassifier,
+    FakeLLM,
+    FakeMedia,
+    FakeSTT,
+    FakeTools,
+    FakeTTS,
+    _settle,
+    settings,
+)
 
 
 class QuietSession(CallSession):
@@ -40,6 +49,9 @@ class QuietSession(CallSession):
 
     def _build_stt(self):
         return FakeSTT()
+
+    def _build_classifier(self):
+        return FakeClassifier()
 
 
 def make_worker(tmp_path, monkeypatch, **kwargs) -> Worker:

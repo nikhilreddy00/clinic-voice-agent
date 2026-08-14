@@ -28,7 +28,11 @@ from loguru import logger
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 
+from ...intents import Intent
+from ...prompts import build_system_prompt
+from ...scheduling_tools import build_tools_schema
 from .. import events as ev
+from ..llm_router import LLMRouter, Tier
 
 EmitFn = Callable[[ev.Event], None]
 
@@ -71,6 +75,8 @@ class AnthropicLLM:
         emit: EmitFn,
         *,
         max_tokens: int = MAX_TOKENS,
+        router: LLMRouter | None = None,
+        now=None,
     ) -> None:
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._model = model
@@ -78,25 +84,71 @@ class AnthropicLLM:
         self._emit = emit
         self._max_tokens = max_tokens
         self._tasks: dict[str, asyncio.Task] = {}
+        # Phase 12: the reducer picks a tier; this maps it to a model. `now` is pinned at call
+        # construction so every per-intent prompt in one call shares the same date table — a
+        # long call must not silently change its own grounding at midnight.
+        self._router = router or LLMRouter()
+        self._now = now
+        self._prompt_cache: dict[Intent | None, str] = {}
+        self._tools_cache: dict[Intent | None, list[dict[str, Any]]] = {}
 
-        # System is a block list, not a bare string, so a cache_control breakpoint is a
-        # one-field change. It is opt-in because Phase 8 measured the cacheable prefix at 3,811
-        # tokens against Haiku 4.5's 4,096 minimum: Anthropic ACCEPTS the breakpoint there and
-        # then silently caches nothing (cache_creation_input_tokens: 0). Enabling it by default
-        # would look like a working optimization while doing nothing. Turn it on together with
-        # a model whose minimum the prompt clears (Sonnet 4.6/5 and Opus 4.8 are 1,024), and
-        # verify with a non-zero usage.cache_read_input_tokens on the second call.
-        self._system: list[dict[str, Any]] = [{"type": "text", "text": system_prompt}]
-        if os.getenv("CLINIC_PROMPT_CACHE", "").strip() == "1":
-            self._system[-1]["cache_control"] = {"type": "ephemeral"}
+        # Phase 12 made the system prompt per-intent, so it is built per request rather than
+        # held as one blob; `system_prompt` remains the fallback for callers that construct this
+        # adapter directly (the Pipecat-era signature).
+        self._fallback_prompt = system_prompt
+        # Caching is opt-in because Phase 8 measured the cacheable prefix at 3,811 tokens
+        # against Haiku 4.5's 4,096 minimum: Anthropic ACCEPTS the breakpoint there and then
+        # silently caches nothing (cache_creation_input_tokens: 0). Enabling it by default
+        # would look like a working optimization while doing nothing. Note Phase 12's
+        # intent-scoped prompts push non-scheduling turns FURTHER below that floor — the
+        # resolution is a model whose minimum the prompt clears, not a smaller prompt.
+        self._cache_enabled = os.getenv("CLINIC_PROMPT_CACHE", "").strip() == "1"
+        if self._cache_enabled:
             logger.info("[llm] prompt caching breakpoint enabled on the system block")
 
-    def start(self, request_id: str, messages: tuple[dict[str, Any], ...]) -> None:
+    def _system_blocks(self, prompt: str) -> list[dict[str, Any]]:
+        """System as a block list, so a cache_control breakpoint is a one-field change."""
+        block: dict[str, Any] = {"type": "text", "text": prompt or self._fallback_prompt}
+        if self._cache_enabled:
+            block["cache_control"] = {"type": "ephemeral"}
+        return [block]
+
+    def _scoped_prompt(self, intent: Intent | None) -> str:
+        """System prompt for this intent, built once per call and reused."""
+        if intent not in self._prompt_cache:
+            self._prompt_cache[intent] = build_system_prompt(intent, self._now)
+        return self._prompt_cache[intent]
+
+    def _scoped_tools(self, intent: Intent | None) -> list[dict[str, Any]]:
+        """Tool subset for this intent. Non-scheduling intents get none — see build_tools_schema."""
+        if intent not in self._tools_cache:
+            self._tools_cache[intent] = to_anthropic_tools(build_tools_schema(intent))
+        return self._tools_cache[intent]
+
+    def start(
+        self,
+        request_id: str,
+        messages: tuple[dict[str, Any], ...],
+        *,
+        tier: Tier = Tier.STANDARD,
+        intent: Intent | None = None,
+        routing_reason: str = "",
+    ) -> None:
         """Kick off a streaming request. Returns immediately; results arrive as events."""
         if request_id in self._tasks:
             return
+        decision = self._router.resolve(tier, routing_reason)
+        self._emit(
+            ev.ModelRouted(
+                t=time.monotonic(),
+                request_id=request_id,
+                tier=decision.tier.value,
+                model=decision.model,
+                reason=decision.reason,
+            )
+        )
         self._tasks[request_id] = asyncio.create_task(
-            self._run(request_id, list(messages)), name=f"llm-{request_id}"
+            self._run(request_id, list(messages), decision, intent), name=f"llm-{request_id}"
         )
 
     def cancel(self, request_id: str) -> None:
@@ -105,15 +157,16 @@ class AnthropicLLM:
         if task is not None and not task.done():
             task.cancel()
 
-    async def _run(self, request_id: str, messages: list[dict[str, Any]]) -> None:
+    async def _run(self, request_id, messages, decision, intent) -> None:
         self._emit(ev.LLMStarted(t=time.monotonic(), request_id=request_id))
         text_parts: list[str] = []
+        system = self._system_blocks(self._scoped_prompt(intent))
         try:
             async with self._client.messages.stream(
-                model=self._model,
-                max_tokens=self._max_tokens,
-                system=self._system,
-                tools=self._tools,
+                model=decision.model,
+                max_tokens=decision.max_tokens,
+                system=system,
+                tools=self._scoped_tools(intent),
                 messages=messages,
             ) as stream:
                 async for event in stream:
@@ -169,7 +222,7 @@ class AnthropicLLM:
     def _log_cache_usage(self, final: Any) -> None:
         """Report cache hits/misses when caching is on — a zero read is the only silent-miss tell."""
         usage = getattr(final, "usage", None)
-        if usage is None or "cache_control" not in self._system[-1]:
+        if usage is None or not self._cache_enabled:
             return
         logger.info(
             f"[llm] cache: created={getattr(usage, 'cache_creation_input_tokens', None)} "
