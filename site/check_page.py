@@ -51,6 +51,7 @@ REQUIRED_COPY = [
     "+1 (484) 295-0169",
     "Three in ten calls to a busy practice go unanswered",
     "It cannot tell a caller they are booked unless they are.",
+    "The clinic's phone line has a pulse.",
     "3BA83DD4",
     "text-in-the-loop eval case, not a phone call",
     "19/19",

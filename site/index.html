@@ -211,6 +211,23 @@
   .steps .idx { font: 500 .75rem/1 var(--mono); letter-spacing: .14em; color: var(--teal); padding-top: .35rem; }
   .steps p { color: var(--muted); margin: .35rem 0 0; }
 
+  /* --- ethos: the mark, explained ------------------------------------------- */
+  .band--pulse { background: var(--porcelain); padding: clamp(3.5rem, 7vw, 5.5rem) 0; }
+  .ethos { display: grid; gap: 1.5rem; max-width: 44ch; }
+  .ethos-line {
+    font-family: var(--display); font-weight: 400;
+    font-size: clamp(2rem, 1.3rem + 3vw, 3.5rem);
+    line-height: 1.05; letter-spacing: -.02em;
+    color: var(--ink); margin: 0; max-width: none;
+  }
+  .ethos-line em { font-style: italic; color: var(--teal-bright); }
+  .ethos-sub { color: var(--muted); margin: 0; }
+  /* The large mark holds its trace undrawn until the section is actually in view,
+     so the line and the heartbeat land together rather than the animation having
+     already finished somewhere above the fold. */
+  .ethos .logo .pulse { animation: none; stroke-dashoffset: 42; }
+  .ethos.in .logo .pulse { animation: trace 1.5s var(--ease) forwards, beat 2.6s 1.5s ease-in-out infinite; }
+
   /* --- console: a locked stage, content moves inside ------------------------ */
   .console {
     margin-top: 3rem; background: var(--white);
@@ -449,6 +466,23 @@
           </div>
         </li>
       </ol>
+    </div>
+  </section>
+
+  <section class="band band--pulse" id="ethos">
+    <div class="wrap">
+      <div class="ethos reveal">
+        <svg class="logo" width="52" height="52" viewBox="0 0 32 32" role="img" aria-label="Attend">
+          <path class="bubble" d="M7 4h18a5 5 0 0 1 5 5v11a5 5 0 0 1-5 5h-8.5l-6.2 4.6A.8.8 0 0 1 9 29v-4H7a5 5 0 0 1-5-5V9a5 5 0 0 1 5-5Z"/>
+          <path class="pulse" d="M6.5 14.5h3.2l2-4.6 3 9 2.4-6 1.6 1.6h6.8"/>
+        </svg>
+        <p class="ethos-line">The clinic's phone line <em>has a pulse.</em></p>
+        <p class="ethos-sub">
+          That is the mark — a speech bubble with a heartbeat running through it — and it is the
+          whole idea behind the product. A number that answers, listens properly, and books,
+          at three in the afternoon or ten at night.
+        </p>
+      </div>
     </div>
   </section>
 
