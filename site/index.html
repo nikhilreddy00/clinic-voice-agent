@@ -5,401 +5,582 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Attend</title>
 <meta name="description" content="A voice agent that answers a clinic's phone, takes a real intake, and books into a real calendar. Built as a working prototype, with the measurements to back it up.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Sans:wght@400;450;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
+  /* =========================================================================
+     Attend — a switchboard after hours.
+
+     One committed visual world rather than two themes: the page is about the
+     hours when a clinic's phone rings and nobody is there, so it is lit like a
+     console at night. Every colour is painted explicitly, because an artifact
+     composites over whatever ground the viewer's own theme paints.
+
+     Coral appears exactly twice — the live dot and the record indicator. It is
+     the only warm colour on the page, so it reads as "this line is open" and
+     nothing else competes with it.
+     ========================================================================= */
   :root {
-    --bg: #FBFAF8;
-    --surface: #FFFFFF;
-    --fg: #16181D;
-    --muted: #555C6B;
-    --line: #E4E1DB;
-    --accent: #0F5C4E;
-    --accent-fg: #FFFFFF;
-    --mono-bg: #F3F1EC;
-    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-    --measure: 68ch;
+    --ink:        #080B12;
+    --ink-raised: #0D1119;
+    --slate:      #111725;
+    --slate-hi:   #18202F;
+    --line:       #1E2839;
+    --line-soft:  #161E2C;
+
+    --porcelain:  #E8EDF5;
+    --steel:      #93A1B8;
+    --steel-dim:  #7B8AA3;
+
+    --mint:       #5EEAD4;
+    --mint-deep:  #0F766E;   /* rules and borders only — too dark for text */
+    --mint-text:  #0D9488;   /* the quiet accent when it must be READ at small sizes */
+    --mint-glow:  rgba(94, 234, 212, 0.14);
+    --coral:      #FF5C47;
+
+    --display: "Instrument Serif", Georgia, "Times New Roman", serif;
+    --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    --measure: 62ch;
+    --radius: 14px;
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0E1013;
-      --surface: #14171C;
-      --fg: #ECEEF2;
-      --muted: #A3ABB9;
-      --line: #232830;
-      --accent: #35C7A9;
-      --accent-fg: #06231D;
-      --mono-bg: #171B21;
-    }
-  }
+
   * { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; }
+  html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+
   body {
     margin: 0;
-    background: var(--bg);
-    color: var(--fg);
+    background: var(--ink);
+    color: var(--porcelain);
     font-family: var(--sans);
-    font-size: clamp(1rem, 0.96rem + 0.2vw, 1.0625rem);
-    line-height: 1.6;
+    font-size: clamp(1rem, 0.96rem + 0.22vw, 1.0625rem);
+    font-weight: 400;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
   }
-  main { max-width: 78rem; margin: 0 auto; padding: 0 1.5rem; }
-  section { padding: clamp(3rem, 8vw, 6rem) 0; border-top: 1px solid var(--line); }
-  section:first-of-type { border-top: 0; }
-  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 0.75rem; }
-  h1 { font-size: clamp(2.25rem, 1.6rem + 3.2vw, 4rem); }
-  h2 { font-size: clamp(1.5rem, 1.2rem + 1.4vw, 2.25rem); }
-  p { max-width: var(--measure); margin: 0 0 1rem; }
-  .lede { font-size: clamp(1.125rem, 1rem + 0.6vw, 1.375rem); color: var(--muted); }
-  .eyebrow {
-    font: 600 0.75rem/1 var(--mono);
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--accent);
-    margin-bottom: 1rem;
-  }
-  code, .mono { font-family: var(--mono); font-size: 0.9em; }
 
-  /* --- hero ------------------------------------------------------------------ */
-  .hero { padding-top: clamp(3rem, 10vw, 7rem); }
-  .wordmark {
-    font: 700 1.125rem/1 var(--sans);
-    letter-spacing: -0.02em;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin-bottom: clamp(2rem, 6vw, 4rem);
-  }
-  .wordmark::before {
+  ::selection { background: var(--mint); color: var(--ink); }
+
+  a { color: var(--mint); text-underline-offset: 3px; }
+  :focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; border-radius: 3px; }
+
+  .wrap { width: min(100% - 2.5rem, 74rem); margin-inline: auto; }
+
+  /* --- band system: alternating grounds are the "partial backgrounds" -------- */
+  .band { position: relative; padding: clamp(4rem, 9vw, 7.5rem) 0; }
+  .band--raised { background: var(--ink-raised); }
+  .band--raised::before,
+  .band--raised::after {
     content: "";
-    width: 0.7rem; height: 0.7rem; border-radius: 50%;
-    background: var(--accent);
+    position: absolute; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--line), transparent);
   }
-  .cta {
-    display: flex; flex-wrap: wrap; align-items: center;
-    gap: 1rem 1.5rem;
-    margin-top: 2.5rem;
+  .band--raised::before { top: 0; }
+  .band--raised::after { bottom: 0; }
+
+  /* --- type ---------------------------------------------------------------- */
+  h1, h2, h3 { margin: 0 0 0.6rem; text-wrap: balance; }
+  h1 {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: clamp(2.75rem, 1.6rem + 5.2vw, 5.75rem);
+    line-height: 0.98;
+    letter-spacing: -0.02em;
   }
+  h2 {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: clamp(2rem, 1.4rem + 2.6vw, 3.25rem);
+    line-height: 1.05;
+    letter-spacing: -0.015em;
+  }
+  h3 { font: 500 1.0625rem/1.35 var(--sans); letter-spacing: -0.005em; }
+  p { margin: 0 0 1rem; max-width: var(--measure); }
+  .lede { font-size: clamp(1.0625rem, 1rem + 0.5vw, 1.3125rem); color: var(--steel); line-height: 1.55; }
+  em { font-style: italic; }
+
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 0.55rem;
+    font: 500 0.6875rem/1 var(--mono);
+    letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--mint);
+    margin-bottom: 1.25rem;
+  }
+  .eyebrow::before {
+    content: ""; width: 1.75rem; height: 1px; background: var(--mint-deep);
+  }
+
+  /* --- reveal on scroll ----------------------------------------------------- */
+  .reveal { opacity: 0; transform: translateY(18px); }
+  .reveal.in { opacity: 1; transform: none; transition: opacity .7s var(--ease), transform .7s var(--ease); }
+
+  /* --- masthead ------------------------------------------------------------- */
+  .masthead {
+    position: sticky; top: 0; z-index: 50;
+    background: color-mix(in srgb, var(--ink) 82%, transparent);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .masthead .wrap {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 1rem; padding: 0.85rem 0;
+  }
+  .brand { display: inline-flex; align-items: center; gap: 0.6rem; text-decoration: none; color: var(--porcelain); }
+  .brand-name { font: 600 1.0625rem/1 var(--sans); letter-spacing: -0.02em; }
+  .masthead-cta {
+    font: 500 0.875rem/1 var(--mono);
+    color: var(--porcelain); text-decoration: none;
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 0.5rem 0.95rem;
+    transition: border-color .3s var(--ease), color .3s var(--ease);
+  }
+  .masthead-cta:hover { border-color: var(--mint); color: var(--mint); }
+  @media (max-width: 640px) { .masthead-cta { display: none; } }
+
+  /* --- hero ----------------------------------------------------------------- */
+  .hero { position: relative; overflow: hidden; padding: clamp(4rem, 11vw, 8.5rem) 0 clamp(3rem, 7vw, 5rem); }
+  .hero-glow {
+    position: absolute; inset: -30% -10% auto -10%; height: 70vh;
+    background: radial-gradient(60% 60% at 50% 0%, var(--mint-glow), transparent 70%);
+    pointer-events: none;
+  }
+  #wave { position: absolute; inset: auto 0 0 0; width: 100%; height: 180px; opacity: 0.5; pointer-events: none; }
+  .hero .wrap { position: relative; z-index: 1; }
+  .hero h1 { max-width: 15ch; }
+  .hero h1 .accent { font-style: italic; color: var(--mint); }
+  .hero .lede { max-width: 52ch; margin-top: 1.5rem; }
+
+  .cta-row { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem 1.75rem; margin-top: 2.75rem; }
   .call {
-    display: inline-flex; align-items: baseline; gap: 0.6rem;
-    background: var(--accent); color: var(--accent-fg);
-    text-decoration: none;
-    padding: 0.9rem 1.4rem;
-    border-radius: 0.6rem;
-    font: 600 1.125rem/1 var(--sans);
+    position: relative; overflow: hidden;
+    display: inline-flex; align-items: center; gap: 0.85rem;
+    background: var(--mint); color: var(--ink);
+    text-decoration: none; border-radius: 999px;
+    padding: 0.95rem 1.6rem;
+    font: 600 1.0625rem/1 var(--sans); letter-spacing: -0.01em;
+    box-shadow: 0 0 0 0 var(--mint-glow);
+    transition: transform .3s var(--ease), box-shadow .4s var(--ease);
   }
-  .call .num { font-family: var(--mono); letter-spacing: -0.01em; }
-  .call:hover { filter: brightness(1.08); }
-  .call:focus-visible { outline: 3px solid var(--fg); outline-offset: 3px; }
-  .cta-note { color: var(--muted); font-size: 0.9375rem; max-width: 34ch; margin: 0; }
+  .call:hover { transform: translateY(-2px); box-shadow: 0 12px 40px -8px rgba(94,234,212,.45); }
+  .call .num { font: 500 1.0625rem/1 var(--mono); }
+  .call .dot {
+    width: 0.5rem; height: 0.5rem; border-radius: 50%;
+    background: var(--ink); flex: none;
+    animation: ring 2s infinite;
+  }
+  @keyframes ring { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .cta-note { color: var(--steel-dim); font-size: 0.9375rem; max-width: 30ch; margin: 0; }
 
-  /* --- generic layout blocks -------------------------------------------------- */
-  .cols {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
-    gap: clamp(1.5rem, 4vw, 3rem);
-    margin-top: 2.5rem;
+  /* --- marquee of what it handles ------------------------------------------- */
+  .ticker {
+    margin-top: clamp(3rem, 7vw, 5rem);
+    border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft);
+    overflow: hidden; padding: 0.9rem 0;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+            mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
   }
-  .cols h3 { font-size: 1.0625rem; }
-  .cols p { color: var(--muted); margin: 0; font-size: 0.9375rem; }
-  .stat {
-    font: 700 clamp(2rem, 1.4rem + 2.4vw, 3rem)/1 var(--sans);
-    letter-spacing: -0.03em;
-    color: var(--accent);
-    display: block;
-    margin-bottom: 0.35rem;
+  .ticker-track { display: flex; gap: 2.5rem; width: max-content; animation: slide 38s linear infinite; }
+  .ticker span {
+    font: 400 0.8125rem/1 var(--mono); letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--steel-dim); white-space: nowrap;
   }
-  .steps { counter-reset: step; margin-top: 2.5rem; padding: 0; list-style: none; }
-  .steps li {
-    counter-increment: step;
-    display: grid;
-    grid-template-columns: 2.25rem 1fr;
-    gap: 1rem;
-    padding: 1.25rem 0;
-    border-top: 1px solid var(--line);
-  }
-  .steps li::before {
-    content: counter(step);
-    font: 600 0.875rem/2.25rem var(--mono);
-    text-align: center;
-    color: var(--accent-fg);
-    background: var(--accent);
-    border-radius: 50%;
-    width: 2.25rem; height: 2.25rem;
-  }
-  .steps h3 { margin-bottom: 0.25rem; font-size: 1.0625rem; }
-  .steps p { color: var(--muted); margin: 0; }
+  .ticker span::after { content: "／"; margin-left: 2.5rem; color: var(--line); }
+  @keyframes slide { to { transform: translateX(-50%); } }
 
-  /* --- call replay ------------------------------------------------------------ */
-  .replay {
-    display: grid;
-    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
-    gap: clamp(1rem, 3vw, 2rem);
-    margin-top: 2.5rem;
-    align-items: start;
+  /* --- problem stats -------------------------------------------------------- */
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1px; margin-top: 3rem; background: var(--line-soft); border: 1px solid var(--line-soft); }
+  .cell { background: var(--ink); padding: clamp(1.5rem, 3vw, 2.25rem); }
+  .band--raised .cell { background: var(--ink-raised); }
+  .cell .stat {
+    display: block; font-family: var(--display); font-weight: 400;
+    font-size: clamp(2.75rem, 2rem + 3vw, 4rem); line-height: 1;
+    color: var(--mint); letter-spacing: -0.02em; margin-bottom: 0.75rem;
+    font-variant-numeric: tabular-nums;
   }
-  @media (max-width: 840px) { .replay { grid-template-columns: 1fr; } }
-  .panel {
-    background: var(--surface);
+  .cell p { color: var(--steel); font-size: 0.9375rem; margin: 0.4rem 0 0; }
+
+  /* --- steps ---------------------------------------------------------------- */
+  .steps { list-style: none; margin: 3rem 0 0; padding: 0; display: grid; gap: 1px; background: var(--line-soft); border: 1px solid var(--line-soft); }
+  .steps li { background: var(--ink-raised); padding: clamp(1.5rem, 3vw, 2.25rem); display: grid; grid-template-columns: 3.5rem 1fr; gap: 1.5rem; align-items: start; }
+  @media (max-width: 560px) { .steps li { grid-template-columns: 1fr; gap: 0.75rem; } }
+  .steps .idx { font: 400 0.75rem/1 var(--mono); letter-spacing: 0.14em; color: var(--mint-text); padding-top: 0.35rem; }
+  .steps p { color: var(--steel); margin: 0.35rem 0 0; }
+
+  /* --- the console: fixed stage, content moves inside ----------------------- */
+  .console {
+    margin-top: 3rem;
+    background: var(--slate);
     border: 1px solid var(--line);
-    border-radius: 0.75rem;
-    padding: 1.25rem;
-    min-height: 22rem;
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: 0 40px 80px -40px rgba(0,0,0,.8);
   }
-  .panel-title {
-    font: 600 0.75rem/1 var(--mono);
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin-bottom: 1rem;
+  .console-bar {
+    display: flex; align-items: center; gap: 1rem;
+    padding: 0.8rem 1.1rem;
+    background: var(--slate-hi);
+    border-bottom: 1px solid var(--line);
+    font: 500 0.8125rem/1 var(--mono);
+  }
+  .live { display: inline-flex; align-items: center; gap: 0.5rem; color: var(--coral); letter-spacing: 0.12em; }
+  .live .rec { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--coral); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
+  .console-num { color: var(--steel); }
+  .console-timer { margin-left: auto; color: var(--steel); font-variant-numeric: tabular-nums; }
+  @media (max-width: 560px) { .console-num { display: none; } }
+
+  .console-body { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+  @media (max-width: 880px) { .console-body { grid-template-columns: 1fr; } }
+
+  /* The whole point: a locked stage. Turns scroll INSIDE these panes, so the
+     page never reflows and the reader never loses their place. */
+  .stage {
+    height: 26rem;
+    overflow-y: auto;
+    padding: 1.25rem;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
+  }
+  @media (max-width: 880px) { .stage { height: 19rem; } }
+  .stage::-webkit-scrollbar { width: 6px; }
+  .stage::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+  .stage--rail { border-left: 1px solid var(--line); background: var(--ink-raised); }
+  @media (max-width: 880px) { .stage--rail { border-left: 0; border-top: 1px solid var(--line); } }
+
+  .stage-label {
+    position: sticky; top: -1.25rem; z-index: 2;
+    margin: -1.25rem -1.25rem 1rem; padding: 0.7rem 1.25rem;
+    background: color-mix(in srgb, var(--slate) 92%, transparent);
+    backdrop-filter: blur(8px);
+    font: 500 0.6875rem/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--steel-dim);
     display: flex; justify-content: space-between; align-items: center;
   }
-  .turn { margin-bottom: 0.875rem; opacity: 0; transform: translateY(4px); }
-  .turn.shown { opacity: 1; transform: none; transition: opacity .28s ease, transform .28s ease; }
-  .turn .who {
-    font: 600 0.6875rem/1 var(--mono);
-    letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--muted); display: block; margin-bottom: 0.25rem;
-  }
-  .turn.caller .bubble { background: var(--mono-bg); }
-  .turn.agent .bubble { background: transparent; border: 1px solid var(--line); }
-  .bubble { padding: 0.6rem 0.8rem; border-radius: 0.5rem; }
-  .tool {
-    font-family: var(--mono); font-size: 0.8125rem;
-    border: 1px solid var(--line); border-left: 3px solid var(--accent);
-    border-radius: 0.5rem; padding: 0.7rem 0.85rem; margin-bottom: 0.75rem;
-    background: var(--mono-bg);
-    opacity: 0; transform: translateY(4px);
-  }
-  .tool.shown { opacity: 1; transform: none; transition: opacity .28s ease, transform .28s ease; }
-  .tool .name { color: var(--accent); font-weight: 600; }
-  .tool dl { margin: 0.5rem 0 0; display: grid; grid-template-columns: auto 1fr; gap: 0.15rem 0.6rem; }
-  .tool dt { color: var(--muted); }
-  .tool dd { margin: 0; overflow-wrap: anywhere; }
-  .tool.is-confirm { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent); }
-  .replay-controls { display: flex; gap: 0.75rem; align-items: center; margin-top: 1.25rem; }
-  .btn {
-    font: 600 0.875rem/1 var(--sans);
-    background: transparent; color: var(--fg);
-    border: 1px solid var(--line); border-radius: 0.5rem;
-    padding: 0.55rem 0.9rem; cursor: pointer;
-  }
-  .btn:hover { border-color: var(--accent); }
-  .btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-  .caveat { color: var(--muted); font-size: 0.875rem; max-width: var(--measure); }
-  @media (prefers-reduced-motion: reduce) {
-    .turn, .tool { opacity: 1; transform: none; transition: none; }
-  }
+  .stage--rail .stage-label { background: color-mix(in srgb, var(--ink-raised) 92%, transparent); }
 
-  /* --- proof table ------------------------------------------------------------ */
-  .table-wrap { overflow-x: auto; margin-top: 2.5rem; }
-  table { border-collapse: collapse; width: 100%; min-width: 34rem; font-size: 0.9375rem; }
-  th, td { text-align: left; padding: 0.7rem 1rem 0.7rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font: 600 0.75rem/1.4 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
-  td.value { font-family: var(--mono); color: var(--accent); font-weight: 600; white-space: nowrap; }
-  td.source { color: var(--muted); }
-  .limits { border-left: 3px solid var(--accent); padding-left: 1.25rem; margin-top: 2rem; }
-  .limits li { margin-bottom: 0.6rem; max-width: var(--measure); }
-  footer {
-    border-top: 1px solid var(--line);
-    padding: 2.5rem 0 4rem;
-    color: var(--muted);
-    font-size: 0.9375rem;
+  .turn { margin-bottom: 1rem; opacity: 0; transform: translateY(8px); }
+  .turn.shown { opacity: 1; transform: none; transition: opacity .4s var(--ease), transform .4s var(--ease); }
+  .turn .who { font: 500 0.6875rem/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--steel-dim); display: block; margin-bottom: 0.4rem; }
+  .bubble { padding: 0.7rem 0.9rem; border-radius: 10px; font-size: 0.9375rem; line-height: 1.5; }
+  .turn.caller .bubble { background: var(--slate-hi); color: var(--porcelain); border-top-left-radius: 3px; }
+  .turn.agent .bubble { background: transparent; border: 1px solid var(--line); color: var(--steel); border-top-right-radius: 3px; }
+  .turn.agent { padding-left: 1.5rem; }
+
+  .tool {
+    font-family: var(--mono); font-size: 0.75rem;
+    background: var(--slate); border: 1px solid var(--line);
+    border-radius: 10px; padding: 0.7rem 0.85rem; margin-bottom: 0.7rem;
+    opacity: 0; transform: translateY(8px);
   }
-  footer a { color: var(--fg); }
+  .tool.shown { opacity: 1; transform: none; transition: opacity .4s var(--ease), transform .4s var(--ease); }
+  .tool .name { color: var(--mint); font-weight: 500; display: block; margin-bottom: 0.5rem; }
+  .tool dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 0.2rem 0.7rem; }
+  .tool dt { color: var(--steel-dim); }
+  .tool dd { margin: 0; color: var(--porcelain); overflow-wrap: anywhere; }
+  .tool.is-confirm { border-color: var(--mint-deep); background: linear-gradient(180deg, var(--mint-glow), transparent 60%), var(--slate); }
+  .tool.is-confirm dd { color: var(--mint); }
+
+  .console-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; padding: 0.9rem 1.1rem; border-top: 1px solid var(--line); background: var(--slate-hi); }
+  .btn {
+    font: 500 0.8125rem/1 var(--mono); letter-spacing: 0.06em;
+    background: transparent; color: var(--porcelain);
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 0.55rem 1rem; cursor: pointer;
+    transition: border-color .3s var(--ease), color .3s var(--ease);
+  }
+  .btn:hover { border-color: var(--mint); color: var(--mint); }
+  .console-hint { font: 400 0.8125rem/1.4 var(--sans); color: var(--steel-dim); margin: 0; }
+
+  .caveat { color: var(--steel-dim); font-size: 0.875rem; max-width: var(--measure); margin-top: 1.75rem; }
+
+  /* --- proof ---------------------------------------------------------------- */
+  .table-wrap { overflow-x: auto; margin-top: 3rem; border: 1px solid var(--line-soft); border-radius: var(--radius); }
+  table { border-collapse: collapse; width: 100%; min-width: 40rem; font-size: 0.9375rem; }
+  thead th {
+    font: 500 0.6875rem/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--steel-dim); text-align: left;
+    padding: 1rem 1.25rem; background: var(--slate); border-bottom: 1px solid var(--line);
+  }
+  tbody td { padding: 1rem 1.25rem; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr { transition: background .3s var(--ease); }
+  tbody tr:hover { background: var(--ink-raised); }
+  td.value { font: 500 1rem/1.4 var(--mono); color: var(--mint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.source { color: var(--steel); font-size: 0.875rem; }
+
+  /* --- limits --------------------------------------------------------------- */
+  .limits { list-style: none; margin: 3rem 0 0; padding: 0; display: grid; gap: 1.25rem; }
+  .limits li { display: grid; grid-template-columns: 1.5rem 1fr; gap: 1rem; max-width: 76ch; }
+  .limits .tick { color: var(--mint-text); font: 500 0.875rem/1.6 var(--mono); }
+  .limits strong { color: var(--porcelain); font-weight: 600; }
+  .limits span.body { color: var(--steel); }
+
+  /* --- footer --------------------------------------------------------------- */
+  footer { border-top: 1px solid var(--line-soft); padding: 3rem 0 4rem; color: var(--steel-dim); font-size: 0.9375rem; }
+  footer p { max-width: 62ch; }
+  .foot-brand { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 1.25rem; }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .reveal, .turn, .tool { opacity: 1; transform: none; transition: none; }
+    .ticker-track { animation: none; }
+    .call .dot, .live .rec { animation: none; }
+    #wave { display: none; }
+  }
 </style>
 </head>
 <body>
-<main>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <svg width="26" height="26" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <rect x="1" y="1" width="30" height="30" rx="9" stroke="#1E2839" stroke-width="1.5"/>
+        <path d="M10 21V15M16 21V11M22 21V17" stroke="#5EEAD4" stroke-width="2.5" stroke-linecap="round"/>
+      </svg>
+      <span class="brand-name">Attend</span>
+    </a>
+    <a class="masthead-cta" href="tel:+14842950169">+1 (484) 295-0169</a>
+  </div>
+</header>
+
+<main id="top">
 
   <section class="hero">
-    <div class="wordmark">Attend</div>
-    <h1>The front desk that never misses a call.</h1>
-    <p class="lede">
-      Attend answers a clinic's phone, takes a real intake, offers times that are genuinely
-      open, and books the appointment — then reads back a confirmation number it actually has.
-    </p>
-    <div class="cta">
-      <a class="call" href="tel:+14842950169">
-        Call the demo line <span class="num">+1 (484) 295-0169</span>
-      </a>
-      <p class="cta-note">
-        A real agent picks up and books into Grove Family Clinic, a synthetic practice used
-        for demonstration.
+    <div class="hero-glow"></div>
+    <canvas id="wave" aria-hidden="true"></canvas>
+    <div class="wrap">
+      <p class="eyebrow reveal">Voice agents for clinic front desks</p>
+      <h1 class="reveal">The front desk that <span class="accent">never misses</span> a call.</h1>
+      <p class="lede reveal">
+        Attend answers a clinic's phone, takes a real intake, offers times that are genuinely
+        open, and books the appointment — then reads back a confirmation number it actually has.
+      </p>
+      <div class="cta-row reveal">
+        <a class="call" href="tel:+14842950169">
+          <span class="dot"></span>
+          Call the demo line
+          <span class="num">+1 (484) 295-0169</span>
+        </a>
+        <p class="cta-note">
+          A real agent picks up and books into Grove Family Clinic, a synthetic practice used
+          for demonstration.
+        </p>
+      </div>
+    </div>
+    <div class="ticker" aria-hidden="true">
+      <div class="ticker-track" id="ticker-track"></div>
+    </div>
+  </section>
+
+  <section class="band band--raised" id="problem">
+    <div class="wrap">
+      <p class="eyebrow reveal">The problem</p>
+      <h2 class="reveal">The phone is the front door,<br>and it is often locked.</h2>
+      <p class="lede reveal">Most practices lose booked appointments the same way: nobody could pick up.</p>
+      <div class="grid-3">
+        <div class="cell reveal">
+          <span class="stat">3 in 10</span>
+          <h3>Calls go unanswered at peak</h3>
+          <p>
+            Three in ten calls to a busy practice go unanswered when the desk is with a patient,
+            on another line, or at lunch. Each one is a patient who has to try again — or doesn't.
+          </p>
+        </div>
+        <div class="cell reveal">
+          <span class="stat">After 5</span>
+          <h3>The line goes dark</h3>
+          <p>
+            Patients decide to book in the evening, which is exactly when nobody is there to
+            take the call. Voicemail is where that intention goes to expire.
+          </p>
+        </div>
+        <div class="cell reveal">
+          <span class="stat">1 at a time</span>
+          <h3>A desk cannot parallelize</h3>
+          <p>
+            One receptionist holds one conversation. A Monday-morning rush is a queue by
+            definition, and callers who wait on hold hang up.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="how">
+    <div class="wrap">
+      <p class="eyebrow reveal">How it works</p>
+      <h2 class="reveal">It answers, it asks the right<br>questions, and it books.</h2>
+      <ol class="steps">
+        <li class="reveal">
+          <span class="idx">01</span>
+          <div>
+            <h3>It picks up — every time, on every line</h3>
+            <p>
+              The caller hears that they are speaking to an automated assistant, and that the
+              call is recorded, before they say anything. That disclosure is not optional.
+            </p>
+          </div>
+        </li>
+        <li class="reveal">
+          <span class="idx">02</span>
+          <div>
+            <h3>It takes an intake a clinician can actually use</h3>
+            <p>
+              Name, date of birth, new or returning — then a focused history: how long, how bad,
+              what makes it worse, what's happened before. It asks a few targeted questions and
+              writes one clean clinical sentence, so nobody re-takes the history in the room.
+              It never diagnoses and never suggests treatment.
+            </p>
+          </div>
+        </li>
+        <li class="reveal">
+          <span class="idx">03</span>
+          <div>
+            <h3>It books into the real calendar</h3>
+            <p>
+              It offers only times the schedule actually has open, holds the slot while the
+              caller decides, writes the booking, and reads back the confirmation number the
+              system returned. It cannot tell a caller they are booked unless they are.
+            </p>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="band band--raised" id="replay">
+    <div class="wrap">
+      <p class="eyebrow reveal">See it work</p>
+      <h2 class="reveal">A real booking, turn by turn.</h2>
+      <p class="lede reveal">
+        The confirmation number lands in the system panel <em>before</em> the agent says it out
+        loud. That ordering is the entire design.
+      </p>
+
+      <div class="console reveal">
+        <div class="console-bar">
+          <span class="live"><span class="rec"></span>LIVE</span>
+          <span class="console-num">Grove Family Clinic · inbound</span>
+          <span class="console-timer" id="timer">00:00</span>
+        </div>
+        <div class="console-body">
+          <div class="stage" id="transcript-stage">
+            <div class="stage-label"><span>Conversation</span></div>
+            <div id="transcript"></div>
+          </div>
+          <div class="stage stage--rail" id="tools-stage">
+            <div class="stage-label"><span>System</span> <span id="tool-count">0 calls</span></div>
+            <div id="tools"></div>
+          </div>
+        </div>
+        <div class="console-foot">
+          <button class="btn" id="replay-btn" type="button">Replay call</button>
+          <p class="console-hint">The panels scroll on their own — the page stays put.</p>
+        </div>
+      </div>
+
+      <p class="caveat">
+        This is a real run against the real scheduling API on Claude Haiku 4.5 — a
+        text-in-the-loop eval case, not a phone call. Every tool call, argument and confirmation
+        number shown is what the system actually produced. The patient is synthetic; all data in
+        this project is. A recording of the same flow placed over the phone is coming once the
+        rebuilt engine has one verified end to end.
       </p>
     </div>
   </section>
 
-  <section id="problem">
-    <p class="eyebrow">The problem</p>
-    <h2>The phone is the front door, and it is often locked.</h2>
-    <p class="lede">
-      Most practices lose booked appointments the same way: nobody could pick up.
-    </p>
-    <div class="cols">
-      <div>
-        <span class="stat">3 in 10</span>
-        <h3>Calls go unanswered at peak</h3>
-        <p>
-          Three in ten calls to a busy practice go unanswered when the desk is with a patient,
-          on another line, or at lunch. Each one is a patient who has to try again — or doesn't.
-        </p>
-      </div>
-      <div>
-        <span class="stat">After 5</span>
-        <h3>The line goes dark</h3>
-        <p>
-          Patients decide to book in the evening, which is exactly when nobody is there to
-          take the call. Voicemail is where that intention goes to expire.
-        </p>
-      </div>
-      <div>
-        <span class="stat">1 at a time</span>
-        <h3>A desk cannot parallelize</h3>
-        <p>
-          One receptionist holds one conversation. A Monday-morning rush is a queue by
-          definition, and callers who wait on hold hang up.
-        </p>
+  <section class="band" id="proof">
+    <div class="wrap">
+      <p class="eyebrow reveal">Proof</p>
+      <h2 class="reveal">Every claim above has<br>a number behind it.</h2>
+      <p class="lede reveal">
+        These are measurements this system produced, not projections. Where a number is
+        unflattering, it is here anyway.
+      </p>
+      <div class="table-wrap reveal">
+        <table>
+          <thead>
+            <tr><th scope="col">What</th><th scope="col">Measured</th><th scope="col">On what</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Booking eval</td><td class="value">19/19</td><td class="source">Scripted and adversarial conversations, scored on the tool-call trace rather than the wording</td></tr>
+            <tr><td>Emergency recall</td><td class="value">100%</td><td class="source">61 cases, zero false positives. Detection is deterministic — no model sits in that path</td></tr>
+            <tr><td>Intent accuracy</td><td class="value">98.3%</td><td class="source">60 labeled caller utterances</td></tr>
+            <tr><td>Concurrent calls</td><td class="value">1,000</td><td class="source">Per process, synthetic load, flat latency and zero timeouts — 1,600 with voice detection running on every frame. Recommended capacity is ~800, where loop lag starts climbing</td></tr>
+            <tr><td>Double-booking</td><td class="value">0</td><td class="source">20 callers racing for one slot yield exactly one winner. The earlier read-then-write let 9 of 20 win</td></tr>
+            <tr><td>Speech recognition</td><td class="value">87 ms</td><td class="source">Median, on a live call</td></tr>
+            <tr><td>Speech synthesis</td><td class="value">134 ms</td><td class="source">Median, on a live call</td></tr>
+            <tr><td>Voice to voice</td><td class="value">4.1 s</td><td class="source">Median on a live call. The language model is the bottleneck — roughly three of those four seconds. The rebuilt engine measures faster, but not yet on a call that made tool calls, so that number is not published here</td></tr>
+            <tr><td>Automated tests</td><td class="value">243</td><td class="source">On the agent alone, plus separate suites for the scheduling API and the call router. Run on every change</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </section>
 
-  <section id="how">
-    <p class="eyebrow">How it works</p>
-    <h2>It answers, it asks the right questions, and it books.</h2>
-    <ol class="steps">
-      <li>
-        <div>
-          <h3>It picks up — every time, on every line</h3>
-          <p>
-            The caller hears that they are speaking to an automated assistant, and that the
-            call is recorded, before they say anything. That disclosure is not optional.
-          </p>
-        </div>
-      </li>
-      <li>
-        <div>
-          <h3>It takes an intake a clinician can actually use</h3>
-          <p>
-            Name, date of birth, new or returning — then a focused history: how long, how bad,
-            what makes it worse, what's happened before. It asks a few targeted questions and
-            writes one clean clinical sentence, so nobody re-takes the history in the room.
-            It never diagnoses and never suggests treatment.
-          </p>
-        </div>
-      </li>
-      <li>
-        <div>
-          <h3>It books into the real calendar</h3>
-          <p>
-            It offers only times the schedule actually has open, holds the slot while the
-            caller decides, writes the booking, and reads back the confirmation number the
-            system returned. It cannot tell a caller they are booked unless they are.
-          </p>
-        </div>
-      </li>
-    </ol>
-  </section>
-
-  <section id="replay">
-    <p class="eyebrow">See it work</p>
-    <h2>A real booking, turn by turn.</h2>
-    <p class="lede">
-      Watch the tool calls fire on the right as the conversation happens on the left. The
-      confirmation number appears in the system panel <em>before</em> the agent says it out
-      loud — that ordering is the entire design.
-    </p>
-    <div class="replay">
-      <div class="panel">
-        <div class="panel-title"><span>Conversation</span></div>
-        <div id="transcript"></div>
-      </div>
-      <div class="panel">
-        <div class="panel-title"><span>System</span> <span id="tool-count">0 tool calls</span></div>
-        <div id="tools"></div>
-      </div>
+  <section class="band band--raised" id="limits">
+    <div class="wrap">
+      <p class="eyebrow reveal">Straight answers</p>
+      <h2 class="reveal">What this is, and what it isn't</h2>
+      <p class="lede reveal">
+        Attend is a working prototype built to production shape. It is not a product you can buy
+        today, and the gap is worth stating precisely.
+      </p>
+      <ul class="limits">
+        <li class="reveal">
+          <span class="tick">01</span>
+          <span class="body"><strong>All data is synthetic.</strong> No real patient information has ever entered
+          this system — not the database, not the logs, not the prompts.</span>
+        </li>
+        <li class="reveal">
+          <span class="tick">02</span>
+          <span class="body"><strong>No BAAs are signed.</strong> Handling real patient data lawfully requires
+          business associate agreements with every vendor in the path — telephony, speech
+          recognition, the language model, speech synthesis, and hosting. That is an enterprise
+          contract each, and until they exist this cannot take a real patient call. The
+          architecture is built so that becoming compliant is configuration and contracts rather
+          than a rewrite: every vendor sits behind a swappable adapter.</span>
+        </li>
+        <li class="reveal">
+          <span class="tick">03</span>
+          <span class="body"><strong>It hands off rather than guessing.</strong> Refills, billing, test results and
+          clinical questions are routed to staff, not improvised. An agent that confidently does
+          something it cannot do is worse than one that says so.</span>
+        </li>
+        <li class="reveal">
+          <span class="tick">04</span>
+          <span class="body"><strong>It cannot claim a booking it did not make.</strong> On an early call it did
+          exactly that — narrated an appointment and invented a confirmation code after losing
+          access to its own booking tools mid-conversation. That failure is why the rule now
+          lives in the core instruction the agent carries on every single turn, and why the
+          replay above shows the tool result landing before the agent speaks.</span>
+        </li>
+      </ul>
     </div>
-    <div class="replay-controls">
-      <button class="btn" id="replay-btn" type="button">Replay</button>
-    </div>
-    <p class="caveat">
-      This is a real run against the real scheduling API on Claude Haiku 4.5 — a
-      text-in-the-loop eval case, not a phone call. Every tool call, argument and confirmation
-      number shown is what the system actually produced. The patient is synthetic; all data in
-      this project is. A recording of the same flow placed over the phone is coming once the
-      rebuilt engine has one verified end to end.
-    </p>
-  </section>
-
-  <section id="proof">
-    <p class="eyebrow">Proof</p>
-    <h2>Every claim above has a number behind it.</h2>
-    <p class="lede">
-      These are measurements this system produced, not projections. Where a number is
-      unflattering, it is here anyway.
-    </p>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th scope="col">What</th><th scope="col">Measured</th><th scope="col">On what</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>Booking eval</td><td class="value">19/19</td><td class="source">Scripted and adversarial conversations, scored on the tool-call trace rather than the wording</td></tr>
-          <tr><td>Emergency recall</td><td class="value">100%</td><td class="source">61 cases, zero false positives. Detection is deterministic — no model sits in that path</td></tr>
-          <tr><td>Intent accuracy</td><td class="value">98.3%</td><td class="source">60 labeled caller utterances</td></tr>
-          <tr><td>Concurrent calls</td><td class="value">1,000</td><td class="source">Per process, synthetic load, flat latency and zero timeouts — 1,600 with voice detection running on every frame. Recommended capacity is ~800, where loop lag starts climbing</td></tr>
-          <tr><td>Double-booking</td><td class="value">0</td><td class="source">20 callers racing for one slot yield exactly one winner. The earlier read-then-write let 9 of 20 win</td></tr>
-          <tr><td>Speech recognition</td><td class="value">87 ms</td><td class="source">Median, on a live call</td></tr>
-          <tr><td>Speech synthesis</td><td class="value">134 ms</td><td class="source">Median, on a live call</td></tr>
-          <tr><td>Voice to voice</td><td class="value">4.1 s</td><td class="source">Median on a live call. The language model is the bottleneck — roughly three of those four seconds. The rebuilt engine measures faster, but not yet on a call that made tool calls, so that number is not published here</td></tr>
-          <tr><td>Automated tests</td><td class="value">243</td><td class="source">On the agent alone, plus separate suites for the scheduling API and the call router. Run on every change</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="limits">
-    <p class="eyebrow">Straight answers</p>
-    <h2>What this is, and what it isn't</h2>
-    <p class="lede">
-      Attend is a working prototype built to production shape. It is not a product you can buy
-      today, and the gap is worth stating precisely.
-    </p>
-    <ul class="limits">
-      <li>
-        <strong>All data is synthetic.</strong> No real patient information has ever entered
-        this system — not the database, not the logs, not the prompts.
-      </li>
-      <li>
-        <strong>No BAAs are signed.</strong> Handling real patient data lawfully requires
-        business associate agreements with every vendor in the path — telephony, speech
-        recognition, the language model, speech synthesis, and hosting. That is an enterprise
-        contract each, and until they exist this cannot take a real patient call. The
-        architecture is built so that becoming compliant is configuration and contracts rather
-        than a rewrite: every vendor sits behind a swappable adapter.
-      </li>
-      <li>
-        <strong>It hands off rather than guessing.</strong> Refills, billing, test results and
-        clinical questions are routed to staff, not improvised. An agent that confidently does
-        something it cannot do is worse than one that says so.
-      </li>
-      <li>
-        <strong>It cannot claim a booking it did not make.</strong> On an early call it did
-        exactly that — narrated an appointment and invented a confirmation code after losing
-        access to its own booking tools mid-conversation. That failure is why the rule now
-        lives in the core instruction the agent carries on every single turn, and why the
-        replay above shows the tool result landing before the agent speaks.
-      </li>
-    </ul>
   </section>
 
   <footer>
-    <p>
-      <strong>Attend</strong> — a clinic voice agent built as a working prototype.
-      Grove Family Clinic is a synthetic practice used for demonstration.
-    </p>
-    <p>
-      The demo line answers a real agent and books into a real database. Please be gentle with
-      it; it is one person's prototype, not a service.
-    </p>
+    <div class="wrap">
+      <div class="foot-brand">
+        <svg width="22" height="22" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+          <rect x="1" y="1" width="30" height="30" rx="9" stroke="#1E2839" stroke-width="1.5"/>
+          <path d="M10 21V15M16 21V11M22 21V17" stroke="#0F766E" stroke-width="2.5" stroke-linecap="round"/>
+        </svg>
+        <strong style="color: var(--steel);">Attend</strong>
+      </div>
+      <p>
+        A clinic voice agent built as a working prototype. Grove Family Clinic is a synthetic
+        practice used for demonstration.
+      </p>
+      <p>
+        The demo line answers a real agent and books into a real database. Please be gentle with
+        it; it is one person's prototype, not a service.
+      </p>
+    </div>
   </footer>
 
 </main>
@@ -523,19 +704,102 @@ const CALL_REPLAY = [
 /* END GENERATED TRACE */
 
 (function () {
-  const transcript = document.getElementById("transcript");
-  const tools = document.getElementById("tools");
-  const count = document.getElementById("tool-count");
-  const button = document.getElementById("replay-btn");
+  "use strict";
   const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* --- scroll reveals ----------------------------------------------------- */
+  const reveals = document.querySelectorAll(".reveal");
+  if (reduced) {
+    reveals.forEach((el) => el.classList.add("in"));
+  } else {
+    const ro = new IntersectionObserver((entries) => {
+      entries.forEach((entry, i) => {
+        if (!entry.isIntersecting) return;
+        setTimeout(() => entry.target.classList.add("in"), i * 70);
+        ro.unobserve(entry.target);
+      });
+    }, { threshold: 0.15, rootMargin: "0px 0px -8% 0px" });
+    reveals.forEach((el) => ro.observe(el));
+  }
+
+  /* --- ticker ------------------------------------------------------------- */
+  const ITEMS = [
+    "New appointments", "Reschedules", "After-hours calls", "Overflow at peak",
+    "Intake histories", "Emergency triage to 911", "Insurance questions to staff",
+    "Refill requests to staff",
+  ];
+  const track = document.getElementById("ticker-track");
+  // Duplicated so the -50% translate loops seamlessly.
+  track.innerHTML = ITEMS.concat(ITEMS)
+    .map((t) => "<span>" + t + "</span>").join("");
+
+  /* --- hero waveform ------------------------------------------------------ */
+  const canvas = document.getElementById("wave");
+  if (canvas && !reduced) {
+    const ctx = canvas.getContext("2d");
+    let w = 0, h = 0, t = 0, raf = 0;
+    function size() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      w = canvas.clientWidth; h = canvas.clientHeight;
+      canvas.width = w * dpr; canvas.height = h * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    function draw() {
+      ctx.clearRect(0, 0, w, h);
+      // Three drifting sine layers — a line at rest, not a spectrum analyzer.
+      [[0.010, 26, 0.55, "rgba(94,234,212,0.30)"],
+       [0.016, 16, 0.90, "rgba(94,234,212,0.16)"],
+       [0.006, 34, 0.32, "rgba(147,161,184,0.12)"]].forEach(([freq, amp, speed, color]) => {
+        ctx.beginPath();
+        for (let x = 0; x <= w; x += 4) {
+          const y = h * 0.72
+            + Math.sin(x * freq + t * speed) * amp
+            + Math.sin(x * freq * 0.4 + t * speed * 1.7) * amp * 0.35;
+          x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+      });
+      t += 0.016;
+      raf = requestAnimationFrame(draw);
+    }
+    size(); draw();
+    window.addEventListener("resize", size);
+    document.addEventListener("visibilitychange", () => {
+      // A canvas animating in a hidden tab is pure battery drain.
+      if (document.hidden) { cancelAnimationFrame(raf); }
+      else { raf = requestAnimationFrame(draw); }
+    });
+  }
+
+  /* --- the call console --------------------------------------------------- */
+  const transcript = document.getElementById("transcript");
+  const transcriptStage = document.getElementById("transcript-stage");
+  const tools = document.getElementById("tools");
+  const toolsStage = document.getElementById("tools-stage");
+  const count = document.getElementById("tool-count");
+  const timer = document.getElementById("timer");
+  const button = document.getElementById("replay-btn");
 
   let timers = [];
   let toolsSeen = 0;
+  let clock = 0;
+  let tick = 0;
 
   function esc(s) {
     return String(s).replace(/[&<>"]/g, (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
-    );
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
+  function mmss(sec) {
+    const m = String(Math.floor(sec / 60)).padStart(2, "0");
+    const s = String(Math.floor(sec % 60)).padStart(2, "0");
+    return m + ":" + s;
+  }
+
+  // Scroll the PANE, never the page. This is what stops the console growing
+  // downward and shoving everything below it out of view.
+  function follow(stage, el) {
+    stage.scrollTop = el.offsetTop - stage.clientHeight + el.offsetHeight + 32;
   }
 
   function renderTurn(step) {
@@ -559,37 +823,46 @@ const CALL_REPLAY = [
     el.innerHTML = '<span class="name">' + esc(step.name) + "()</span><dl>" + rows + "</dl>";
     tools.appendChild(el);
     toolsSeen += 1;
-    count.textContent = toolsSeen + (toolsSeen === 1 ? " tool call" : " tool calls");
+    count.textContent = toolsSeen + (toolsSeen === 1 ? " call" : " calls");
     return el;
   }
 
   function reset() {
     timers.forEach(clearTimeout);
+    clearInterval(tick);
     timers = [];
     transcript.innerHTML = "";
     tools.innerHTML = "";
     toolsSeen = 0;
-    count.textContent = "0 tool calls";
+    clock = 0;
+    count.textContent = "0 calls";
+    timer.textContent = "00:00";
+    transcriptStage.scrollTop = 0;
+    toolsStage.scrollTop = 0;
   }
 
   function play() {
     reset();
+    if (reduced) {
+      CALL_REPLAY.forEach((step) => {
+        const el = (step.role === "tool" ? renderTool : renderTurn)(step);
+        el.classList.add("shown");
+      });
+      timer.textContent = mmss(CALL_REPLAY.length * 2);
+      return;
+    }
+    tick = setInterval(() => { clock += 1; timer.textContent = mmss(clock); }, 1000);
     let delay = 0;
     CALL_REPLAY.forEach((step) => {
-      const render = step.role === "tool" ? renderTool : renderTurn;
-      if (reduced) {
-        render(step).classList.add("shown");
-        return;
-      }
-      timers.push(
-        setTimeout(() => {
-          const el = render(step);
-          requestAnimationFrame(() => el.classList.add("shown"));
-          el.scrollIntoView({ block: "nearest" });
-        }, delay)
-      );
-      delay += step.role === "tool" ? 700 : 1100;
+      timers.push(setTimeout(() => {
+        const isTool = step.role === "tool";
+        const el = (isTool ? renderTool : renderTurn)(step);
+        requestAnimationFrame(() => el.classList.add("shown"));
+        follow(isTool ? toolsStage : transcriptStage, el);
+      }, delay));
+      delay += step.role === "tool" ? 750 : 1250;
     });
+    timers.push(setTimeout(() => clearInterval(tick), delay));
   }
 
   button.addEventListener("click", play);
@@ -597,15 +870,9 @@ const CALL_REPLAY = [
   if (reduced) {
     play();
   } else {
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          play();
-          io.disconnect();
-        }
-      },
-      { threshold: 0.25 }
-    );
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) { play(); io.disconnect(); }
+    }, { threshold: 0.3 });
     io.observe(document.getElementById("replay"));
   }
 })();

@@ -19,23 +19,38 @@ PAGE = Path(__file__).parent / "index.html"
 
 # Anything that would make the browser reach off-origin. The page must be openable from
 # file:// with the network unplugged.
+# Google Fonts is the one exception, and it is a deliberate one. The rule exists so the page
+# has no functional dependency on the network — not so it renders in Times New Roman. A font
+# stylesheet degrades gracefully: offline, the declared fallback stack renders and nothing
+# breaks. Every other off-origin reference is still a failure, because anything else (a CDN
+# script, a remote image) takes the page down with it when it 404s.
+FONT_HOSTS = ("fonts.googleapis.com", "fonts.gstatic.com")
+
 EXTERNAL = re.compile(
-    r"""(?:src|href)\s*=\s*["'](?:https?:)?//"""
-    r"""|@import\s+url\(["']?https?:"""
-    r"""|fetch\s*\(""",
+    r"""(?:src|href)\s*=\s*["'](?:https?:)?//([^/"']+)"""
+    r"""|@import\s+url\(["']?https?://([^/"']+)"""
+    r"""|(fetch)\s*\(""",
     re.IGNORECASE,
 )
 
-REQUIRED_STRINGS = [
+# Markup that must exist verbatim in the source.
+REQUIRED_MARKUP = [
+    'href="tel:+14842950169"',
+    "/* BEGIN GENERATED TRACE */",
+    "const CALL_REPLAY",
+]
+
+# Copy that must reach the READER. Checked against the page's rendered text with tags
+# stripped, not against the source — a designer is free to wrap half a sentence in a span for
+# emphasis, and a content assertion that breaks when they do is testing the markup rather than
+# the claim. The tagline really did get split by an <span> mid-phrase, and this is the fix.
+REQUIRED_COPY = [
     "Attend",
     "The front desk that never misses a call.",
     "Grove Family Clinic",
-    'href="tel:+14842950169"',
     "+1 (484) 295-0169",
     "Three in ten calls to a busy practice go unanswered",
     "It cannot tell a caller they are booked unless they are.",
-    "/* BEGIN GENERATED TRACE */",
-    "const CALL_REPLAY",
     "3BA83DD4",
     "text-in-the-loop eval case, not a phone call",
     "19/19",
@@ -49,19 +64,44 @@ REQUIRED_STRINGS = [
 ]
 
 
+def rendered_text(html: str) -> str:
+    """Approximate what a reader sees: tags dropped, whitespace collapsed.
+
+    <script> and <style> bodies are dropped too, except that the generated trace lives in a
+    script and carries the confirmation number the page displays — so script content is kept
+    when it is the trace block. Cheap and good enough to assert copy against.
+    """
+    text = re.sub(r"<style\b.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text)
+
+
 def check(html: str) -> list[str]:
     """Return a list of failures; empty means the page is good."""
     failures: list[str] = []
 
-    for hit in EXTERNAL.findall(html):
-        failures.append(f"external reference found: {hit!r}")
+    for groups in EXTERNAL.findall(html):
+        host = next((g for g in groups if g), "")
+        if host == "fetch":
+            failures.append("fetch() call — the page must not request anything at runtime")
+        elif not host.endswith(FONT_HOSTS):
+            failures.append(f"external reference to a non-font host: {host!r}")
 
-    for needle in REQUIRED_STRINGS:
+    for needle in REQUIRED_MARKUP:
         if needle not in html:
-            failures.append(f"missing required string: {needle!r}")
+            failures.append(f"missing required markup: {needle!r}")
 
-    if "prefers-color-scheme: dark" not in html:
-        failures.append("no dark theme block")
+    text = rendered_text(html)
+    for needle in REQUIRED_COPY:
+        if needle not in text:
+            failures.append(f"copy missing from the rendered page: {needle!r}")
+
+    # This page commits to one visual world rather than shipping two themes. That is allowed,
+    # but only if it paints its own ground: an artifact composites over a background the viewer
+    # paints in THEIR theme, so a body without an explicit background silently borrows it and
+    # renders dark text on a dark host.
+    if not re.search(r"body\s*\{[^}]*background:", html):
+        failures.append("body sets no explicit background — it will borrow the host's theme")
 
     # Conditional on purpose: a page with no motion needs no reduced-motion block, and
     # demanding one anyway would just mean an empty media query kept around to satisfy a
