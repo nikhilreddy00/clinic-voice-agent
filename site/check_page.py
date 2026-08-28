@@ -74,8 +74,65 @@ def check(html: str) -> list[str]:
         failures.append("no <title>")
     if 'lang="en"' not in html:
         failures.append("no lang attribute on <html>")
+    if 'name="viewport"' not in html:
+        failures.append("no viewport meta — the page will not scale on a phone")
 
+    h1s = html.count("<h1")
+    if h1s != 1:
+        failures.append(f"expected exactly one <h1>, found {h1s}")
+
+    # The proof table carries a min-width so its columns stay readable. That is only safe
+    # inside an overflow container — otherwise it widens the whole document and every section
+    # scrolls sideways on a phone.
+    if "<table" in html and ".table-wrap" not in html:
+        failures.append("table present with no .table-wrap overflow container")
+
+    failures.extend(unclosed_tags(html))
     return failures
+
+
+VOID = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
+
+
+def unclosed_tags(html: str) -> list[str]:
+    """Catch a tag left open — the failure mode of hand-editing one large file.
+
+    A stray unclosed <div> renders fine in a forgiving browser right up until it silently
+    swallows the section after it, which is exactly the kind of damage nobody spots in a diff.
+    """
+    from html.parser import HTMLParser
+
+    class Checker(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stack: list[str] = []
+            self.problems: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs) -> None:
+            if tag not in VOID:
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in VOID:
+                return
+            if not self.stack:
+                self.problems.append(f"closing </{tag}> with nothing open")
+            elif self.stack[-1] != tag:
+                self.problems.append(f"</{tag}> closes while <{self.stack[-1]}> is open")
+                if tag in self.stack:
+                    while self.stack and self.stack.pop() != tag:
+                        pass
+            else:
+                self.stack.pop()
+
+    checker = Checker()
+    checker.feed(html)
+    if checker.stack:
+        checker.problems.append(f"never closed: {checker.stack}")
+    return checker.problems
 
 
 def main() -> int:
