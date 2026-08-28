@@ -38,6 +38,14 @@ REQUIRED_STRINGS = [
     "const CALL_REPLAY",
     "3BA83DD4",
     "text-in-the-loop eval case, not a phone call",
+    "19/19",
+    "100%",
+    "98.3%",
+    "1,000",
+    "4.1 s",
+    "243",
+    "What this is, and what it isn't",
+    "No BAAs are signed",
 ]
 
 

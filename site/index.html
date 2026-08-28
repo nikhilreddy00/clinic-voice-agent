@@ -188,6 +188,23 @@
   @media (prefers-reduced-motion: reduce) {
     .turn, .tool { opacity: 1; transform: none; transition: none; }
   }
+
+  /* --- proof table ------------------------------------------------------------ */
+  .table-wrap { overflow-x: auto; margin-top: 2.5rem; }
+  table { border-collapse: collapse; width: 100%; min-width: 34rem; font-size: 0.9375rem; }
+  th, td { text-align: left; padding: 0.7rem 1rem 0.7rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font: 600 0.75rem/1.4 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  td.value { font-family: var(--mono); color: var(--accent); font-weight: 600; white-space: nowrap; }
+  td.source { color: var(--muted); }
+  .limits { border-left: 3px solid var(--accent); padding-left: 1.25rem; margin-top: 2rem; }
+  .limits li { margin-bottom: 0.6rem; max-width: var(--measure); }
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 2.5rem 0 4rem;
+    color: var(--muted);
+    font-size: 0.9375rem;
+  }
+  footer a { color: var(--fg); }
 </style>
 </head>
 <body>
@@ -311,6 +328,79 @@
       rebuilt engine has one verified end to end.
     </p>
   </section>
+
+  <section id="proof">
+    <p class="eyebrow">Proof</p>
+    <h2>Every claim above has a number behind it.</h2>
+    <p class="lede">
+      These are measurements this system produced, not projections. Where a number is
+      unflattering, it is here anyway.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th scope="col">What</th><th scope="col">Measured</th><th scope="col">On what</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Booking eval</td><td class="value">19/19</td><td class="source">Scripted and adversarial conversations, scored on the tool-call trace rather than the wording</td></tr>
+          <tr><td>Emergency recall</td><td class="value">100%</td><td class="source">61 cases, zero false positives. Detection is deterministic — no model sits in that path</td></tr>
+          <tr><td>Intent accuracy</td><td class="value">98.3%</td><td class="source">60 labeled caller utterances</td></tr>
+          <tr><td>Concurrent calls</td><td class="value">1,000</td><td class="source">Per process, synthetic load, flat latency and zero timeouts — 1,600 with voice detection running on every frame. Recommended capacity is ~800, where loop lag starts climbing</td></tr>
+          <tr><td>Double-booking</td><td class="value">0</td><td class="source">20 callers racing for one slot yield exactly one winner. The earlier read-then-write let 9 of 20 win</td></tr>
+          <tr><td>Speech recognition</td><td class="value">87 ms</td><td class="source">Median, on a live call</td></tr>
+          <tr><td>Speech synthesis</td><td class="value">134 ms</td><td class="source">Median, on a live call</td></tr>
+          <tr><td>Voice to voice</td><td class="value">4.1 s</td><td class="source">Median on a live call. The language model is the bottleneck — roughly three of those four seconds. The rebuilt engine measures faster, but not yet on a call that made tool calls, so that number is not published here</td></tr>
+          <tr><td>Automated tests</td><td class="value">243</td><td class="source">On the agent alone, plus separate suites for the scheduling API and the call router. Run on every change</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="limits">
+    <p class="eyebrow">Straight answers</p>
+    <h2>What this is, and what it isn't</h2>
+    <p class="lede">
+      Attend is a working prototype built to production shape. It is not a product you can buy
+      today, and the gap is worth stating precisely.
+    </p>
+    <ul class="limits">
+      <li>
+        <strong>All data is synthetic.</strong> No real patient information has ever entered
+        this system — not the database, not the logs, not the prompts.
+      </li>
+      <li>
+        <strong>No BAAs are signed.</strong> Handling real patient data lawfully requires
+        business associate agreements with every vendor in the path — telephony, speech
+        recognition, the language model, speech synthesis, and hosting. That is an enterprise
+        contract each, and until they exist this cannot take a real patient call. The
+        architecture is built so that becoming compliant is configuration and contracts rather
+        than a rewrite: every vendor sits behind a swappable adapter.
+      </li>
+      <li>
+        <strong>It hands off rather than guessing.</strong> Refills, billing, test results and
+        clinical questions are routed to staff, not improvised. An agent that confidently does
+        something it cannot do is worse than one that says so.
+      </li>
+      <li>
+        <strong>It cannot claim a booking it did not make.</strong> On an early call it did
+        exactly that — narrated an appointment and invented a confirmation code after losing
+        access to its own booking tools mid-conversation. That failure is why the rule now
+        lives in the core instruction the agent carries on every single turn, and why the
+        replay above shows the tool result landing before the agent speaks.
+      </li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>
+      <strong>Attend</strong> — a clinic voice agent built as a working prototype.
+      Grove Family Clinic is a synthetic practice used for demonstration.
+    </p>
+    <p>
+      The demo line answers a real agent and books into a real database. Please be gentle with
+      it; it is one person's prototype, not a service.
+    </p>
+  </footer>
 
 </main>
 
