@@ -190,8 +190,17 @@ def test_two_handoff_intents_do_not_replan_against_each_other():
         # A moderately-confident different intent is a slot-fill answer, not a topic shift.
         # "I've been feeling a bit run down lately" -> clinical_question @ 0.75, observed live.
         (Intent.SCHEDULE_APPOINTMENT, Intent.CLINICAL_QUESTION, 0.75, Intent.SCHEDULE_APPOINTMENT),
-        # A confident different intent IS a topic shift.
+        # A confident different intent IS a topic shift — when it is a different TASK.
         (Intent.SCHEDULE_APPOINTMENT, Intent.MEDICATION_REFILL, 0.93, Intent.MEDICATION_REFILL),
+        # ...but a QUESTION asked mid-booking is not, at any confidence. The live call that
+        # forced this rule: describing pickleball ankle pain classified `clinical_question`
+        # at 0.92, cleared the 0.85 switch bar, and stripped the scheduling tools mid-booking.
+        (Intent.SCHEDULE_APPOINTMENT, Intent.CLINICAL_QUESTION, 0.92, Intent.SCHEDULE_APPOINTMENT),
+        (Intent.SCHEDULE_APPOINTMENT, Intent.CLINICAL_QUESTION, 1.0, Intent.SCHEDULE_APPOINTMENT),
+        (Intent.SCHEDULE_APPOINTMENT, Intent.INSURANCE_VERIFICATION, 0.99, Intent.SCHEDULE_APPOINTMENT),
+        (Intent.SCHEDULE_APPOINTMENT, Intent.BILLING_QUESTION, 0.99, Intent.SCHEDULE_APPOINTMENT),
+        # The guard is scoped to scheduling flows; elsewhere a confident question still wins.
+        (Intent.BILLING_QUESTION, Intent.CLINICAL_QUESTION, 0.95, Intent.CLINICAL_QUESTION),
         # Agreement is a no-op at any confidence.
         (Intent.SCHEDULE_APPOINTMENT, Intent.SCHEDULE_APPOINTMENT, 0.2, Intent.SCHEDULE_APPOINTMENT),
     ],
@@ -351,10 +360,21 @@ def test_an_unclassified_turn_is_over_equipped_not_under_equipped():
 
 
 def test_intent_scoping_shrinks_non_booking_prompts():
+    """Non-scheduling turns stay far smaller than a booking turn.
+
+    The bar was 2,100 chars when Phase 12 measured it. It moved to 2,900 deliberately: the
+    "never claim an action you did not take" rule now lives in the CORE prompt, so every intent
+    carries it. That is the point — the live fabricated-booking call happened on a turn whose
+    intent had flipped to clinical_question, i.e. exactly the prompt that used to lack the rule.
+    Paying ~400 chars on every turn to make the anti-fabrication guard unconditional is the
+    trade this test is asserting, not a regression to squeeze back out.
+    """
     sizes = prompt_sizes()
     assert sizes["schedule_appointment"] > 9000, "booking rules are load-bearing; do not shrink"
     for intent in ("billing_question", "hours_location", "medication_refill", "test_results"):
-        assert sizes[intent] < 2100, f"{intent} prompt is {sizes[intent]} chars"
+        assert sizes[intent] < 2900, f"{intent} prompt is {sizes[intent]} chars"
+    # The reduction that matters is still large: a hand-off turn is under a third of a booking.
+    assert max(sizes[i] for i in ("billing_question", "test_results")) * 3 < sizes["schedule_appointment"]
 
 
 def test_every_intent_produces_a_usable_prompt():
@@ -376,3 +396,27 @@ def test_handoff_fragments_forbid_improvising_the_capability():
     assert "NEVER approve" in build_system_prompt(Intent.MEDICATION_REFILL)
     assert "must NOT give any" in build_system_prompt(Intent.CLINICAL_QUESTION)
     assert "must NOT read out" in build_system_prompt(Intent.TEST_RESULTS)
+
+
+def test_describing_symptoms_mid_booking_keeps_the_scheduling_tools():
+    """The second live regression, and the expensive one.
+
+    Turn 6 of a real call: "I have been playing pickleball for the past three months, and I'm
+    getting ankle and wrist pain" — the answer to the agent's own "what's the reason for your
+    visit?" question. It classified `clinical_question` at 0.92, above the 0.85 switch bar.
+
+    The tool surface must not move. When it moved, the model lost both the tools and the
+    booking prompt, and improvised a confirmation number for an appointment that was never
+    written to the database.
+    """
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="I'd like to book an appointment"))
+    d.send(ev.IntentClassified(intent="schedule_appointment", confidence=0.95))
+    d.send(ev.LLMCompleted(request_id="req-2", stop_reason="end_turn"))
+
+    d.send(ev.FinalTranscript(text="playing pickleball, ankle and wrist pain"))
+    produced = d.send(ev.IntentClassified(intent="clinical_question", confidence=0.92))
+
+    assert d.state.intent is Intent.SCHEDULE_APPOINTMENT
+    assert produced == [], "re-planned the turn — the tool surface moved mid-booking"
+    assert build_tools_schema(d.state.intent).standard_tools, "scheduling tools were stripped"
