@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attend — the front desk that never misses a call</title>
+<meta name="description" content="A voice agent that answers a clinic's phone, takes a real intake, and books into a real calendar. Built as a working prototype, with the measurements to back it up.">
+<style>
+  :root {
+    --bg: #FBFAF8;
+    --surface: #FFFFFF;
+    --fg: #16181D;
+    --muted: #555C6B;
+    --line: #E4E1DB;
+    --accent: #0F5C4E;
+    --accent-fg: #FFFFFF;
+    --mono-bg: #F3F1EC;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --measure: 68ch;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0E1013;
+      --surface: #14171C;
+      --fg: #ECEEF2;
+      --muted: #A3ABB9;
+      --line: #232830;
+      --accent: #35C7A9;
+      --accent-fg: #06231D;
+      --mono-bg: #171B21;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: clamp(1rem, 0.96rem + 0.2vw, 1.0625rem);
+    line-height: 1.6;
+  }
+  main { max-width: 78rem; margin: 0 auto; padding: 0 1.5rem; }
+  section { padding: clamp(3rem, 8vw, 6rem) 0; border-top: 1px solid var(--line); }
+  section:first-of-type { border-top: 0; }
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 0.75rem; }
+  h1 { font-size: clamp(2.25rem, 1.6rem + 3.2vw, 4rem); }
+  h2 { font-size: clamp(1.5rem, 1.2rem + 1.4vw, 2.25rem); }
+  p { max-width: var(--measure); margin: 0 0 1rem; }
+  .lede { font-size: clamp(1.125rem, 1rem + 0.6vw, 1.375rem); color: var(--muted); }
+  .eyebrow {
+    font: 600 0.75rem/1 var(--mono);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 1rem;
+  }
+  code, .mono { font-family: var(--mono); font-size: 0.9em; }
+
+  /* --- hero ------------------------------------------------------------------ */
+  .hero { padding-top: clamp(3rem, 10vw, 7rem); }
+  .wordmark {
+    font: 700 1.125rem/1 var(--sans);
+    letter-spacing: -0.02em;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: clamp(2rem, 6vw, 4rem);
+  }
+  .wordmark::before {
+    content: "";
+    width: 0.7rem; height: 0.7rem; border-radius: 50%;
+    background: var(--accent);
+  }
+  .cta {
+    display: flex; flex-wrap: wrap; align-items: center;
+    gap: 1rem 1.5rem;
+    margin-top: 2.5rem;
+  }
+  .call {
+    display: inline-flex; align-items: baseline; gap: 0.6rem;
+    background: var(--accent); color: var(--accent-fg);
+    text-decoration: none;
+    padding: 0.9rem 1.4rem;
+    border-radius: 0.6rem;
+    font: 600 1.125rem/1 var(--sans);
+  }
+  .call .num { font-family: var(--mono); letter-spacing: -0.01em; }
+  .call:hover { filter: brightness(1.08); }
+  .call:focus-visible { outline: 3px solid var(--fg); outline-offset: 3px; }
+  .cta-note { color: var(--muted); font-size: 0.9375rem; max-width: 34ch; margin: 0; }
+
+  /* --- generic layout blocks -------------------------------------------------- */
+  .cols {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: clamp(1.5rem, 4vw, 3rem);
+    margin-top: 2.5rem;
+  }
+  .cols h3 { font-size: 1.0625rem; }
+  .cols p { color: var(--muted); margin: 0; font-size: 0.9375rem; }
+  .stat {
+    font: 700 clamp(2rem, 1.4rem + 2.4vw, 3rem)/1 var(--sans);
+    letter-spacing: -0.03em;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 0.35rem;
+  }
+  .steps { counter-reset: step; margin-top: 2.5rem; padding: 0; list-style: none; }
+  .steps li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 2.25rem 1fr;
+    gap: 1rem;
+    padding: 1.25rem 0;
+    border-top: 1px solid var(--line);
+  }
+  .steps li::before {
+    content: counter(step);
+    font: 600 0.875rem/2.25rem var(--mono);
+    text-align: center;
+    color: var(--accent-fg);
+    background: var(--accent);
+    border-radius: 50%;
+    width: 2.25rem; height: 2.25rem;
+  }
+  .steps h3 { margin-bottom: 0.25rem; font-size: 1.0625rem; }
+  .steps p { color: var(--muted); margin: 0; }
+
+  /* --- call replay ------------------------------------------------------------ */
+  .replay {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    gap: clamp(1rem, 3vw, 2rem);
+    margin-top: 2.5rem;
+    align-items: start;
+  }
+  @media (max-width: 840px) { .replay { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+    padding: 1.25rem;
+    min-height: 22rem;
+  }
+  .panel-title {
+    font: 600 0.75rem/1 var(--mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 1rem;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .turn { margin-bottom: 0.875rem; opacity: 0; transform: translateY(4px); }
+  .turn.shown { opacity: 1; transform: none; transition: opacity .28s ease, transform .28s ease; }
+  .turn .who {
+    font: 600 0.6875rem/1 var(--mono);
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--muted); display: block; margin-bottom: 0.25rem;
+  }
+  .turn.caller .bubble { background: var(--mono-bg); }
+  .turn.agent .bubble { background: transparent; border: 1px solid var(--line); }
+  .bubble { padding: 0.6rem 0.8rem; border-radius: 0.5rem; }
+  .tool {
+    font-family: var(--mono); font-size: 0.8125rem;
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 0.5rem; padding: 0.7rem 0.85rem; margin-bottom: 0.75rem;
+    background: var(--mono-bg);
+    opacity: 0; transform: translateY(4px);
+  }
+  .tool.shown { opacity: 1; transform: none; transition: opacity .28s ease, transform .28s ease; }
+  .tool .name { color: var(--accent); font-weight: 600; }
+  .tool dl { margin: 0.5rem 0 0; display: grid; grid-template-columns: auto 1fr; gap: 0.15rem 0.6rem; }
+  .tool dt { color: var(--muted); }
+  .tool dd { margin: 0; overflow-wrap: anywhere; }
+  .tool.is-confirm { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent); }
+  .replay-controls { display: flex; gap: 0.75rem; align-items: center; margin-top: 1.25rem; }
+  .btn {
+    font: 600 0.875rem/1 var(--sans);
+    background: transparent; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 0.5rem;
+    padding: 0.55rem 0.9rem; cursor: pointer;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .caveat { color: var(--muted); font-size: 0.875rem; max-width: var(--measure); }
+  @media (prefers-reduced-motion: reduce) {
+    .turn, .tool { opacity: 1; transform: none; transition: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+  <section class="hero">
+    <div class="wordmark">Attend</div>
+    <h1>The front desk that never misses a call.</h1>
+    <p class="lede">
+      Attend answers a clinic's phone, takes a real intake, offers times that are genuinely
+      open, and books the appointment — then reads back a confirmation number it actually has.
+    </p>
+    <div class="cta">
+      <a class="call" href="tel:+14842950169">
+        Call the demo line <span class="num">+1 (484) 295-0169</span>
+      </a>
+      <p class="cta-note">
+        A real agent picks up and books into Grove Family Clinic, a synthetic practice used
+        for demonstration.
+      </p>
+    </div>
+  </section>
+
+  <section id="problem">
+    <p class="eyebrow">The problem</p>
+    <h2>The phone is the front door, and it is often locked.</h2>
+    <p class="lede">
+      Most practices lose booked appointments the same way: nobody could pick up.
+    </p>
+    <div class="cols">
+      <div>
+        <span class="stat">3 in 10</span>
+        <h3>Calls go unanswered at peak</h3>
+        <p>
+          Three in ten calls to a busy practice go unanswered when the desk is with a patient,
+          on another line, or at lunch. Each one is a patient who has to try again — or doesn't.
+        </p>
+      </div>
+      <div>
+        <span class="stat">After 5</span>
+        <h3>The line goes dark</h3>
+        <p>
+          Patients decide to book in the evening, which is exactly when nobody is there to
+          take the call. Voicemail is where that intention goes to expire.
+        </p>
+      </div>
+      <div>
+        <span class="stat">1 at a time</span>
+        <h3>A desk cannot parallelize</h3>
+        <p>
+          One receptionist holds one conversation. A Monday-morning rush is a queue by
+          definition, and callers who wait on hold hang up.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <p class="eyebrow">How it works</p>
+    <h2>It answers, it asks the right questions, and it books.</h2>
+    <ol class="steps">
+      <li>
+        <div>
+          <h3>It picks up — every time, on every line</h3>
+          <p>
+            The caller hears that they are speaking to an automated assistant, and that the
+            call is recorded, before they say anything. That disclosure is not optional.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>It takes an intake a clinician can actually use</h3>
+          <p>
+            Name, date of birth, new or returning — then a focused history: how long, how bad,
+            what makes it worse, what's happened before. It asks a few targeted questions and
+            writes one clean clinical sentence, so nobody re-takes the history in the room.
+            It never diagnoses and never suggests treatment.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>It books into the real calendar</h3>
+          <p>
+            It offers only times the schedule actually has open, holds the slot while the
+            caller decides, writes the booking, and reads back the confirmation number the
+            system returned. It cannot tell a caller they are booked unless they are.
+          </p>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section id="replay">
+    <p class="eyebrow">See it work</p>
+    <h2>A real booking, turn by turn.</h2>
+    <p class="lede">
+      Watch the tool calls fire on the right as the conversation happens on the left. The
+      confirmation number appears in the system panel <em>before</em> the agent says it out
+      loud — that ordering is the entire design.
+    </p>
+    <div class="replay">
+      <div class="panel">
+        <div class="panel-title"><span>Conversation</span></div>
+        <div id="transcript"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title"><span>System</span> <span id="tool-count">0 tool calls</span></div>
+        <div id="tools"></div>
+      </div>
+    </div>
+    <div class="replay-controls">
+      <button class="btn" id="replay-btn" type="button">Replay</button>
+    </div>
+    <p class="caveat">
+      This is a real run against the real scheduling API on Claude Haiku 4.5 — a
+      text-in-the-loop eval case, not a phone call. Every tool call, argument and confirmation
+      number shown is what the system actually produced. The patient is synthetic; all data in
+      this project is. A recording of the same flow placed over the phone is coming once the
+      rebuilt engine has one verified end to end.
+    </p>
+  </section>
+
+</main>
+
+<script>
+/* BEGIN GENERATED TRACE */
+const CALL_REPLAY = [
+  {
+    "role": "caller",
+    "text": "Hi, I'd like to book an appointment."
+  },
+  {
+    "role": "agent",
+    "text": "Great! I'd be happy to help you book an appointment at Grove Family Clinic. What's your name?"
+  },
+  {
+    "role": "caller",
+    "text": "My name is Jordan Alvarez."
+  },
+  {
+    "role": "agent",
+    "text": "Thanks, Jordan. What's your date of birth?"
+  },
+  {
+    "role": "caller",
+    "text": "March 15th, 1990."
+  },
+  {
+    "role": "agent",
+    "text": "Got it. Are you a new patient, or have you visited us before?"
+  },
+  {
+    "role": "caller",
+    "text": "I'm a new patient."
+  },
+  {
+    "role": "agent",
+    "text": "Welcome! What's the reason for your visit today?"
+  },
+  {
+    "role": "caller",
+    "text": "It's just for a routine checkup."
+  },
+  {
+    "role": "agent",
+    "text": "Perfect. Can you briefly describe what's been going on in one sentence?"
+  },
+  {
+    "role": "caller",
+    "text": "Nothing specific, just my annual physical."
+  },
+  {
+    "role": "agent",
+    "text": "Got it. What day would work best for you?"
+  },
+  {
+    "role": "caller",
+    "text": "Whatever you have soonest is fine."
+  },
+  {
+    "role": "tool",
+    "name": "check_availability",
+    "args": {
+      "reason_category": "checkup"
+    },
+    "result": {
+      "ok": true,
+      "slots_found": 9
+    }
+  },
+  {
+    "role": "agent",
+    "text": "The soonest opening is Friday, August 14 at 2:30 PM with Dr. Aisha Patel, or Friday at 5:00 PM with Dr. Marcus Chen. Which works better for you?"
+  },
+  {
+    "role": "caller",
+    "text": "That works, let's do it."
+  },
+  {
+    "role": "tool",
+    "name": "hold_slot",
+    "args": {
+      "slot_id": 10
+    },
+    "result": {
+      "ok": true,
+      "hold_id": "3594df4e\u2026"
+    }
+  },
+  {
+    "role": "agent",
+    "text": "Perfect! Let me confirm the details: your appointment is Friday, August 14 at 2:30 PM with Dr. Aisha Patel for your annual physical.\n\nYour date of birth is 03/15/1990.\n\nDoes everything look correct?"
+  },
+  {
+    "role": "caller",
+    "text": "Yes, please book it."
+  },
+  {
+    "role": "tool",
+    "name": "confirm_booking",
+    "args": {
+      "hold_id": "3594df4e\u2026",
+      "patient_name": "Jordan Alvarez",
+      "reason": "checkup",
+      "date_of_birth": "03/15/1990",
+      "new_patient": true,
+      "symptom_notes": "Annual physical"
+    },
+    "result": {
+      "ok": true,
+      "confirmation_id": "3BA83DD4",
+      "display_time": "Friday, August 14 at 2:30 PM",
+      "provider_name": "Dr. Aisha Patel"
+    }
+  },
+  {
+    "role": "agent",
+    "text": "You're all set, Jordan! Your appointment is Friday, August 14 at 2:30 PM with Dr. Aisha Patel. Your confirmation number is 3BA83DD4. Please arrive 15 minutes early to complete paperwork. Is there anything else I can help you with?"
+  }
+];
+/* END GENERATED TRACE */
+
+(function () {
+  const transcript = document.getElementById("transcript");
+  const tools = document.getElementById("tools");
+  const count = document.getElementById("tool-count");
+  const button = document.getElementById("replay-btn");
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  let timers = [];
+  let toolsSeen = 0;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
+    );
+  }
+
+  function renderTurn(step) {
+    const el = document.createElement("div");
+    el.className = "turn " + step.role;
+    el.innerHTML =
+      '<span class="who">' + (step.role === "caller" ? "Caller" : "Attend") + "</span>" +
+      '<div class="bubble">' + esc(step.text) + "</div>";
+    transcript.appendChild(el);
+    return el;
+  }
+
+  function renderTool(step) {
+    const el = document.createElement("div");
+    el.className = "tool" + (step.name === "confirm_booking" ? " is-confirm" : "");
+    const rows = Object.entries(step.args)
+      .concat(Object.entries(step.result))
+      .filter(([, v]) => v !== null && v !== undefined)
+      .map(([k, v]) => "<dt>" + esc(k) + "</dt><dd>" + esc(v) + "</dd>")
+      .join("");
+    el.innerHTML = '<span class="name">' + esc(step.name) + "()</span><dl>" + rows + "</dl>";
+    tools.appendChild(el);
+    toolsSeen += 1;
+    count.textContent = toolsSeen + (toolsSeen === 1 ? " tool call" : " tool calls");
+    return el;
+  }
+
+  function reset() {
+    timers.forEach(clearTimeout);
+    timers = [];
+    transcript.innerHTML = "";
+    tools.innerHTML = "";
+    toolsSeen = 0;
+    count.textContent = "0 tool calls";
+  }
+
+  function play() {
+    reset();
+    let delay = 0;
+    CALL_REPLAY.forEach((step) => {
+      const render = step.role === "tool" ? renderTool : renderTurn;
+      if (reduced) {
+        render(step).classList.add("shown");
+        return;
+      }
+      timers.push(
+        setTimeout(() => {
+          const el = render(step);
+          requestAnimationFrame(() => el.classList.add("shown"));
+          el.scrollIntoView({ block: "nearest" });
+        }, delay)
+      );
+      delay += step.role === "tool" ? 700 : 1100;
+    });
+  }
+
+  button.addEventListener("click", play);
+
+  if (reduced) {
+    play();
+  } else {
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          play();
+          io.disconnect();
+        }
+      },
+      { threshold: 0.25 }
+    );
+    io.observe(document.getElementById("replay"));
+  }
+})();
+</script>
+</body>
+</html>
