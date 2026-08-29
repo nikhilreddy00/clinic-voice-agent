@@ -108,6 +108,10 @@ class CallState:
     interruptions: int = 0
     booked: bool = False
     escalated: bool = False
+    # The caller has said goodbye on a completed booking. The call does NOT end here — the
+    # agent still owes them its own sign-off, and cutting the line mid-"take care" is worse
+    # than the dead air this replaces. EndCall fires when that last utterance finishes playing.
+    closing: bool = False
 
     # --- provider health (recorded in Phase 10; consumed by the Phase-15 ladder) ---------
     degraded: tuple[str, ...] = field(default_factory=tuple)

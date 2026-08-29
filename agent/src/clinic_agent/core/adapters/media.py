@@ -23,6 +23,7 @@ never becomes an event and never reaches the reducer.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Awaitable, Callable
 
@@ -232,6 +233,7 @@ class LiveKitMedia(MediaAdapter):
         self._room = rtc.Room()
         self._source = rtc.AudioSource(OUTPUT_SAMPLE_RATE, NUM_CHANNELS)
         self._stream_tasks: list[asyncio.Task] = []
+        self._announced = False
 
     async def start(self) -> None:
         rtc = self._rtc
@@ -242,13 +244,12 @@ class LiveKitMedia(MediaAdapter):
                 self._stream_tasks.append(
                     asyncio.create_task(self._consume(track), name="livekit-audio-in")
                 )
+                self._announce(participant.identity)
 
         @self._room.on("participant_connected")
         def _on_join(participant) -> None:  # noqa: ANN001
+            # Logged, NOT announced. See _announce.
             logger.info(f"[telephony] caller joined room (participant={participant.identity})")
-            self._emit(
-                ev.CallerPresent(t=time.monotonic(), participant_id=participant.identity)
-            )
 
         @self._room.on("participant_disconnected")
         def _on_leave(participant) -> None:  # noqa: ANN001
@@ -266,10 +267,42 @@ class LiveKitMedia(MediaAdapter):
         )
 
         # A SIP call can be bridged in before the agent finishes connecting, in which case the
-        # participant_connected event already fired and would never fire again.
+        # events above already fired and would never fire again. Announce only if that
+        # participant's audio is actually subscribed — the same bar as the live path.
         for participant in self._room.remote_participants.values():
-            self._emit(ev.CallerPresent(t=time.monotonic(), participant_id=participant.identity))
-            break
+            for publication in participant.track_publications.values():
+                if publication.subscribed and publication.kind == rtc.TrackKind.KIND_AUDIO:
+                    self._announce(participant.identity)
+                    break
+
+    def _announce(self, identity: str) -> None:
+        """Emit CallerPresent — the event that triggers the greeting — once, and not too early.
+
+        This used to fire on `participant_connected`, which is signalling only: the participant
+        exists in the room, but the media path is not up. Measured on two live calls, the agent
+        began speaking 99 ms and 302 ms after that event, and both callers reported the opening
+        of the greeting as broken or unintelligible. We were pushing PCM into a track with no
+        receiver.
+
+        `track_subscribed` is the real bar — it means media is flowing and codecs are
+        negotiated. The extra settle on top is a deliberate calibration knob, not superstition:
+        subscription and the first RTP packet actually reaching the caller's handset are not the
+        same instant, and the gap depends on the carrier. Tune with CLINIC_GREETING_SETTLE_MS if
+        a network needs more; the cost is paid once per call, before anyone has spoken.
+        """
+        if self._announced:
+            return
+        self._announced = True
+        settle_ms = float(os.getenv("CLINIC_GREETING_SETTLE_MS", "400"))
+        logger.info(f"[telephony] audio path up for {identity}; greeting in {settle_ms:.0f} ms")
+
+        async def _greet_when_ready() -> None:
+            await asyncio.sleep(settle_ms / 1000.0)
+            self._emit(ev.CallerPresent(t=time.monotonic(), participant_id=identity))
+
+        self._stream_tasks.append(
+            asyncio.create_task(_greet_when_ready(), name="livekit-greeting-settle")
+        )
 
     async def _consume(self, track) -> None:  # noqa: ANN001
         stream = self._rtc.AudioStream(

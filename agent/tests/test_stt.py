@@ -149,9 +149,14 @@ from clinic_agent.core.endpointing import looks_unfinished  # noqa: E402
         ("Thank you.", False),
         ("This is the first time visit.", False),
         ("I had a fracture for ankle.", False),
-        # --- unpunctuated but complete: Deepgram does not always punctuate ------------------
+        # --- unpunctuated but complete: NOT the strong signal, so no long window. They get
+        # --- the short one via grace_seconds() below, which is cheap insurance either way.
         ("December eight two thousand", False),
         ("Nikki Kumarati", False),
+        # --- unpunctuated AND mid-thought, but the last word is a fine sentence ending.
+        # --- The word list cannot see these; only the missing full stop can.
+        ("Well, I don't know the exact reason, but I ate", False),
+        ("what's", False),
         # --- degenerate input ----------------------------------------------------------------
         ("", False),
         ("   ", False),
@@ -163,6 +168,18 @@ def test_looks_unfinished_against_real_transcripts(text, unfinished):
 
 
 # --- the grace window, end to end through the adapter ---------------------------------------
+
+
+def _fast_grace(monkeypatch) -> None:
+    """Run the real graded logic on a test-sized clock.
+
+    The durations themselves are asserted by the grace_seconds table above; these tests are
+    about the adapter's behaviour around the window, so they shrink it rather than restating it.
+    """
+    from clinic_agent.core import endpointing
+
+    monkeypatch.setattr(endpointing, "STRONG_GRACE_S", 0.05)
+    monkeypatch.setattr(endpointing, "WEAK_GRACE_S", 0.05)
 
 
 def _results(text: str, *, is_final: bool, speech_final: bool = False) -> dict:
@@ -190,11 +207,11 @@ async def test_a_finished_sentence_is_not_delayed(fake_ws):
 
 
 @pytest.mark.asyncio
-async def test_a_mid_sentence_pause_waits_then_resumes(fake_ws):
+async def test_a_mid_sentence_pause_waits_then_resumes(fake_ws, monkeypatch):
     """The exact live failure: 'Well, I had a surgery when I was' → agent cut in."""
     events: list[ev.Event] = []
     adapter = build(events)
-    adapter.GRACE_S = 0.05
+    _fast_grace(monkeypatch)
     await adapter.start()
     try:
         adapter._handle(
@@ -217,11 +234,11 @@ async def test_a_mid_sentence_pause_waits_then_resumes(fake_ws):
 
 
 @pytest.mark.asyncio
-async def test_a_caller_who_truly_trails_off_still_gets_an_answer(fake_ws):
+async def test_a_caller_who_truly_trails_off_still_gets_an_answer(fake_ws, monkeypatch):
     """One grace window per utterance. Silence must not become a stall."""
     events: list[ev.Event] = []
     adapter = build(events)
-    adapter.GRACE_S = 0.05
+    _fast_grace(monkeypatch)
     await adapter.start()
     try:
         adapter._handle(_results("How about", is_final=True, speech_final=True))
@@ -236,11 +253,11 @@ async def test_a_caller_who_truly_trails_off_still_gets_an_answer(fake_ws):
 
 
 @pytest.mark.asyncio
-async def test_utterance_end_does_not_preempt_an_open_grace_window(fake_ws):
+async def test_utterance_end_does_not_preempt_an_open_grace_window(fake_ws, monkeypatch):
     """Deepgram's backstop fires sooner than the grace window and must not cut it short."""
     events: list[ev.Event] = []
     adapter = build(events)
-    adapter.GRACE_S = 0.05
+    _fast_grace(monkeypatch)
     await adapter.start()
     try:
         adapter._handle(_results("in", is_final=True, speech_final=True))
@@ -285,3 +302,28 @@ async def test_cartesia_error_for_a_cancelled_context_is_not_a_degradation(monke
     degraded = [e for e in events if isinstance(e, ev.ProviderDegraded)]
     assert len(degraded) == 1
     assert "voice not found" in degraded[0].reason
+
+
+@_pytest.mark.parametrize(
+    "text,seconds",
+    [
+        # Complete — must not be delayed at all.
+        ("It's been two weeks.", 0.0),
+        ("Seven.", 0.0),
+        ("Sunday or Monday?", 0.0),
+        # Unambiguously mid-clause — buy the caller real time.
+        ("Yes. I would like to schedule an appointment with the", 1.6),
+        ("I got some of", 1.6),
+        ("Well,", 1.6),
+        ("in", 1.6),
+        # Merely unpunctuated — short insurance, so names and dates stay fast.
+        ("December eight two thousand", 0.7),
+        ("Well, I don't know the exact reason, but I ate", 0.7),
+        ("what's", 0.7),
+        ("", 0.0),
+    ],
+)
+def test_grace_is_graded_by_how_certain_the_signal_is(text, seconds):
+    from clinic_agent.core.endpointing import grace_seconds
+
+    assert grace_seconds(text) == seconds

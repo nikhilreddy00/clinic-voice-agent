@@ -30,7 +30,7 @@ from loguru import logger
 
 from .. import events as ev
 from ..audio import INPUT_SAMPLE_RATE, NUM_CHANNELS
-from ..endpointing import looks_unfinished
+from ..endpointing import grace_seconds
 
 DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
 
@@ -49,11 +49,11 @@ class DeepgramSTT:
     # being billed as audio; Deepgram asks for one every 3-5 s.
     KEEPALIVE_INTERVAL_S = 5.0
 
-    # How long to keep listening after Deepgram calls the turn over, when the transcript is
-    # visibly mid-sentence. Long enough to cover a caller drawing breath, short enough that a
-    # false positive costs less than one conversational beat. Only unfinished-looking turns
-    # ever wait, so this is not added to the latency of a normal turn.
-    GRACE_S = 0.9
+    # A caller who pauses, resumes, and pauses again is still composing one sentence, so the
+    # window renews rather than firing once. Capped because the point is patience, not a stall:
+    # past this many holds the agent answers with what it has, which is what the warm
+    # "take your time" reply is for.
+    MAX_GRACE_WINDOWS = 3
 
     def __init__(
         self,
@@ -87,7 +87,7 @@ class DeepgramSTT:
         self._keepalive_task: asyncio.Task | None = None
         self._last_send = 0.0
         self._grace_task: asyncio.Task | None = None
-        self._grace_used = False  # one grace window per utterance, never a stall
+        self._grace_windows = 0  # holds spent on the current utterance
         self._segments: list[str] = []
         self._confidences: list[float] = []
 
@@ -192,23 +192,24 @@ class DeepgramSTT:
             self._end_of_turn(now)
 
     def _end_of_turn(self, now: float) -> None:
-        """Deepgram says the turn is over. Decide whether the caller agrees.
-
-        Only a transcript that reads as mid-clause buys a grace window, and only one per
-        utterance — a caller who genuinely trails off mid-sentence still gets an answer rather
-        than silence.
-        """
+        """Deepgram says the turn is over. Decide whether the caller agrees."""
         text = " ".join(self._segments).strip()
-        if text and not self._grace_used and looks_unfinished(text):
-            self._grace_used = True
-            logger.info(f"[stt] holding the turn — caller sounds mid-sentence: {text[-48:]!r}")
-            self._grace_task = asyncio.create_task(self._grace_then_flush(), name="stt-grace")
+        wait = grace_seconds(text) if text else 0.0
+        if wait and self._grace_windows < self.MAX_GRACE_WINDOWS:
+            self._grace_windows += 1
+            logger.info(
+                f"[stt] holding the turn {wait:.1f}s "
+                f"({self._grace_windows}/{self.MAX_GRACE_WINDOWS}) — {text[-48:]!r}"
+            )
+            self._grace_task = asyncio.create_task(
+                self._grace_then_flush(wait), name="stt-grace"
+            )
             return
         self._flush(now)
 
-    async def _grace_then_flush(self) -> None:
+    async def _grace_then_flush(self, wait: float) -> None:
         try:
-            await asyncio.sleep(self.GRACE_S)
+            await asyncio.sleep(wait)
         except asyncio.CancelledError:
             return
         self._flush(time.monotonic())
@@ -224,7 +225,7 @@ class DeepgramSTT:
 
     def _flush(self, now: float) -> None:
         self._grace_task = None
-        self._grace_used = False
+        self._grace_windows = 0
         if not self._segments:
             return
         text = " ".join(self._segments)

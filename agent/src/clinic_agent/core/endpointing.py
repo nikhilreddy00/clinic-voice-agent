@@ -54,9 +54,21 @@ CONTINUATION_WORDS = frozenset(
 
 _WORD = re.compile(r"[a-z']+")
 
+# Two tiers, because the evidence comes in two strengths and one window cannot serve both.
+#
+# STRONG — a trailing comma or a word that cannot end an English sentence ("in", "the", "with",
+# "Well,"). The caller is unambiguously mid-clause, so buy them real time.
+#
+# WEAK — no terminal punctuation at all. `punctuate=true` means Deepgram declined to close the
+# sentence, which is suggestive but not conclusive: "December eight two thousand" and "Nikki
+# Kumarati" are complete answers that simply never got a full stop. A short window is cheap
+# insurance; a long one would tax every name and date of birth in the call.
+STRONG_GRACE_S = 1.6
+WEAK_GRACE_S = 0.7
+
 
 def looks_unfinished(text: str) -> bool:
-    """True when the caller is mid-sentence and the turn should not end yet.
+    """True when the transcript is unambiguously mid-clause (the STRONG signal).
 
     >>> looks_unfinished("Well, there is a severe pain in the")
     True
@@ -66,25 +78,35 @@ def looks_unfinished(text: str) -> bool:
     True
     >>> looks_unfinished("It's been two weeks.")
     False
-    >>> looks_unfinished("Seven.")
-    False
-    >>> looks_unfinished("December eight")
+    >>> looks_unfinished("December eight two thousand")
     False
     """
     stripped = text.strip()
     if not stripped:
         return False
-
-    # Deepgram closed the sentence itself. Trust it — this is the common case and it must stay
-    # on the fast path.
     if stripped.endswith(TERMINAL):
         return False
-
-    # A trailing comma is a caller drawing breath mid-list, never an ending.
     if stripped.endswith(","):
         return True
-
     words = _WORD.findall(stripped.lower())
-    if not words:
-        return False
-    return words[-1] in CONTINUATION_WORDS
+    return bool(words) and words[-1] in CONTINUATION_WORDS
+
+
+def grace_seconds(text: str) -> float:
+    """How long to keep listening after Deepgram calls the turn over. 0.0 means flush now.
+
+    >>> grace_seconds("It's been two weeks.")
+    0.0
+    >>> grace_seconds("I got some of")
+    1.6
+    >>> grace_seconds("December eight two thousand")
+    0.7
+    """
+    stripped = text.strip()
+    if not stripped:
+        return 0.0
+    if looks_unfinished(stripped):
+        return STRONG_GRACE_S
+    if stripped.endswith(TERMINAL):
+        return 0.0
+    return WEAK_GRACE_S
