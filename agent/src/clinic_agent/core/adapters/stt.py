@@ -30,6 +30,7 @@ from loguru import logger
 
 from .. import events as ev
 from ..audio import INPUT_SAMPLE_RATE, NUM_CHANNELS
+from ..endpointing import looks_unfinished
 
 DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
 
@@ -47,6 +48,12 @@ class DeepgramSTT:
     # agent then ran the rest of the call deaf. A KeepAlive text frame resets the timer without
     # being billed as audio; Deepgram asks for one every 3-5 s.
     KEEPALIVE_INTERVAL_S = 5.0
+
+    # How long to keep listening after Deepgram calls the turn over, when the transcript is
+    # visibly mid-sentence. Long enough to cover a caller drawing breath, short enough that a
+    # false positive costs less than one conversational beat. Only unfinished-looking turns
+    # ever wait, so this is not added to the latency of a normal turn.
+    GRACE_S = 0.9
 
     def __init__(
         self,
@@ -79,6 +86,8 @@ class DeepgramSTT:
         self._task: asyncio.Task | None = None
         self._keepalive_task: asyncio.Task | None = None
         self._last_send = 0.0
+        self._grace_task: asyncio.Task | None = None
+        self._grace_used = False  # one grace window per utterance, never a stall
         self._segments: list[str] = []
         self._confidences: list[float] = []
 
@@ -150,6 +159,11 @@ class DeepgramSTT:
     def _handle(self, message: dict) -> None:
         kind = message.get("type")
         if kind == "UtteranceEnd":
+            # While a grace window is open it owns the flush. Deepgram's backstop fires at
+            # utterance_end_ms, which is sooner, and letting it through here would cut the
+            # pause short and undo the whole mechanism.
+            if self._grace_pending():
+                return
             self._flush(time.monotonic())
             return
         if kind != "Results":
@@ -162,6 +176,7 @@ class DeepgramSTT:
 
         if not message.get("is_final"):
             if text:
+                self._cancel_grace()  # the caller resumed — they were only thinking
                 logger.debug(f"ASR  ▷ interim: {text!r}")
                 self._emit(ev.PartialTranscript(t=now, text=text))
                 if self._on_partial:
@@ -169,13 +184,47 @@ class DeepgramSTT:
             return
 
         if text:
+            self._cancel_grace()
             self._segments.append(text)
             if isinstance(confidence, (int, float)):
                 self._confidences.append(float(confidence))
         if message.get("speech_final"):
-            self._flush(now)
+            self._end_of_turn(now)
+
+    def _end_of_turn(self, now: float) -> None:
+        """Deepgram says the turn is over. Decide whether the caller agrees.
+
+        Only a transcript that reads as mid-clause buys a grace window, and only one per
+        utterance — a caller who genuinely trails off mid-sentence still gets an answer rather
+        than silence.
+        """
+        text = " ".join(self._segments).strip()
+        if text and not self._grace_used and looks_unfinished(text):
+            self._grace_used = True
+            logger.info(f"[stt] holding the turn — caller sounds mid-sentence: {text[-48:]!r}")
+            self._grace_task = asyncio.create_task(self._grace_then_flush(), name="stt-grace")
+            return
+        self._flush(now)
+
+    async def _grace_then_flush(self) -> None:
+        try:
+            await asyncio.sleep(self.GRACE_S)
+        except asyncio.CancelledError:
+            return
+        self._flush(time.monotonic())
+
+    def _grace_pending(self) -> bool:
+        return self._grace_task is not None and not self._grace_task.done()
+
+    def _cancel_grace(self) -> None:
+        """More speech arrived — the pause was a breath, not an ending."""
+        if self._grace_pending():
+            self._grace_task.cancel()
+        self._grace_task = None
 
     def _flush(self, now: float) -> None:
+        self._grace_task = None
+        self._grace_used = False
         if not self._segments:
             return
         text = " ".join(self._segments)
@@ -188,6 +237,7 @@ class DeepgramSTT:
         self._emit(ev.FinalTranscript(t=now, text=text, confidence=confidence))
 
     async def aclose(self) -> None:
+        self._cancel_grace()
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
             try:

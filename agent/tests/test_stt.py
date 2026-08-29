@@ -114,3 +114,174 @@ async def test_keepalive_stops_when_the_socket_closes(fake_ws):
 
     task = adapter._keepalive_task
     assert task is None or task.done()
+
+
+# --- endpointing: the caller pausing to think is not the end of their turn -------------------
+
+import pytest as _pytest  # noqa: E402  (grouped with the endpointing block it serves)
+
+from clinic_agent.core.endpointing import looks_unfinished  # noqa: E402
+
+
+# Every string below is a REAL transcript from the first booked call through this engine
+# (logs/traces/20260829T182056478576Z.jsonl). The left column is what the caller actually said;
+# the right is whether the agent should have waited. It answered all of them immediately.
+@_pytest.mark.parametrize(
+    "text,unfinished",
+    [
+        # --- genuinely mid-sentence: the agent talked over a caller who was still going -----
+        ("Well, there is a severe pain in the", True),
+        ("And as well as", True),
+        ("Well, I had a surgery when I was", True),
+        ("in", True),
+        ("How about", True),
+        ("Well,", True),
+        ("yeah. I'm fine with", True),
+        # --- complete answers: these must NOT be delayed, or every turn gets slower ---------
+        ("It's been two weeks.", False),
+        ("Six?", False),
+        ("Seven.", False),
+        ("one PM.", False),
+        ("Sunday or Monday?", False),
+        ("Nothing. Everything looks good.", False),
+        ("Yeah. That's correct.", False),
+        ("No. I'm good.", False),
+        ("Thank you.", False),
+        ("This is the first time visit.", False),
+        ("I had a fracture for ankle.", False),
+        # --- unpunctuated but complete: Deepgram does not always punctuate ------------------
+        ("December eight two thousand", False),
+        ("Nikki Kumarati", False),
+        # --- degenerate input ----------------------------------------------------------------
+        ("", False),
+        ("   ", False),
+        ("...", False),
+    ],
+)
+def test_looks_unfinished_against_real_transcripts(text, unfinished):
+    assert looks_unfinished(text) is unfinished
+
+
+# --- the grace window, end to end through the adapter ---------------------------------------
+
+
+def _results(text: str, *, is_final: bool, speech_final: bool = False) -> dict:
+    return {
+        "type": "Results",
+        "is_final": is_final,
+        "speech_final": speech_final,
+        "channel": {"alternatives": [{"transcript": text, "confidence": 0.99}]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_finished_sentence_is_not_delayed(fake_ws):
+    """The fast path must stay fast — most turns are already correct."""
+    events: list[ev.Event] = []
+    adapter = build(events)
+    await adapter.start()
+    try:
+        adapter._handle(_results("It's been two weeks.", is_final=True, speech_final=True))
+        finals = [e for e in events if isinstance(e, ev.FinalTranscript)]
+        assert len(finals) == 1, "a complete sentence waited when it should not have"
+        assert finals[0].text == "It's been two weeks."
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_mid_sentence_pause_waits_then_resumes(fake_ws):
+    """The exact live failure: 'Well, I had a surgery when I was' → agent cut in."""
+    events: list[ev.Event] = []
+    adapter = build(events)
+    adapter.GRACE_S = 0.05
+    await adapter.start()
+    try:
+        adapter._handle(
+            _results("Well, I had a surgery when I was", is_final=True, speech_final=True)
+        )
+        assert not [e for e in events if isinstance(e, ev.FinalTranscript)], (
+            "flushed a mid-sentence utterance instead of waiting"
+        )
+
+        # The caller carries on — the pause was a breath.
+        adapter._handle(_results("in college", is_final=False))
+        adapter._handle(_results("in college.", is_final=True, speech_final=True))
+        await asyncio.sleep(0.12)
+
+        finals = [e for e in events if isinstance(e, ev.FinalTranscript)]
+        assert len(finals) == 1, "the resumed speech produced more than one turn"
+        assert finals[0].text == "Well, I had a surgery when I was in college."
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_caller_who_truly_trails_off_still_gets_an_answer(fake_ws):
+    """One grace window per utterance. Silence must not become a stall."""
+    events: list[ev.Event] = []
+    adapter = build(events)
+    adapter.GRACE_S = 0.05
+    await adapter.start()
+    try:
+        adapter._handle(_results("How about", is_final=True, speech_final=True))
+        assert not [e for e in events if isinstance(e, ev.FinalTranscript)]
+        await asyncio.sleep(0.12)  # nothing more arrives
+
+        finals = [e for e in events if isinstance(e, ev.FinalTranscript)]
+        assert len(finals) == 1, "the turn never completed — the caller would hear silence"
+        assert finals[0].text == "How about"
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_utterance_end_does_not_preempt_an_open_grace_window(fake_ws):
+    """Deepgram's backstop fires sooner than the grace window and must not cut it short."""
+    events: list[ev.Event] = []
+    adapter = build(events)
+    adapter.GRACE_S = 0.05
+    await adapter.start()
+    try:
+        adapter._handle(_results("in", is_final=True, speech_final=True))
+        adapter._handle({"type": "UtteranceEnd"})
+        assert not [e for e in events if isinstance(e, ev.FinalTranscript)], (
+            "UtteranceEnd flushed while the grace window was still open"
+        )
+        await asyncio.sleep(0.12)
+        assert len([e for e in events if isinstance(e, ev.FinalTranscript)]) == 1
+    finally:
+        await adapter.aclose()
+
+
+# --- TTS: an interruption is not a provider failure ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cartesia_error_for_a_cancelled_context_is_not_a_degradation(monkeypatch):
+    """Three of these fired on the first booked call, purely from the caller barging in.
+
+    `degraded` exists to drive failover. Marking the provider unhealthy every time someone
+    interrupts would make the Phase-15 circuit breaker trip on a perfectly healthy call.
+    """
+    from clinic_agent.core.adapters import tts as tts_mod
+
+    events: list[ev.Event] = []
+    played: list = []
+    adapter = tts_mod.CartesiaTTS(
+        api_key="test", voice_id="v", emit=events.append,
+        play=lambda *a: asyncio.sleep(0),
+        end_utterance=lambda *a: asyncio.sleep(0),
+        clear_playback=lambda *a: asyncio.sleep(0),
+    )
+
+    # utt-gone was cancelled, so the adapter is no longer tracking it.
+    await adapter._handle({"type": "error", "context_id": "utt-gone", "error": None})
+    assert not [e for e in events if isinstance(e, ev.ProviderDegraded)]
+
+    # An error on a context we ARE still synthesising is a real fault and must surface.
+    adapter._active.add("utt-live")
+    await adapter._handle({"type": "error", "context_id": "utt-live", "error": "voice not found"})
+    degraded = [e for e in events if isinstance(e, ev.ProviderDegraded)]
+    assert len(degraded) == 1
+    assert "voice not found" in degraded[0].reason
