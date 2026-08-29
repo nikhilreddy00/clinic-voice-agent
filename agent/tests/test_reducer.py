@@ -9,6 +9,7 @@ audio devices, no network, and no API keys.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -390,3 +391,40 @@ def test_long_unpunctuated_text_still_gets_flushed():
     chunks, remainder = _split_speakable(buffer)
     assert chunks == ["we have an opening with Doctor Chen on Monday morning,"]
     assert remainder.strip() == "x" * 100
+
+
+# --- the agent ends the call (the 16 seconds of dead air on the second booked call) ----------
+
+
+def test_the_agent_hangs_up_after_the_caller_says_goodbye():
+    """Before this, EndCall had one producer — the caller hanging up.
+
+    Live call: the agent said "take care, and we'll see you soon", then the line sat open for
+    16 seconds until the caller gave up and hung up themselves.
+    """
+    d = _greeted()
+    d.state = replace(d.state, booked=True)
+
+    produced = d.send(ev.FinalTranscript(text="No. Thank you."))
+    assert d.state.closing is True
+    assert not [a for a in produced if isinstance(a, EndCall)], (
+        "hung up on the farewell itself — the caller never hears the agent's goodbye"
+    )
+
+    # The agent speaks its sign-off, and the line drops only once that has finished playing.
+    d.send(ev.LLMCompleted(request_id=d.state.request_id, text="Take care!", stop_reason="end_turn"))
+    d.send(ev.BotStartedSpeaking(utterance_id="utt-2"))
+    produced = d.send(ev.BotStoppedSpeaking(utterance_id="utt-2", completed=True))
+
+    assert [a for a in produced if isinstance(a, EndCall)], "the call never ended"
+    assert d.state.phase is Phase.CLOSED
+
+
+def test_a_farewell_before_a_booking_does_not_end_the_call():
+    """"No thanks" while slots are being offered is declining a time, not leaving."""
+    d = _greeted()
+    assert d.state.booked is False
+
+    d.send(ev.FinalTranscript(text="No. Thank you."))
+    assert d.state.closing is False
+    assert d.state.phase is not Phase.CLOSED

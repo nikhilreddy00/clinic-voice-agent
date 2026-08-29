@@ -42,6 +42,7 @@ from .actions import (
     StartLLM,
     TransferToHuman,
 )
+from .closing import is_farewell
 from .intent import detect_emergency
 from .llm_router import select_tier
 from .state import CallState, Phase
@@ -276,6 +277,13 @@ def _on_final_transcript(state: CallState, e: ev.FinalTranscript):
     if emergency is not None:
         return _enter_emergency(state, text, emergency)
 
+    # Arm the hang-up once the business is done and the caller signs off. Gated on `booked`
+    # because ending a call is irreversible: before an appointment exists, "no thanks" is a
+    # caller declining a slot, not leaving. The turn below still runs — the agent gets to say
+    # goodbye, and _on_bot_stopped drops the line once that has actually played.
+    if state.booked and is_farewell(text):
+        state = replace(state, closing=True)
+
     if state.phase is Phase.EMERGENCY:
         # Already handed off. Repeat the guidance rather than resuming a booking flow — an
         # automated scheduler should not be talking someone out of calling 911.
@@ -490,6 +498,14 @@ def _on_bot_stopped(state: CallState, e: ev.BotStoppedSpeaking):
     stray transcript cancel a booking that is mid-commit.
     """
     state = replace(state, bot_speaking=False)
+
+    # The caller said goodbye and the agent has now finished saying it back. Waiting for
+    # playback to drain rather than ending on the farewell itself is the whole point: it is
+    # what lets the caller actually hear "take care" before the line goes.
+    if state.closing and state.phase not in (Phase.THINKING, Phase.TOOL_WAIT):
+        return replace(state, phase=Phase.CLOSED, caller_present=False), [
+            EndCall(reason="conversation_complete")
+        ]
     if state.phase in (Phase.GREETING, Phase.SPEAKING):
         state = replace(state, phase=Phase.LISTENING, utterance_id=None)
     return state, []

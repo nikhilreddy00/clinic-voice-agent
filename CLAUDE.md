@@ -150,16 +150,24 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
   intent-scoped prompts (`prompts.build_system_prompt`) and tool subsets
   (`build_tools_schema(intent)`), `core/adapters/classifier.py`, and
   `eval/run_intent_eval.py`. Measured: **emergency recall 100%** (61 cases, 0 false positives),
-  **intent accuracy 98.3%**, non-scheduling prompts **−80%** (9.5 KB → ~1.9 KB). Full detail:
+  **intent accuracy 98.3%**, non-scheduling prompts **−77%** (11.9 KB → ~2.7 KB; was ~1.9 KB
+  until the unconditional anti-fabrication rule moved into the core prompt). Full detail:
   `docs/build_spec.md` → *Phase 12*. Rules that are easy to break:
   - **The emergency path never touches a model.** `detect_emergency` is pure and runs in the
     reducer before any request exists. Do not "improve" it by asking an LLM — that makes the
     highest-stakes control probabilistic and kills replayability.
   - **Never apply a general negation rule to emergency phrases.** "can't breathe" / "not
     breathing" carry their own polarity; the narrow guard applies ONLY to `NEGATABLE_PATTERNS`.
-  - **Intent is sticky** (`intents.resolve_intent`). Mid-booking slot-fill answers classify as
-    `unknown` in isolation; letting them overwrite the intent strips the scheduling tools and
-    breaks booking outright. This actually happened — see the Phase-12 regression note.
+  - **Intent is sticky** (`intents.resolve_intent`), and stickiness is a SAFETY control, not a
+    tidiness one. Two live regressions, both ending in "zero tool calls, outcome abandoned":
+    mid-booking slot-fill answers classify as `unknown`, and — the expensive one — the answer to
+    the agent's own "what's the reason for your visit?" classifies as `clinical_question` at
+    high confidence, because a clinical description is what that question ASKS FOR. Either one
+    overwriting the intent strips the scheduling tools *and* swaps the booking prompt for a
+    hand-off fragment, after which the model narrates a booking it never made, confirmation
+    number included. No confidence threshold can separate the two (0.85 was tried; it failed at
+    0.92) — hence `QUESTION_INTENTS`: from a scheduling flow, questions never preempt, only a
+    genuine change of task does.
   - Classifier latency is **928 ms p50, not the planned <150 ms** — Haiku is not a fast-tier
     model. It costs the caller nothing (it runs in parallel) but scoping applies from the next
     turn. `CLINIC_MODEL_FAST` points the tier elsewhere once Phase 8's bake-off runs.
@@ -282,9 +290,14 @@ done. **Next: Phase 13 — agent memory + expanded tool surface** (caller memory
 DOB verification gate, reschedule/cancel/refill tools).
 
 Two open items carried forward, both requiring real-world execution rather than code:
-- **No live phone call has been placed through the in-house engine.** The LLM and tool paths are
-  verified against real services and a full booking runs text-in-the-loop, but the media/STT/TTS
-  adapters have never carried real audio. This gates making `core` the default.
+- **Live calls through the in-house engine: 2 placed, 0 clean.** Call 1 was deaf (Deepgram closed
+  the idle socket 12 s after start-up, 32 s before the caller dialed; fixed with a KeepAlive in
+  `core/adapters/stt.py`). Call 2 talked fluently for 19 turns and made **zero tool calls** — the
+  intent flipped to `clinical_question` mid-booking, so the model invented the appointment and
+  the confirmation code (fixed via `intents.QUESTION_INTENTS` plus an anti-fabrication rule now
+  in the CORE prompt). A third call, verified against the database, is what gates making `core`
+  the default. **Read `logs/traces/<call_id>.jsonl` before trusting any call** — a call can sound
+  perfect and have booked nothing; `had_tool_call: false` on every turn is the tell.
 - **Tier B load (25–50 real concurrent calls) is not run**, so there is no cost-per-minute
   number. The harness and control plane exist; the spend and PSTN capacity do not.
 

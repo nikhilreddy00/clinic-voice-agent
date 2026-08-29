@@ -61,6 +61,33 @@ MIN_INTENT_CONFIDENCE = 0.6
 # zero tool calls, outcome `abandoned`. Slot-filling answers are not topic shifts.
 INTENT_SWITCH_CONFIDENCE = 0.85
 
+# Question-shaped intents. A caller can raise any of these DURING a booking without having
+# stopped wanting the appointment: "does my insurance cover this?", "what were my test
+# results?", "where are you located?". None of them is a topic shift away from scheduling.
+#
+# CLINICAL_QUESTION is the load-bearing one, and it is not a classifier weakness — it is
+# structural. The booking flow ASKS the caller to describe their symptoms, so the answer is a
+# clinical description by construction, and a good classifier will label it `clinical_question`
+# with high confidence. Raising INTENT_SWITCH_CONFIDENCE cannot separate the two, because they
+# are the same words. It was tried (0.85) and it failed live at 0.92: "I've been playing
+# pickleball for the past three months, and I'm getting ankle and wrist pain" switched the
+# intent, which stripped the scheduling tools AND swapped the booking prompt for the hand-off
+# fragment. The model then had no tools, no booking rules, and a half-filled booking in its
+# history — so it narrated the rest of the call, inventing an availability check, a time, and
+# the confirmation code "GFC-082826-1015". Thirteen turns, zero tool calls, nothing in the
+# database, and a caller who hung up believing he had an appointment.
+#
+# So: from a scheduling flow, only a genuine change of task preempts. Questions never do.
+QUESTION_INTENTS = frozenset(
+    {
+        Intent.CLINICAL_QUESTION,
+        Intent.BILLING_QUESTION,
+        Intent.INSURANCE_VERIFICATION,
+        Intent.TEST_RESULTS,
+        Intent.HOURS_LOCATION,
+    }
+)
+
 
 def needs_clarification(intent: Intent, confidence: float) -> bool:
     """Whether the agent should ask rather than commit to a flow."""
@@ -77,14 +104,18 @@ def resolve_intent(
     1. ``unknown`` never overwrites an established intent. A caller answering "Dana Reyes" has
        not stopped wanting an appointment; the utterance simply carries no intent on its own.
     2. Establishing the *first* intent needs ``MIN_INTENT_CONFIDENCE``.
-    3. *Switching* an established intent needs ``INTENT_SWITCH_CONFIDENCE`` — a genuine topic
-       shift ("actually, I need a refill instead") is confidently a different thing, while an
-       out-of-context slot-fill answer is not.
+    3. A question asked *during* a scheduling flow is not a topic shift, at any confidence —
+       see ``QUESTION_INTENTS``.
+    4. Otherwise, *switching* an established intent needs ``INTENT_SWITCH_CONFIDENCE`` — a
+       genuine change of task ("actually, I need a refill instead") is confidently a different
+       thing, while an out-of-context slot-fill answer is not.
     """
     if proposed is Intent.UNKNOWN:
         return current if current is not None else Intent.UNKNOWN
     if current is None or current is Intent.UNKNOWN:
         return proposed if confidence >= MIN_INTENT_CONFIDENCE else current
     if proposed is current:
+        return current
+    if current in SCHEDULING_INTENTS and proposed in QUESTION_INTENTS:
         return current
     return proposed if confidence >= INTENT_SWITCH_CONFIDENCE else current

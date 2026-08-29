@@ -30,6 +30,7 @@ from loguru import logger
 
 from .. import events as ev
 from ..audio import INPUT_SAMPLE_RATE, NUM_CHANNELS
+from ..endpointing import grace_seconds
 
 DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
 
@@ -39,6 +40,20 @@ PartialFn = Callable[[str, float], None]
 
 class DeepgramSTT:
     """One streaming STT connection for one call."""
+
+    # Deepgram closes a stream that has received no audio for 10 s (error net0001). A call has
+    # two ordinary silence windows longer than that: the wait for an inbound SIP call, which is
+    # unbounded, and any bot utterance over ~10 s, because the mic gate drops every input frame
+    # while the bot speaks. Both used to kill the socket, and since nothing reconnects, the
+    # agent then ran the rest of the call deaf. A KeepAlive text frame resets the timer without
+    # being billed as audio; Deepgram asks for one every 3-5 s.
+    KEEPALIVE_INTERVAL_S = 5.0
+
+    # A caller who pauses, resumes, and pauses again is still composing one sentence, so the
+    # window renews rather than firing once. Capped because the point is patience, not a stall:
+    # past this many holds the agent answers with what it has, which is what the warm
+    # "take your time" reply is for.
+    MAX_GRACE_WINDOWS = 3
 
     def __init__(
         self,
@@ -69,6 +84,10 @@ class DeepgramSTT:
 
         self._ws: websockets.ClientConnection | None = None
         self._task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
+        self._last_send = 0.0
+        self._grace_task: asyncio.Task | None = None
+        self._grace_windows = 0  # holds spent on the current utterance
         self._segments: list[str] = []
         self._confidences: list[float] = []
 
@@ -77,7 +96,9 @@ class DeepgramSTT:
         self._ws = await websockets.connect(
             url, additional_headers={"Authorization": f"Token {self._api_key}"}
         )
+        self._last_send = time.monotonic()
         self._task = asyncio.create_task(self._receive_loop(), name="stt-receive")
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop(), name="stt-keepalive")
         logger.info(f"[stt] deepgram connected (model={self._params['model']}, {self._sample_rate} Hz)")
 
     async def send_audio(self, pcm: bytes) -> None:
@@ -86,9 +107,38 @@ class DeepgramSTT:
             return
         try:
             await self._ws.send(pcm)
+            self._last_send = time.monotonic()
         except websockets.ConnectionClosed:
             self._ws = None
             self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="stt", reason="closed"))
+
+    async def _keepalive_loop(self) -> None:
+        """Send a KeepAlive whenever the stream has been silent for a full interval.
+
+        Sleeping only the *remaining* time rather than a fixed tick keeps the real gap at or
+        under the interval. A fixed tick would allow a gap of nearly twice it, which is how a
+        5 s keepalive quietly becomes a 10 s one and hits the very timeout it exists to avoid.
+        """
+        try:
+            while True:
+                ws = self._ws
+                if ws is None:
+                    return
+                idle_for = time.monotonic() - self._last_send
+                if idle_for < self.KEEPALIVE_INTERVAL_S:
+                    await asyncio.sleep(self.KEEPALIVE_INTERVAL_S - idle_for)
+                    continue
+                try:
+                    await ws.send(json.dumps({"type": "KeepAlive"}))
+                    self._last_send = time.monotonic()
+                except websockets.ConnectionClosed:
+                    self._ws = None
+                    self._emit(
+                        ev.ProviderDegraded(t=time.monotonic(), provider="stt", reason="closed")
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
 
     async def _receive_loop(self) -> None:
         assert self._ws is not None
@@ -109,6 +159,11 @@ class DeepgramSTT:
     def _handle(self, message: dict) -> None:
         kind = message.get("type")
         if kind == "UtteranceEnd":
+            # While a grace window is open it owns the flush. Deepgram's backstop fires at
+            # utterance_end_ms, which is sooner, and letting it through here would cut the
+            # pause short and undo the whole mechanism.
+            if self._grace_pending():
+                return
             self._flush(time.monotonic())
             return
         if kind != "Results":
@@ -121,6 +176,7 @@ class DeepgramSTT:
 
         if not message.get("is_final"):
             if text:
+                self._cancel_grace()  # the caller resumed — they were only thinking
                 logger.debug(f"ASR  ▷ interim: {text!r}")
                 self._emit(ev.PartialTranscript(t=now, text=text))
                 if self._on_partial:
@@ -128,13 +184,48 @@ class DeepgramSTT:
             return
 
         if text:
+            self._cancel_grace()
             self._segments.append(text)
             if isinstance(confidence, (int, float)):
                 self._confidences.append(float(confidence))
         if message.get("speech_final"):
-            self._flush(now)
+            self._end_of_turn(now)
+
+    def _end_of_turn(self, now: float) -> None:
+        """Deepgram says the turn is over. Decide whether the caller agrees."""
+        text = " ".join(self._segments).strip()
+        wait = grace_seconds(text) if text else 0.0
+        if wait and self._grace_windows < self.MAX_GRACE_WINDOWS:
+            self._grace_windows += 1
+            logger.info(
+                f"[stt] holding the turn {wait:.1f}s "
+                f"({self._grace_windows}/{self.MAX_GRACE_WINDOWS}) — {text[-48:]!r}"
+            )
+            self._grace_task = asyncio.create_task(
+                self._grace_then_flush(wait), name="stt-grace"
+            )
+            return
+        self._flush(now)
+
+    async def _grace_then_flush(self, wait: float) -> None:
+        try:
+            await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            return
+        self._flush(time.monotonic())
+
+    def _grace_pending(self) -> bool:
+        return self._grace_task is not None and not self._grace_task.done()
+
+    def _cancel_grace(self) -> None:
+        """More speech arrived — the pause was a breath, not an ending."""
+        if self._grace_pending():
+            self._grace_task.cancel()
+        self._grace_task = None
 
     def _flush(self, now: float) -> None:
+        self._grace_task = None
+        self._grace_windows = 0
         if not self._segments:
             return
         text = " ".join(self._segments)
@@ -147,6 +238,14 @@ class DeepgramSTT:
         self._emit(ev.FinalTranscript(t=now, text=text, confidence=confidence))
 
     async def aclose(self) -> None:
+        self._cancel_grace()
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._keepalive_task = None
         if self._ws is not None:
             try:
                 await self._ws.send(json.dumps({"type": "CloseStream"}))

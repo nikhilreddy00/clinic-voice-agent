@@ -152,13 +152,22 @@ class CartesiaTTS:
             await self._end_utterance(context_id)
 
         elif kind == "error":
-            logger.error(f"[tts] cartesia error: {message.get('error')}")
+            # Cancelling a context makes Cartesia answer with an error frame, so every barge-in
+            # produced one of these. It was logged at ERROR and marked the whole provider
+            # degraded — on the first booked call, three times, purely from the caller
+            # interrupting. `degraded` is meant to drive failover, so poisoning it with normal
+            # turn-taking would make the Phase-15 breaker fire on healthy calls.
+            #
+            # A context we are no longer tracking is one we cancelled ourselves. That is
+            # expected, not a fault.
+            detail = message.get("error") or message.get("message") or message
+            if context_id not in self._active:
+                logger.debug(f"[tts] cartesia closed a cancelled context: {detail}")
+                await self._clear_playback(context_id)
+                return
+            logger.error(f"[tts] cartesia error: {detail}")
             self._active.discard(context_id)
-            self._emit(
-                ev.ProviderDegraded(
-                    t=time.monotonic(), provider="tts", reason=str(message.get("error"))
-                )
-            )
+            self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="tts", reason=str(detail)))
             await self._clear_playback(context_id)
 
     async def aclose(self) -> None:
