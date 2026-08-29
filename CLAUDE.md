@@ -277,6 +277,13 @@ agent/.venv/bin/python loadtest/tier_a.py --mode audio --concurrency 5,100,800,1
 agent/.venv/bin/python loadtest/tier_a.py --rechart loadtest/results/tierA-loop.json
 ```
 
+```bash
+# Landing page — no build step, no server needed. Open it, or check its invariants.
+open site/index.html
+python3 site/check_page.py                                   # asserts every published claim
+python3 site/build_trace.py logs/traces/<call_id>.jsonl       # re-point the replay at a new call
+```
+
 `MODE` (default `local`) is the only switch between the laptop mic/speaker path and the LiveKit
 SIP telephony path — the ASR→LLM→TTS loop, tool calls, mic gate, and barge-in are identical in
 both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephony (LiveKit SIP)*.
@@ -286,18 +293,50 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 **Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 12 of 17.**
 Phase 8 (model bake-off harness) is built but the sweep has not been run; Phases 9 (Postgres +
 Supabase), 10 (in-house event loop), 11 (concurrency + load proof), and 12 (reasoning layer) are
-done. **Next: Phase 13 — agent memory + expanded tool surface** (caller memory by ANI, the
-DOB verification gate, reschedule/cancel/refill tools).
+done, and the engine is validated by real phone calls (see below). **Next: Phase 13 — agent
+memory + expanded tool surface** (caller memory by ANI, the DOB verification gate,
+reschedule/cancel/refill tools). The last live call points straight at it: the agent asked "are
+you a new patient?" of a number it had already served three times, and could not answer "who is
+the doctor?" — that is `lookup_patient` and `get_clinic_info`.
+
+**Live-call hardening (post-Phase-12, effectively early Phase 14).** Five defects, all found by
+reading traces rather than by a failing test. Do not regress these:
+  - **Deepgram closes an idle socket after 10 s** (`net0001`). `MODE=telephony` opens STT at
+    start-up and then waits an unbounded time for a call, and the mic gate sends nothing while
+    the bot speaks — so both windows killed it. `stt.py` sends a KeepAlive on an interval.
+    Nothing reconnects, so a dead socket means a call that hears nothing and looks fine.
+  - **`intents.QUESTION_INTENTS`** — see the Phase-12 note. This is the fabricated-booking fix.
+  - **`core/endpointing.py` — graded turn-end grace.** Deepgram ends a turn after 300 ms of
+    silence, so a caller pausing to think gets talked over; 7 of 27 turns on one call were the
+    agent answering a fragment. Grace is graded ON PURPOSE: a trailing comma or a word that
+    cannot end a sentence buys 1.6 s, merely-unpunctuated buys 0.7 s. That split is load-bearing
+    — "December eight two thousand" is a complete answer with no full stop, and taxing it 1.6 s
+    would slow every name and date. Windows renew up to 3×. **This deliberately raises per-turn
+    e2e** (~800 ms) while halving total call time; do not "optimize" it away by reading the
+    per-turn number alone.
+  - **`core/closing.py` — the agent can end a call.** `EndCall` used to have exactly one
+    producer, the caller hanging up, so a completed booking left the line open until the caller
+    gave up (16 s of dead air, measured). Gated on `state.booked` because hanging up is
+    irreversible, and it fires on `BotStoppedSpeaking`, not on the farewell — the caller has to
+    hear the goodbye.
+  - **The greeting must wait for media, not signalling.** `CallerPresent` fired on LiveKit's
+    `participant_connected`; the agent began speaking 99 ms later, into a track with no
+    receiver, and callers reported the greeting as broken. It now fires on `track_subscribed`
+    plus `CLINIC_GREETING_SETTLE_MS` (400 ms) — a calibration knob for carrier variance, not
+    superstition.
+  - **A Cartesia error frame on a cancelled context is NOT provider degradation.** Every
+    barge-in produced one; `degraded` drives the Phase-15 breaker, so it must not be poisoned by
+    normal turn-taking.
 
 Two open items carried forward, both requiring real-world execution rather than code:
-- **Live calls through the in-house engine: 2 placed, 0 clean.** Call 1 was deaf (Deepgram closed
-  the idle socket 12 s after start-up, 32 s before the caller dialed; fixed with a KeepAlive in
-  `core/adapters/stt.py`). Call 2 talked fluently for 19 turns and made **zero tool calls** — the
-  intent flipped to `clinical_question` mid-booking, so the model invented the appointment and
-  the confirmation code (fixed via `intents.QUESTION_INTENTS` plus an anti-fabrication rule now
-  in the CORE prompt). A third call, verified against the database, is what gates making `core`
-  the default. **Read `logs/traces/<call_id>.jsonl` before trusting any call** — a call can sound
-  perfect and have booked nothing; `had_tool_call: false` on every turn is the tell.
+- ~~No live call through the in-house engine.~~ **CLOSED — 5 calls placed, 3 booked end to end**,
+  verified in Postgres. Measured across the booked calls: **voice-to-voice p50 1.5 s** (vs 4.1 s
+  on the Pipecat path) and **call duration halved, ~6 min → ~3 min**. `core` is now the proven
+  path; making it the *default* entrypoint is a one-line change nobody has made yet.
+
+  **Read `logs/traces/<call_id>.jsonl` before trusting any call.** Every defect below was found
+  in the event stream and was invisible in the console logs — a call can sound flawless and have
+  booked nothing. `had_tool_call: false` on every turn is the tell.
 - **Tier B load (25–50 real concurrent calls) is not run**, so there is no cost-per-minute
   number. The harness and control plane exist; the spend and PSTN capacity do not.
 
