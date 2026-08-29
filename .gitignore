@@ -43,3 +43,4 @@ build/
 
 # Phase-8 bake-off temp DB
 eval/.bakeoff_clinic.db
+.claude-flow/
