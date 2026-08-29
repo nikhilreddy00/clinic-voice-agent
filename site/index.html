@@ -518,11 +518,12 @@
       </div>
 
       <p class="caveat">
-        This is a real run against the real scheduling API on Claude Haiku 4.5 — a
-        text-in-the-loop eval case, not a phone call. Every tool call, argument and confirmation
-        number shown is what the system actually produced. The patient is synthetic; all data in
-        this project is. A recording of the same flow placed over the phone is coming once the
-        rebuilt engine has one verified end to end.
+        This is a real inbound phone call — dialled from a mobile, answered over the clinic's
+        line, and replayed here from the call's own event log. Every word, tool call, argument
+        and confirmation number is what the system actually produced, in the order it produced
+        them. Watch turn four: the caller pauses mid-sentence and the agent waits rather than
+        talking over them. The call ends because the agent hung up, not the caller. The patient
+        is synthetic; all data in this project is.
       </p>
     </div>
   </section>
@@ -547,8 +548,9 @@
             <tr><td>Concurrent calls</td><td class="value">1,000</td><td class="source">Per process, synthetic load, flat latency and zero timeouts — 1,600 with voice detection running on every frame. Recommended capacity is ~800, where loop lag starts climbing</td></tr>
             <tr><td>Double-booking</td><td class="value">0</td><td class="source">20 callers racing for one slot yield exactly one winner. The earlier read-then-write let 9 of 20 win</td></tr>
             <tr><td>Speech recognition</td><td class="value">87 ms</td><td class="source">Median, on a live call</td></tr>
-            <tr><td>Speech synthesis</td><td class="value">134 ms</td><td class="source">Median, on a live call</td></tr>
-            <tr><td>Voice to voice</td><td class="value">4.1 s</td><td class="source">Median on a live call. The language model is the bottleneck — roughly three of those four seconds. The rebuilt engine measures faster, but not yet on a call that made tool calls, so that number is not published here</td></tr>
+            <tr><td>Speech synthesis</td><td class="value">85 ms</td><td class="source">Median time to first audio, measured on booked phone calls</td></tr>
+            <tr><td>Voice to voice</td><td class="value">1.5 s</td><td class="source">Median across three booked phone calls, tool calls included. The pipeline it replaced measured 4.1 s. Per-turn time now varies deliberately: the agent waits when a caller is still mid-sentence, so a patient turn is slower and a fluent one is not</td></tr>
+            <tr><td>Booking call length</td><td class="value">3 min</td><td class="source">Greeting to hang-up for a complete first-time booking with a clinical history taken. Halved from six minutes by asking fewer, better questions — the agent ends the call itself</td></tr>
             <tr><td>Automated tests</td><td class="value">243</td><td class="source">On the agent alone, plus separate suites for the scheduling API and the call router. Run on every change</td></tr>
           </tbody>
         </table>
@@ -624,115 +626,152 @@
 const CALL_REPLAY = [
   {
     "role": "caller",
-    "text": "Hi, I'd like to book an appointment."
+    "text": "Means that I I would like to book an appointment with the doctor."
   },
   {
     "role": "agent",
-    "text": "Great! I'd be happy to help you book an appointment at Grove Family Clinic. What's your name?"
+    "text": "Perfect \u2014 I'd be happy to help you get scheduled. Can I start by getting your name?"
   },
   {
     "role": "caller",
-    "text": "My name is Jordan Alvarez."
+    "text": "Yeah."
   },
   {
     "role": "agent",
-    "text": "Thanks, Jordan. What's your date of birth?"
+    "text": "Take your time \u2014 I'm listening."
   },
   {
     "role": "caller",
-    "text": "March 15th, 1990."
+    "text": "Ramesh. Ramesh."
   },
   {
     "role": "agent",
-    "text": "Got it. Are you a new patient, or have you visited us before?"
+    "text": "Got it, Ramesh. What's your date of birth?"
   },
   {
     "role": "caller",
-    "text": "I'm a new patient."
+    "text": "May fifth two thousand two."
   },
   {
     "role": "agent",
-    "text": "Welcome! What's the reason for your visit today?"
+    "text": "Thank you. And are you a new patient, or have you visited Grove Family Clinic before?"
   },
   {
     "role": "caller",
-    "text": "It's just for a routine checkup."
+    "text": "New patient."
   },
   {
     "role": "agent",
-    "text": "Perfect. Can you briefly describe what's been going on in one sentence?"
+    "text": "Welcome! What brings you in today \u2014 what would you like to see the doctor about?"
   },
   {
     "role": "caller",
-    "text": "Nothing specific, just my annual physical."
+    "text": "Well, I'm getting too much of wrist pain."
   },
   {
     "role": "agent",
-    "text": "Got it. What day would work best for you?"
+    "text": "I hear you. Can you tell me a bit more about what's been going on with your wrist?"
   },
   {
     "role": "caller",
-    "text": "Whatever you have soonest is fine."
+    "text": "Well, I've been playing for pickleball and tennis. I'm getting more of this pain while playing."
+  },
+  {
+    "role": "agent",
+    "text": "How long has the wrist pain been going on, and is it getting worse or better?"
+  },
+  {
+    "role": "caller",
+    "text": "It's been ten days and it's worst."
+  },
+  {
+    "role": "agent",
+    "text": "Got it \u2014 ten days and getting worse with pickleball and tennis. When would be a good day for you to come in?"
+  },
+  {
+    "role": "caller",
+    "text": "Monday?"
+  },
+  {
+    "role": "agent",
+    "text": "Monday works \u2014 that's August 31st. Let me find what we have open for you."
   },
   {
     "role": "tool",
     "name": "check_availability",
     "args": {
-      "reason_category": "checkup"
+      "date": "2026-08-31",
+      "reason_category": "sick-visit"
     },
     "result": {
       "ok": true,
-      "slots_found": 9
+      "slots_found": 1
     }
   },
   {
     "role": "agent",
-    "text": "The soonest opening is Friday, August 14 at 2:30 PM with Dr. Aisha Patel, or Friday at 5:00 PM with Dr. Marcus Chen. Which works better for you?"
+    "text": "We have Monday, August 31st at 6:30 PM with Dr. Aisha Patel \u2014 does that work for you?"
   },
   {
     "role": "caller",
-    "text": "That works, let's do it."
+    "text": "Yeah. That works for me."
   },
   {
     "role": "tool",
     "name": "hold_slot",
     "args": {
-      "slot_id": 10
+      "slot_id": 12
     },
     "result": {
       "ok": true,
-      "hold_id": "3594df4e\u2026"
+      "hold_id": "61331c21\u2026"
     }
   },
   {
     "role": "agent",
-    "text": "Perfect! Let me confirm the details: your appointment is Friday, August 14 at 2:30 PM with Dr. Aisha Patel for your annual physical.\n\nYour date of birth is 03/15/1990.\n\nDoes everything look correct?"
+    "text": "Great. So to confirm: your appointment is Monday, August 31st at 6:30 PM with Dr. Aisha Patel for your wrist pain.\n\nYour date of birth is May 5th, 2002.\n\nDoes that all sound right?"
   },
   {
     "role": "caller",
-    "text": "Yes, please book it."
+    "text": "Yeah. Sounds perfect."
   },
   {
     "role": "tool",
     "name": "confirm_booking",
     "args": {
-      "hold_id": "3594df4e\u2026",
-      "patient_name": "Jordan Alvarez",
-      "reason": "checkup",
-      "date_of_birth": "03/15/1990",
+      "hold_id": "61331c21\u2026",
+      "patient_name": "Ramesh",
+      "reason": "wrist pain",
+      "date_of_birth": "05/05/2002",
       "new_patient": true,
-      "symptom_notes": "Annual physical"
+      "symptom_notes": "Wrist pain x10 days from pickleball and tennis, getting worse."
     },
     "result": {
       "ok": true,
-      "confirmation_id": "3BA83DD4",
-      "display_time": "Friday, August 14 at 2:30 PM",
+      "confirmation_id": "2096F951",
+      "display_time": "Monday, August 31 at 6:30 PM",
       "provider_name": "Dr. Aisha Patel"
     }
   },
   {
     "role": "agent",
-    "text": "You're all set, Jordan! Your appointment is Friday, August 14 at 2:30 PM with Dr. Aisha Patel. Your confirmation number is 3BA83DD4. Please arrive 15 minutes early to complete paperwork. Is there anything else I can help you with?"
+    "text": "You're all set, Ramesh. Your appointment is Monday, August 31st at 6:30 PM with Dr. Aisha Patel. Your confirmation number is 2096F951. \n\nPlease arrive 15 minutes early to complete paperwork.\n\nIs there anything else I can help you with?"
+  },
+  {
+    "role": "caller",
+    "text": "No. I'm good. Thank you so much."
+  },
+  {
+    "role": "agent",
+    "text": "You're welcome, Ramesh. You're all set for Monday, August 31st at 6:30 PM \u2014 confirmation number 2096F951. Best of luck with your wrist, and we'll see you soon."
+  },
+  {
+    "role": "caller",
+    "text": "Thank you."
+  },
+  {
+    "role": "agent",
+    "text": "Take care!"
   }
 ];
 /* END GENERATED TRACE */

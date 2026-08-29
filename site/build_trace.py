@@ -5,11 +5,14 @@ Why a generator instead of pasting JSON once: the numbers and the confirmation c
 page are the whole argument, and retyping them by hand is how a wrong one ships. This derives
 them from the source file every time.
 
-It also makes the planned swap cheap. Today the replay uses a text-in-the-loop eval case,
-because no successful booking has yet been placed over the phone through the in-house engine.
-When one is, point this at that call's trace and rerun.
+It reads either source this project produces:
 
-Run: python3 site/build_trace.py
+* a **call trace** (``logs/traces/<call_id>.jsonl``) — the event stream of a real inbound phone
+  call, which is what the page ships now that the engine has booked one end to end;
+* an **eval result** (``eval/results/*.json``) — a text-in-the-loop case, which is what it used
+  before a phone booking existed.
+
+Run: python3 site/build_trace.py [path]
 """
 
 from __future__ import annotations
@@ -21,8 +24,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PAGE = Path(__file__).parent / "index.html"
-SOURCE = ROOT / "eval" / "results" / "20260813T045758Z.json"
-CASE_ID = "hp_checkup_tomorrow"
+# A real inbound call: greeting through confirmation, ending when the agent hung up by itself.
+SOURCE = ROOT / "logs" / "traces" / "20260829T201039840380Z.jsonl"
+CASE_ID = "hp_checkup_tomorrow"  # only consulted when the source is an eval result
 
 BEGIN = "/* BEGIN GENERATED TRACE */"
 END = "/* END GENERATED TRACE */"
@@ -71,8 +75,45 @@ def trim_args(args: dict) -> dict:
     }
 
 
-def build_steps() -> list[dict]:
-    case = next(c for c in json.loads(SOURCE.read_text())["cases"] if c["id"] == CASE_ID)
+def build_steps_from_trace(path: Path) -> list[dict]:
+    """Fold a call trace into replay steps, in the order the reducer actually saw them.
+
+    Unlike the eval result, a trace records real ordering — so the beat the page is built
+    around is preserved rather than reconstructed: ToolCompleted for the booking genuinely
+    precedes the LLMCompleted that speaks the confirmation number aloud.
+
+    Only the caller's words, the agent's words, and the tool calls come across. Everything else
+    stays behind — including participant_id, which on the telephony path is the caller's real
+    phone number.
+    """
+    events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    events.sort(key=lambda e: e.get("seq", 0))
+
+    args_by_id: dict[str, dict] = {}
+    steps: list[dict] = []
+    for e in events:
+        kind = e.get("kind")
+        if kind == "FinalTranscript" and e.get("text"):
+            steps.append({"role": "caller", "text": e["text"]})
+        elif kind == "LLMToolUse":
+            args_by_id[e["tool_call_id"]] = e.get("arguments") or {}
+        elif kind == "ToolCompleted":
+            steps.append(
+                {
+                    "role": "tool",
+                    "name": e["name"],
+                    "args": trim_args(args_by_id.get(e["tool_call_id"], {})),
+                    "result": summarize(e["name"], e.get("result") or {}),
+                }
+            )
+        elif kind == "LLMCompleted" and (e.get("text") or "").strip():
+            # A tool-only completion carries no text; its card already represents it.
+            steps.append({"role": "agent", "text": e["text"].strip()})
+    return steps
+
+
+def build_steps_from_eval(path: Path) -> list[dict]:
+    case = next(c for c in json.loads(path.read_text())["cases"] if c["id"] == CASE_ID)
     by_name = {t["name"]: t for t in case["tool_calls"]}
     steps: list[dict] = []
 
@@ -95,16 +136,24 @@ def build_steps() -> list[dict]:
     return steps
 
 
+def build_steps(path: Path) -> list[dict]:
+    """Dispatch on what the file actually is, so either source just works."""
+    if path.suffix == ".jsonl":
+        return build_steps_from_trace(path)
+    return build_steps_from_eval(path)
+
+
 def main() -> int:
-    if not SOURCE.exists():
-        print(f"FAIL: source not found: {SOURCE}")
+    source = Path(sys.argv[1]) if len(sys.argv) > 1 else SOURCE
+    if not source.exists():
+        print(f"FAIL: source not found: {source}")
         return 1
     html = PAGE.read_text(encoding="utf-8")
     if BEGIN not in html or END not in html:
         print(f"FAIL: sentinels not found in {PAGE}")
         return 1
 
-    steps = build_steps()
+    steps = build_steps(source)
     block = "const CALL_REPLAY = " + json.dumps(steps, indent=2) + ";"
     pattern = re.compile(re.escape(BEGIN) + r".*?" + re.escape(END), re.DOTALL)
     # A function replacement, not a string: re.sub processes backslash escapes in a string
@@ -112,7 +161,8 @@ def main() -> int:
     replacement = f"{BEGIN}\n{block}\n{END}"
     PAGE.write_text(pattern.sub(lambda _: replacement, html), encoding="utf-8")
     tools = sum(1 for s in steps if s["role"] == "tool")
-    print(f"OK: regenerated trace from {SOURCE.name} ({CASE_ID}) — {len(steps)} steps, {tools} tool calls")
+    kind = "real phone call" if source.suffix == ".jsonl" else "eval case"
+    print(f"OK: regenerated from {source.name} ({kind}) — {len(steps)} steps, {tools} tool calls")
     return 0
 
 
