@@ -44,6 +44,7 @@ from .actions import (
     ClassifyIntent,
     EndCall,
     InvokeTool,
+    LoadCallerMemory,
     Speak,
     StartLLM,
     TransferToHuman,
@@ -250,6 +251,7 @@ class CallSession:
                 tier=action.tier,
                 intent=action.intent,
                 routing_reason=action.routing_reason,
+                context_note=action.context_note,
             )
         elif isinstance(action, ClassifyIntent):
             self._classifier.classify(action.utterance)
@@ -273,6 +275,11 @@ class CallSession:
             await self._tts.cancel(action.utterance_id)
         elif isinstance(action, InvokeTool):
             self._tools.invoke(action.tool_call_id, action.name, action.arguments)
+        elif isinstance(action, LoadCallerMemory):
+            # Fire-and-forget, in parallel with the greeting: the caller must never wait on a
+            # database to hear the AI disclosure, and a lookup that fails just means the agent
+            # greets exactly as it did before Phase 13.
+            self._tools.load_caller_memory(action.phone)
         elif isinstance(action, EndCall):
             logger.info(f"[session] ending call ({action.reason})")
             self._closed.set()

@@ -53,12 +53,15 @@ class FakeLLM:
         self._emit = emit
         self._script = script
         self.requests: list[tuple[str, tuple]] = []
+        self.context_notes: list[str] = []
         self.tiers: list = []
         self.cancelled: list[str] = []
         self.closed = False
 
-    def start(self, request_id, messages, *, tier=None, intent=None, routing_reason=""):
+    def start(self, request_id, messages, *, tier=None, intent=None, routing_reason="",
+              context_note=""):
         self.requests.append((request_id, messages))
+        self.context_notes.append(context_note)
         self.tiers.append(tier)
         step = self._script[len(self.requests) - 1] if len(self.requests) <= len(self._script) else []
         for event in step:

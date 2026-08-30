@@ -156,6 +156,7 @@ class SchedulingClient:
         date_of_birth: str | None = None,
         new_patient: bool | None = None,
         symptom_notes: str | None = None,
+        phone: str | None = None,
     ) -> dict:
         payload = {
             "hold_id": hold_id,
@@ -164,6 +165,10 @@ class SchedulingClient:
             "date_of_birth": date_of_birth,
             "new_patient": new_patient,
             "symptom_notes": symptom_notes,
+            # Phase 13: the ANI, injected by the reducer. It is what turns this booking into a
+            # patient record, so the NEXT call from this number is a returning caller. Absent
+            # on the local path and in the eval harness, where the booking still succeeds.
+            "phone": phone,
         }
         try:
             resp = await self._client.post(
@@ -189,12 +194,115 @@ class SchedulingClient:
         data["display_time"] = _format_slot_time(data["start_time"])
         return {"ok": True, **data}
 
+    # --- Phase 13: verified caller flows -------------------------------------------------
+    #
+    # `phone` and `date_of_birth` are NEVER model-supplied on these calls. The reducer injects
+    # them from CallState (the ANI from SIP, the DOB the caller spoke and the API already
+    # matched once), so a prompt injection cannot talk the agent into looking up somebody
+    # else's chart by naming a different number. The API re-verifies the pair anyway.
+
+    async def _verified_post(self, path: str, payload: dict) -> dict:
+        """POST a verified-caller request and map the standard failures for the model."""
+        try:
+            resp = await self._client.post(path, json=payload)
+        except httpx.HTTPError as exc:
+            return {"ok": False, "error": f"could not reach the scheduling system ({exc})"}
+        if resp.status_code == 403:
+            return {
+                "ok": False,
+                "status": 403,
+                # The wording matters: the model must not tell the caller their number is or
+                # is not on file — that is the enumeration leak the API is careful to avoid.
+                "error": "could not verify — ask for the date of birth again, or offer staff",
+            }
+        if resp.status_code == 404:
+            return {"ok": False, "status": 404, "error": "no such appointment for this caller"}
+        if resp.status_code == 409:
+            return {"ok": False, "status": 409, "error": "that time was just taken — offer another"}
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            return {"ok": False, "error": f"the scheduling system returned an error ({exc})"}
+        return {"ok": True, **resp.json()}
+
+    async def caller_memory(self, *, phone: str) -> dict:
+        """Pre-greeting lookup by ANI. Returns no identity — see the API's docstring."""
+        try:
+            resp = await self._client.get("/caller-memory", params={"phone": phone})
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            # A memory miss must never block a call: the agent simply greets as it always did.
+            return {"ok": False, "error": str(exc), "known": False, "upcoming_appointments": 0}
+        return {"ok": True, **resp.json()}
+
+    async def verify_identity(self, *, phone: str, date_of_birth: str) -> dict:
+        return await self._verified_post(
+            "/verify-identity", {"phone": phone, "date_of_birth": date_of_birth}
+        )
+
+    async def list_appointments(self, *, phone: str, date_of_birth: str) -> dict:
+        result = await self._verified_post(
+            "/appointments", {"phone": phone, "date_of_birth": date_of_birth}
+        )
+        if result.get("ok"):
+            appts = [
+                {**a, "display_time": _format_slot_time(a["start_time"])}
+                for a in result.get("appointments", [])
+            ]
+            return {"ok": True, "count": len(appts), "appointments": appts}
+        return result
+
+    async def reschedule_appointment(
+        self, *, confirmation_id: str, new_slot_id: int, phone: str, date_of_birth: str
+    ) -> dict:
+        result = await self._verified_post("/reschedule", {
+            "confirmation_id": confirmation_id, "new_slot_id": new_slot_id,
+            "phone": phone, "date_of_birth": date_of_birth,
+        })
+        if result.get("ok"):
+            result["display_time"] = _format_slot_time(result["start_time"])
+        return result
+
+    async def cancel_appointment(
+        self, *, confirmation_id: str, phone: str, date_of_birth: str,
+        reason: str | None = None,
+    ) -> dict:
+        return await self._verified_post("/cancel", {
+            "confirmation_id": confirmation_id, "phone": phone,
+            "date_of_birth": date_of_birth, "reason": reason,
+        })
+
+    async def request_refill(
+        self, *, phone: str, date_of_birth: str, medication: str, notes: str | None = None
+    ) -> dict:
+        return await self._verified_post("/staff-tasks", {
+            "phone": phone, "date_of_birth": date_of_birth, "kind": "refill",
+            "payload": {"medication": medication, "notes": notes},
+        })
+
+    async def clinic_info(self, *, topic: str | None = None) -> dict:
+        try:
+            resp = await self._client.get(
+                "/clinic-info", params={"topic": topic} if topic else {}
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            return {"ok": False, "error": f"could not reach the scheduling system ({exc})"}
+        return {"ok": True, **resp.json()}
+
+
 
 # --- Pipecat function handlers ----------------------------------------------------------
 # Each handler unpacks params.arguments, calls the client, logs a TOOL ▶ line, and hands the
 # result back to the LLM via params.result_callback(...). Pipecat appends that result to the
 # LLMContext as a tool message and re-runs the LLM automatically, so the model "sees" the real
 # availability/hold/booking data and speaks from it — no manual context editing here.
+
+
+def _redact_phone(phone: str | None) -> str:
+    """Last four digits only. The ANI is an identifier; logs are not a place to keep one."""
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    return f"***{digits[-4:]}" if digits else "unset"
 
 
 def _tool_http_status(result: dict) -> int | None:
@@ -215,7 +323,34 @@ TOOL_ENDPOINTS = {
     "check_availability": "/availability",
     "hold_slot": "/hold-slot",
     "confirm_booking": "/confirm-booking",
+    # Phase 13
+    "verify_identity": "/verify-identity",
+    "list_appointments": "/appointments",
+    "reschedule_appointment": "/reschedule",
+    "cancel_appointment": "/cancel",
+    "request_refill": "/staff-tasks",
+    "get_clinic_info": "/clinic-info",
 }
+
+# Tools whose arguments the REDUCER completes from CallState — the caller's number (from the
+# SIP ANI) and the date of birth the API has already matched. The model never sees or supplies
+# either, so no prompt injection can redirect a lookup at another patient's chart.
+CALLER_SCOPED_TOOLS = frozenset({
+    "verify_identity", "list_appointments", "reschedule_appointment",
+    "cancel_appointment", "request_refill", "confirm_booking",
+})
+
+# Tools that must not execute until `CallState.identity_verified` is true. `verify_identity` is
+# obviously not in the set — it is how the flag gets set. `confirm_booking` is not either: a
+# NEW appointment discloses nothing, and requiring verification to book would lock out every
+# first-time caller.
+#
+# This is the in-process half of a two-layer gate. The API re-verifies (phone, DOB) on every
+# one of these calls regardless, because the flag lives in a process driven by a language
+# model, and a language model is not a security boundary.
+VERIFICATION_REQUIRED_TOOLS = frozenset({
+    "list_appointments", "reschedule_appointment", "cancel_appointment", "request_refill",
+})
 
 
 async def execute_tool(
@@ -270,7 +405,58 @@ async def execute_tool(
             date_of_birth=args.get("date_of_birth"),
             new_patient=args.get("new_patient"),
             symptom_notes=symptom_notes,
+            phone=args.get("phone"),
         )
+    elif name == "verify_identity":
+        # PHI minimization: the DOB is the verification secret. Log only that one was supplied.
+        logger.info(
+            f"TOOL ▶ POST /verify-identity req={{phone={_redact_phone(args.get('phone'))}, "
+            f"dob={'set' if args.get('date_of_birth') else 'unset'}}}"
+        )
+        result = await client.verify_identity(
+            phone=args.get("phone", ""), date_of_birth=args.get("date_of_birth", "")
+        )
+    elif name == "list_appointments":
+        logger.info(f"TOOL ▶ POST /appointments req={{phone={_redact_phone(args.get('phone'))}}}")
+        result = await client.list_appointments(
+            phone=args.get("phone", ""), date_of_birth=args.get("date_of_birth", "")
+        )
+    elif name == "reschedule_appointment":
+        logger.info(
+            f"TOOL ▶ POST /reschedule req={{confirmation_id={args.get('confirmation_id')!r}, "
+            f"new_slot_id={args.get('new_slot_id')!r}}}"
+        )
+        result = await client.reschedule_appointment(
+            confirmation_id=args.get("confirmation_id", ""),
+            new_slot_id=args.get("new_slot_id"),
+            phone=args.get("phone", ""),
+            date_of_birth=args.get("date_of_birth", ""),
+        )
+    elif name == "cancel_appointment":
+        logger.info(
+            f"TOOL ▶ POST /cancel req={{confirmation_id={args.get('confirmation_id')!r}}}"
+        )
+        result = await client.cancel_appointment(
+            confirmation_id=args.get("confirmation_id", ""),
+            phone=args.get("phone", ""),
+            date_of_birth=args.get("date_of_birth", ""),
+            reason=args.get("reason"),
+        )
+    elif name == "request_refill":
+        # The medication name is clinical detail; log its presence, not the drug.
+        logger.info(
+            f"TOOL ▶ POST /staff-tasks req={{kind='refill', "
+            f"medication={'set' if args.get('medication') else 'unset'}}}"
+        )
+        result = await client.request_refill(
+            phone=args.get("phone", ""),
+            date_of_birth=args.get("date_of_birth", ""),
+            medication=args.get("medication", ""),
+            notes=args.get("notes"),
+        )
+    elif name == "get_clinic_info":
+        logger.info(f"TOOL ▶ GET /clinic-info req={{topic={args.get('topic')!r}}}")
+        result = await client.clinic_info(topic=args.get("topic"))
     else:
         logger.warning(f"TOOL ▶ unknown tool {name!r} requested by the model")
         return {"ok": False, "error": f"unknown tool {name}"}, 0.0, None
@@ -321,6 +507,25 @@ def _log_tool_result(
             f"TOOL ▶ POST /confirm-booking → BOOKED confirmation_id={result['confirmation_id']} "
             f"{result['display_time']} with {result['provider_name']} for {result['patient_name']}"
         )
+    elif name == "verify_identity":
+        logger.info("TOOL ▶ POST /verify-identity → VERIFIED (caller matched a patient on file)")
+    elif name == "list_appointments":
+        logger.info(f"TOOL ▶ POST /appointments → {result['count']} upcoming")
+    elif name == "reschedule_appointment":
+        logger.info(
+            f"TOOL ▶ POST /reschedule → moved {result['confirmation_id']} to "
+            f"{result['display_time']} with {result['provider_name']}"
+        )
+    elif name == "cancel_appointment":
+        logger.info(f"TOOL ▶ POST /cancel → cancelled {result['confirmation_id']}")
+    elif name == "request_refill":
+        logger.info(
+            f"TOOL ▶ POST /staff-tasks → refill task {result['task_id']} OPEN for staff "
+            "(the agent does not approve refills)"
+        )
+    elif name == "get_clinic_info":
+        found = "hit" if result.get("content") else "miss"
+        logger.info(f"TOOL ▶ GET /clinic-info → {found} topic={result.get('topic')!r}")
 
 
 def register_scheduling_functions(
@@ -347,31 +552,10 @@ def register_scheduling_functions(
         llm.register_function(tool_name, _handler(tool_name))
 
 
-def build_tools_schema(intent: "Intent | None" = None) -> ToolsSchema:
-    """The tool/function schema the LLM is allowed to call, scoped to the caller's intent.
-
-    Phase 12 added the scoping. Through Phase 11 every turn carried all three schemas (2,951
-    characters) whatever the caller wanted, which costs tokens on every request and — the part
-    that actually matters — costs accuracy: a model shown a booking tool while the caller is
-    asking about a bill has an option it should not have. Smaller schemas measurably improve
-    both latency and tool-selection accuracy.
-
-    ``intent=None`` (turn one, before the classifier has answered) gets the full set, matching
-    ``prompts.build_system_prompt``: this is a scheduling line, so being briefly over-equipped
-    beats being under-equipped on the caller's opening sentence.
-
-    Every non-scheduling intent gets **no tools at all**. That is the point rather than a
-    limitation — those flows end in a hand-off, and a model with no tools cannot invent a
-    booking for someone who called about a prescription.
-    """
-    from .intents import Intent as _Intent
-
-    if intent is not None and intent is not _Intent.SCHEDULE_APPOINTMENT:
-        return ToolsSchema(standard_tools=[])
-
+def _booking_tools() -> list[FunctionSchema]:
+    """The three tools that book a NEW appointment. Unchanged since Phase 2."""
     reasons_list = "/".join(REASON_CATEGORIES)
-    return ToolsSchema(
-        standard_tools=[
+    return [
             FunctionSchema(
                 name="check_availability",
                 description=(
@@ -468,4 +652,177 @@ def build_tools_schema(intent: "Intent | None" = None) -> ToolsSchema:
                 required=["hold_id", "patient_name", "reason"],
             ),
         ]
+
+
+def _caller_tools() -> list[FunctionSchema]:
+    """Phase 13 — the tools that touch an EXISTING patient's appointments.
+
+    Two things are deliberately absent from every schema below: the caller's phone number and
+    their date of birth. Both are injected by the reducer from CallState, so the model cannot
+    supply them, cannot be argued into supplying different ones, and never has to ask the
+    caller for a number the agent is already connected to.
+    """
+    return [
+        FunctionSchema(
+            name="verify_identity",
+            description=(
+                "Check the date of birth the caller just spoke against the clinic's records "
+                "for this phone number. Call this BEFORE any tool that reads or changes an "
+                "existing appointment — those will refuse until it succeeds. Ask for the date "
+                "of birth in a natural sentence first. If it fails, you may ask once more in "
+                "case you misheard, then offer to pass them to a staff member. NEVER say "
+                "whether the number is on file, and never guess or read back a date of birth."
+            ),
+            properties={
+                "date_of_birth": {
+                    "type": "string",
+                    "description": (
+                        "The date of birth the caller just spoke, normalized to MM/DD/YYYY "
+                        "(e.g. 'March 15th 1990' -> '03/15/1990')."
+                    ),
+                }
+            },
+            required=["date_of_birth"],
+        ),
+        FunctionSchema(
+            name="list_appointments",
+            description=(
+                "List this caller's upcoming appointments. Requires verify_identity to have "
+                "succeeded first. Each result has a confirmation_id (internal — never read it "
+                "out unless the caller asks for their confirmation number) and a spoken "
+                "display_time. If the list is empty, say you don't see anything upcoming and "
+                "offer to book."
+            ),
+            properties={},
+            required=[],
+        ),
+        FunctionSchema(
+            name="reschedule_appointment",
+            description=(
+                "Move an existing appointment to a different open slot. Requires "
+                "verify_identity first. Steps, in order: list_appointments to find the "
+                "confirmation_id, check_availability for the caller's new preferred day, read "
+                "the new time back and get an explicit yes, THEN call this. If it fails "
+                "because the slot was taken, the original appointment is still intact — say "
+                "so and offer another time."
+            ),
+            properties={
+                "confirmation_id": {
+                    "type": "string",
+                    "description": "confirmation_id of the appointment to move, from list_appointments.",
+                },
+                "new_slot_id": {
+                    "type": "integer",
+                    "description": "slot_id of the new time, from check_availability.",
+                },
+            },
+            required=["confirmation_id", "new_slot_id"],
+        ),
+        FunctionSchema(
+            name="cancel_appointment",
+            description=(
+                "Cancel an existing appointment. Requires verify_identity first. Read the "
+                "appointment back and get an explicit yes before calling — a cancellation the "
+                "caller did not mean is not recoverable by them. Offer to rebook afterwards."
+            ),
+            properties={
+                "confirmation_id": {
+                    "type": "string",
+                    "description": "confirmation_id of the appointment to cancel, from list_appointments.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short reason if the caller volunteers one. Do not press for it.",
+                },
+            },
+            required=["confirmation_id"],
+        ),
+        FunctionSchema(
+            name="request_refill",
+            description=(
+                "Send a prescription refill request to clinic staff. Requires verify_identity "
+                "first. This creates a task for a human — it does NOT approve anything. Tell "
+                "the caller a staff member will review it and follow up; never say the refill "
+                "is approved, is on its way, or is appropriate, and never discuss the "
+                "medication itself."
+            ),
+            properties={
+                "medication": {
+                    "type": "string",
+                    "description": "The medication as the caller named it. Do not correct or expand it.",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "One short sentence if the caller added something (pharmacy, urgency).",
+                },
+            },
+            required=["medication"],
+        ),
+    ]
+
+
+def _clinic_info_tool() -> FunctionSchema:
+    return FunctionSchema(
+        name="get_clinic_info",
+        description=(
+            "Look up a curated clinic fact — hours, location, parking, providers, "
+            "appointment_prep, or insurance. This is the ONLY source you may speak these from: "
+            "if it returns no content, say a staff member can confirm and offer to help with "
+            "an appointment. Never invent an address, a phone number, or a provider."
+        ),
+        properties={
+            "topic": {
+                "type": "string",
+                "enum": ["hours", "location", "parking", "providers", "appointment_prep",
+                         "insurance"],
+                "description": "Which fact the caller asked for.",
+            }
+        },
+        required=["topic"],
     )
+
+
+def build_tools_schema(intent: "Intent | None" = None) -> ToolsSchema:
+    """The tool/function schema the LLM is allowed to call, scoped to the caller's intent.
+
+    Phase 12 added the scoping. Through Phase 11 every turn carried all three schemas whatever
+    the caller wanted, which costs tokens on every request and — the part that actually matters
+    — costs accuracy: a model shown a booking tool while the caller is asking about a bill has
+    an option it should not have.
+
+    Phase 13 made the scoping load-bearing rather than merely efficient. There are nine tools
+    now, five of which touch an existing patient's record, and the sets below are what keep
+    `request_refill` invisible during a booking and `hold_slot` invisible during a
+    cancellation. An intent that this build cannot complete still gets NO tools — a model with
+    no tools cannot invent an outcome for a caller it cannot actually help.
+
+    ``intent=None`` (turn one, before the classifier has answered) gets the booking set plus
+    clinic info: this is a scheduling line, so being briefly over-equipped beats being
+    under-equipped on the caller's opening sentence.
+    """
+    from .intents import Intent as _Intent
+
+    booking = _booking_tools()
+    caller = _caller_tools()
+    by_name = {t.name: t for t in booking + caller}
+    info = _clinic_info_tool()
+
+    def pick(*names: str) -> list[FunctionSchema]:
+        return [by_name[n] for n in names]
+
+    if intent is None or intent is _Intent.SCHEDULE_APPOINTMENT:
+        tools = booking + [info]
+    elif intent is _Intent.RESCHEDULE_APPOINTMENT:
+        # check_availability comes along: a reschedule needs a new time to move to.
+        tools = pick("verify_identity", "list_appointments", "check_availability",
+                     "reschedule_appointment") + [info]
+    elif intent is _Intent.CANCEL_APPOINTMENT:
+        tools = pick("verify_identity", "list_appointments", "cancel_appointment")
+    elif intent is _Intent.MEDICATION_REFILL:
+        tools = pick("verify_identity", "request_refill")
+    elif intent is _Intent.HOURS_LOCATION:
+        tools = [info]
+    else:
+        tools = []
+
+    return ToolsSchema(standard_tools=tools)

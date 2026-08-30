@@ -44,6 +44,7 @@ class ToolExecutor:
         self._emit = emit
         self._collector = collector
         self._tasks: dict[str, asyncio.Task] = {}
+        self._memory_task: asyncio.Task | None = None
 
     def invoke(self, tool_call_id: str, name: str, arguments: dict[str, Any]) -> None:
         """Start a tool call. Returns immediately; the result arrives as an event."""
@@ -82,7 +83,41 @@ class ToolExecutor:
             )
         )
 
+    def load_caller_memory(self, phone: str) -> None:
+        """Look up caller memory by ANI, off the critical path (Phase 13).
+
+        Deliberately not awaited anywhere: the greeting is already being spoken when this
+        starts, and the result arrives as a ``CallerMemoryLoaded`` event whenever it arrives.
+        A failure is not surfaced to the caller — an unrecognised returning caller is a
+        slightly colder greeting, while a greeting that waits on a database is dead air.
+        """
+        if self._memory_task is not None:
+            return
+        self._memory_task = asyncio.create_task(self._load_memory(phone), name="caller-memory")
+
+    async def _load_memory(self, phone: str) -> None:
+        t0 = time.monotonic()
+        try:
+            result = await self._client.caller_memory(phone=phone)
+        except Exception as exc:  # noqa: BLE001 - never let memory take down a call
+            logger.warning(f"[memory] lookup failed: {exc}")
+            result = {"ok": False, "known": False, "upcoming_appointments": 0}
+        latency_ms = (time.monotonic() - t0) * 1000
+        logger.info(
+            f"[memory] caller lookup in {latency_ms:.0f} ms → "
+            f"known={result.get('known')} upcoming={result.get('upcoming_appointments')}"
+        )
+        self._emit(
+            ev.CallerMemoryLoaded(
+                t=time.monotonic(),
+                known=bool(result.get("known")),
+                upcoming_appointments=int(result.get("upcoming_appointments") or 0),
+            )
+        )
+
     async def aclose(self) -> None:
+        if self._memory_task is not None and not self._memory_task.done():
+            self._memory_task.cancel()
         for task in list(self._tasks.values()):
             task.cancel()
         self._tasks.clear()

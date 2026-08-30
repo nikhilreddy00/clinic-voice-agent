@@ -103,6 +103,25 @@ class CallState:
     emergency: bool = False
     emergency_category: str = ""
 
+    # --- caller identity + memory (Phase 13) --------------------------------------------
+    # The ANI, from the SIP participant. Empty on the local path. Present from CallerPresent
+    # onwards, so it is available before the greeting finishes.
+    caller_phone: str = ""
+    # What the pre-greeting memory lookup found. Deliberately NOT a name: the lookup happens
+    # before anyone has proved who they are, and a phone can be in anyone's hand.
+    caller_known: bool = False
+    upcoming_appointments: int = 0
+
+    # The hard gate. No tool in scheduling_tools.VERIFICATION_REQUIRED_TOOLS executes while
+    # this is false — the reducer refuses the call outright rather than sending it, so an
+    # unverified caller's request never becomes an HTTP request at all.
+    identity_verified: bool = False
+    # The date of birth the API has already matched, re-sent on every subsequent PHI call so
+    # the server can re-verify without the model handling it again. In memory only: never
+    # logged, never traced, never spoken back.
+    verified_dob: str = ""
+    patient_name: str = ""
+
     # --- counters / outcome -------------------------------------------------------------
     turn_index: int = 0
     interruptions: int = 0

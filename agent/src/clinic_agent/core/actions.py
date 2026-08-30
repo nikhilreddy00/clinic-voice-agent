@@ -40,6 +40,11 @@ class StartLLM(Action):
     tier: Tier = Tier.STANDARD
     intent: Intent | None = None
     routing_reason: str = ""
+    # Phase 13: per-CALL context appended to the per-INTENT system prompt — whether this number
+    # is on file, and whether a date of birth has been matched. It lives on the action rather
+    # than in the adapter because it is a state-derived fact, so a replayed trace reproduces
+    # exactly the instructions the model was given about who it was talking to.
+    context_note: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +94,18 @@ class InvokeTool(Action):
     tool_call_id: str
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class LoadCallerMemory(Action):
+    """Look this number up, in parallel with the greeting (Phase 13).
+
+    An action rather than something the session does on its own, so the lookup and its timing
+    are visible in a replayed trace like everything else. Fire-and-forget by design: the
+    greeting never waits on it.
+    """
+
+    phone: str
 
 
 @dataclass(frozen=True, slots=True)

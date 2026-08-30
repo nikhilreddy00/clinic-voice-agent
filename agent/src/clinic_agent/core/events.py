@@ -69,8 +69,30 @@ class CallerPresent(Event):
     """
 
     participant_id: str = ""
+    # The caller's number (E.164) from the SIP participant, empty on the local path. Phase 13
+    # uses it to look up caller memory and to scope every verified tool call. It is NEVER
+    # asked of the caller and never read back to them.
+    phone: str = ""
 
     kind: ClassVar[str] = "CallerPresent"
+
+
+@dataclass(frozen=True, slots=True)
+class CallerMemoryLoaded(Event):
+    """The caller-memory lookup for this ANI came back (Phase 13).
+
+    Fired in parallel with the greeting, never awaited: the greeting is deterministic and must
+    not wait on a database, so "welcome back" costs the caller no added latency and a memory
+    lookup that fails or is slow simply means the agent greets the way it always did.
+
+    Carries no identity on purpose — see the API's /caller-memory docstring. Recognising a
+    number is not authentication, and this event exists before anyone has verified anything.
+    """
+
+    known: bool = False
+    upcoming_appointments: int = 0
+
+    kind: ClassVar[str] = "CallerMemoryLoaded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +315,7 @@ _EVENT_TYPES: dict[str, type[Event]] = {
     for cls in (
         CallStarted,
         CallerPresent,
+        CallerMemoryLoaded,
         Hangup,
         SpeechStarted,
         SpeechStopped,

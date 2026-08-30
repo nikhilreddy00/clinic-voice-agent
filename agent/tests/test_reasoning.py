@@ -230,7 +230,7 @@ def test_slot_filling_answers_do_not_strip_the_scheduling_tools():
         produced = d.send(ev.FinalTranscript(text=answer))
         start = next(a for a in produced if isinstance(a, StartLLM))
         assert start.intent is Intent.SCHEDULE_APPOINTMENT, f"lost the intent on {answer!r}"
-        assert len(build_tools_schema(start.intent).standard_tools) == 3
+        assert "hold_slot" in {t.name for t in build_tools_schema(start.intent).standard_tools}
         d.send(ev.IntentClassified(intent=classified, confidence=confidence))
         assert d.state.intent is Intent.SCHEDULE_APPOINTMENT
 
@@ -246,7 +246,10 @@ def test_a_real_topic_shift_still_switches_the_flow():
     d.send(ev.IntentClassified(intent="medication_refill", confidence=0.93))
 
     assert d.state.intent is Intent.MEDICATION_REFILL
-    assert build_tools_schema(d.state.intent).standard_tools == []
+    # Phase 13: a refill has real tools now, but never the booking ones — the point of the
+    # scoping is that the flow the caller switched INTO is the only one on offer.
+    names = {t.name for t in build_tools_schema(d.state.intent).standard_tools}
+    assert names == {"verify_identity", "request_refill"}
 
 
 def test_a_classifier_failure_never_costs_the_caller_a_turn():
@@ -343,20 +346,45 @@ def test_cache_viability_is_a_property_of_the_model():
 # --- prompt and tool scoping --------------------------------------------------------------------
 
 
-def test_non_scheduling_intents_get_no_tools_at_all():
-    """A model with no booking tool cannot invent a booking for a caller asking about a bill."""
-    for intent in (Intent.BILLING_QUESTION, Intent.MEDICATION_REFILL, Intent.TEST_RESULTS):
+def test_intents_this_build_cannot_complete_get_no_tools_at_all():
+    """A model with no tools cannot invent an outcome for a caller it cannot actually help."""
+    for intent in (Intent.BILLING_QUESTION, Intent.TEST_RESULTS, Intent.SPEAK_TO_HUMAN,
+                   Intent.UNKNOWN):
         assert build_tools_schema(intent).standard_tools == []
 
 
 def test_scheduling_keeps_the_full_tool_set():
     names = {t.name for t in build_tools_schema(Intent.SCHEDULE_APPOINTMENT).standard_tools}
-    assert names == {"check_availability", "hold_slot", "confirm_booking"}
+    assert names == {"check_availability", "hold_slot", "confirm_booking", "get_clinic_info"}
+
+
+def test_no_flow_is_offered_another_flows_tools():
+    """The Phase-13 point: nine tools exist, and each flow sees only its own.
+
+    A booking caller who is shown request_refill has an option they should not have, and a
+    caller cancelling an appointment does not need a hold.
+    """
+    def names(intent):
+        return {t.name for t in build_tools_schema(intent).standard_tools}
+
+    assert "request_refill" not in names(Intent.SCHEDULE_APPOINTMENT)
+    assert "hold_slot" not in names(Intent.CANCEL_APPOINTMENT)
+    assert "cancel_appointment" not in names(Intent.SCHEDULE_APPOINTMENT)
+    assert names(Intent.RESCHEDULE_APPOINTMENT) >= {
+        "verify_identity", "list_appointments", "check_availability", "reschedule_appointment"
+    }
+    # Every flow that touches an existing record can verify; nothing else needs to.
+    for intent in (Intent.RESCHEDULE_APPOINTMENT, Intent.CANCEL_APPOINTMENT,
+                   Intent.MEDICATION_REFILL):
+        assert "verify_identity" in names(intent)
+    assert "verify_identity" not in names(Intent.SCHEDULE_APPOINTMENT)
 
 
 def test_an_unclassified_turn_is_over_equipped_not_under_equipped():
     """Turn one has no intent yet; on a scheduling line, that default is the safe direction."""
-    assert len(build_tools_schema(None).standard_tools) == 3
+    assert {t.name for t in build_tools_schema(None).standard_tools} == {
+        "check_availability", "hold_slot", "confirm_booking", "get_clinic_info"
+    }
 
 
 def test_intent_scoping_shrinks_non_booking_prompts():
@@ -368,11 +396,21 @@ def test_intent_scoping_shrinks_non_booking_prompts():
     intent had flipped to clinical_question, i.e. exactly the prompt that used to lack the rule.
     Paying ~400 chars on every turn to make the anti-fabrication guard unconditional is the
     trade this test is asserting, not a regression to squeeze back out.
+
+    Phase 13 split the non-booking intents in two. A HAND-OFF intent still gets only the core
+    prompt plus a few lines, because there is nothing for it to do. An intent this build can
+    now COMPLETE (reschedule, cancel, refill) carries its flow rules and the verification
+    block, so it is bigger — and still less than half a booking prompt.
     """
     sizes = prompt_sizes()
     assert sizes["schedule_appointment"] > 9000, "booking rules are load-bearing; do not shrink"
-    for intent in ("billing_question", "hours_location", "medication_refill", "test_results"):
+    for intent in ("billing_question", "hours_location", "test_results", "speak_to_human"):
         assert sizes[intent] < 2900, f"{intent} prompt is {sizes[intent]} chars"
+    for intent in ("medication_refill", "cancel_appointment", "reschedule_appointment"):
+        assert sizes[intent] * 2 < sizes["schedule_appointment"], (
+            f"{intent} prompt is {sizes[intent]} chars — a completed flow should still be far "
+            "cheaper than the full booking prompt"
+        )
     # The reduction that matters is still large: a hand-off turn is under a third of a booking.
     assert max(sizes[i] for i in ("billing_question", "test_results")) * 3 < sizes["schedule_appointment"]
 

@@ -244,7 +244,7 @@ class LiveKitMedia(MediaAdapter):
                 self._stream_tasks.append(
                     asyncio.create_task(self._consume(track), name="livekit-audio-in")
                 )
-                self._announce(participant.identity)
+                self._announce(participant)
 
         @self._room.on("participant_connected")
         def _on_join(participant) -> None:  # noqa: ANN001
@@ -272,10 +272,28 @@ class LiveKitMedia(MediaAdapter):
         for participant in self._room.remote_participants.values():
             for publication in participant.track_publications.values():
                 if publication.subscribed and publication.kind == rtc.TrackKind.KIND_AUDIO:
-                    self._announce(participant.identity)
+                    self._announce(participant)
                     break
 
-    def _announce(self, identity: str) -> None:
+    @staticmethod
+    def _caller_number(participant) -> str:  # noqa: ANN001
+        """The caller's number (ANI) from the SIP participant, or "" if this isn't a SIP call.
+
+        LiveKit's SIP bridge puts it in the participant attributes; the identity is a fallback
+        because it is conventionally ``sip_<number>``. Empty is a normal outcome (a WebRTC test
+        client, a carrier withholding caller ID) and every consumer treats it as "unknown
+        caller" — never as an error, and never as a reason to ask the caller for their number.
+        """
+        attrs = getattr(participant, "attributes", None) or {}
+        number = attrs.get("sip.phoneNumber") or attrs.get("sip.from_number") or ""
+        if not number:
+            identity = getattr(participant, "identity", "") or ""
+            if identity.startswith("sip_"):
+                number = identity[4:]
+        number = number.strip()
+        return number if number.startswith("+") else ""
+
+    def _announce(self, participant) -> None:  # noqa: ANN001
         """Emit CallerPresent — the event that triggers the greeting — once, and not too early.
 
         This used to fire on `participant_connected`, which is signalling only: the participant
@@ -293,12 +311,21 @@ class LiveKitMedia(MediaAdapter):
         if self._announced:
             return
         self._announced = True
+        identity = getattr(participant, "identity", "") or ""
+        phone = self._caller_number(participant)
         settle_ms = float(os.getenv("CLINIC_GREETING_SETTLE_MS", "400"))
-        logger.info(f"[telephony] audio path up for {identity}; greeting in {settle_ms:.0f} ms")
+        # Last four digits only: the ANI is an identifier and this line goes to the console.
+        masked = f"***{phone[-4:]}" if phone else "withheld"
+        logger.info(
+            f"[telephony] audio path up for {identity} (caller {masked}); "
+            f"greeting in {settle_ms:.0f} ms"
+        )
 
         async def _greet_when_ready() -> None:
             await asyncio.sleep(settle_ms / 1000.0)
-            self._emit(ev.CallerPresent(t=time.monotonic(), participant_id=identity))
+            self._emit(
+                ev.CallerPresent(t=time.monotonic(), participant_id=identity, phone=phone)
+            )
 
         self._stream_tasks.append(
             asyncio.create_task(_greet_when_ready(), name="livekit-greeting-settle")

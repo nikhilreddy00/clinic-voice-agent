@@ -237,6 +237,11 @@ async def _execute_tool(name: str, args: dict, client: SchedulingClient, trace: 
             hold_id=args.get("hold_id"), patient_name=args.get("patient_name"),
             reason=args.get("reason"),
         )
+    elif name == "get_clinic_info":
+        # Phase 13 put a curated fact lookup in the scheduling tool set, so a case can ask
+        # about hours or parking mid-booking. Dispatched here for the same reason as the rest:
+        # the eval must exercise the tools the live agent is actually given, not a subset.
+        result = await client.clinic_info(topic=args.get("topic"))
     else:
         result = {"ok": False, "error": f"unknown tool {name!r}"}
 

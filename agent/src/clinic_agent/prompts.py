@@ -321,19 +321,48 @@ _HANDOFF = (
     "no live transfer in this build — say it warmly and close."
 )
 
+_VERIFY_BLOCK = """\
+IDENTITY VERIFICATION — required before you touch an existing appointment or a prescription.
+  - You are already connected to the caller's phone number; NEVER ask for it and never read it
+    back. Ask ONLY for their date of birth, in a normal sentence ("and your date of birth?").
+  - Call verify_identity with what they say. Until it succeeds, the tools that read or change
+    an appointment will refuse — that is the system working, not an error to apologize for.
+  - Do NOT say whether the number is on file, do not say a name before verification, and never
+    read a date of birth back to the caller. If it fails, you may ask once more in case you
+    misheard, then offer to pass them to a staff member.
+"""
+
+_RESCHEDULE_BLOCK = """\
+The caller wants to MOVE an existing appointment. In order: verify their identity, call
+list_appointments and read back what you find, ask what day works better, call
+check_availability, offer the closest options, get an explicit yes to a specific new time, then
+call reschedule_appointment. If it fails because the time was just taken, their ORIGINAL
+appointment is untouched — say exactly that and offer another time.
+"""
+
+_CANCEL_BLOCK = """\
+The caller wants to CANCEL an existing appointment. In order: verify their identity, call
+list_appointments, read back the appointment you are about to cancel, and get an explicit yes
+before calling cancel_appointment. Do not cancel on an ambiguous answer. Afterwards, offer to
+book a new time — do not press if they decline.
+"""
+
+_REFILL_BLOCK = """\
+The caller wants a prescription refill. You must NEVER approve or deny one, say it is on its
+way, or discuss whether the medication is appropriate — that is practising medicine. Verify
+their identity, ask which medication (their words, do not correct them), call request_refill,
+and tell them a staff member will review it and follow up. If they describe symptoms or ask
+whether they should keep taking something, that is for a clinician.
+"""
+
+_INFO_BLOCK = """\
+The caller wants clinic information. Call get_clinic_info for the topic they asked about and
+speak ONLY what it returns. If it has no content for that topic, say a staff member can confirm
+the detail and offer to help with an appointment — a wrong address sends a sick person to the
+wrong place. Never invent hours, an address, directions, or a price.
+"""
+
 _INTENT_FRAGMENTS: dict[Intent, str] = {
-    Intent.RESCHEDULE_APPOINTMENT: (
-        "The caller wants to change an EXISTING appointment. You cannot look up or modify "
-        f"existing bookings in this build. {_HANDOFF}"
-    ),
-    Intent.CANCEL_APPOINTMENT: (
-        "The caller wants to cancel an existing appointment. You cannot look up or modify "
-        f"existing bookings in this build. {_HANDOFF}"
-    ),
-    Intent.MEDICATION_REFILL: (
-        "The caller wants a prescription refill. You must NEVER approve, deny, or discuss the "
-        f"appropriateness of a medication. {_HANDOFF}"
-    ),
     Intent.BILLING_QUESTION: (
         f"The caller has a billing or payment question. You have no access to billing. {_HANDOFF}"
     ),
@@ -347,13 +376,9 @@ _INTENT_FRAGMENTS: dict[Intent, str] = {
         f"information and you must NOT read out or confirm any of them. {_HANDOFF}"
     ),
     Intent.INSURANCE_VERIFICATION: (
-        "The caller is asking about insurance coverage. You have no coverage data and must not "
-        f"guess which plans are accepted. {_HANDOFF}"
-    ),
-    Intent.HOURS_LOCATION: (
-        "The caller wants hours, the address, or directions. You do NOT have these facts and "
-        "must not invent them — a wrong address sends a sick person to the wrong place. Say a "
-        "staff member can confirm the details, and offer to book an appointment."
+        "The caller is asking about insurance coverage. You may state the clinic's general "
+        "policy from get_clinic_info, but you have no coverage data for a specific plan and "
+        f"must not guess. {_HANDOFF}"
     ),
     Intent.SPEAK_TO_HUMAN: (
         "The caller has asked for a person. Do not try to talk them out of it or resolve the "
@@ -430,6 +455,17 @@ def build_system_prompt(
 
     if intent is None or intent is Intent.SCHEDULE_APPOINTMENT:
         parts.append(_BOOKING_BLOCK)
+    elif intent is Intent.RESCHEDULE_APPOINTMENT:
+        parts.append(_VERIFY_BLOCK)
+        parts.append(_RESCHEDULE_BLOCK)
+    elif intent is Intent.CANCEL_APPOINTMENT:
+        parts.append(_VERIFY_BLOCK)
+        parts.append(_CANCEL_BLOCK)
+    elif intent is Intent.MEDICATION_REFILL:
+        parts.append(_VERIFY_BLOCK)
+        parts.append(_REFILL_BLOCK)
+    elif intent is Intent.HOURS_LOCATION:
+        parts.append(_INFO_BLOCK)
     elif intent is Intent.EMERGENCY:
         # Recorded for completeness. The emergency path is scripted and never reaches a model
         # (core/intent.detect_emergency), so this prompt is not used on that path.
@@ -462,3 +498,49 @@ def prompt_sizes(now: _datetime | None = None) -> dict[str, int]:
 # from docs/build_spec.md (intent -> name -> reason -> offer -> confirm -> book -> close),
 # the scheduling-API tool-calling rules, date grounding, PHI minimization, and human escalation.
 # That builder is what pipeline.py passes to the LLM; there is no separate static full prompt.
+
+
+# --- Phase 13: per-call caller context ---------------------------------------------------
+
+
+def caller_context_note(
+    *, known: bool, upcoming: int, verified: bool, patient_name: str = ""
+) -> str:
+    """The one part of the prompt that is about THIS caller. Built from state by the reducer.
+
+    What it deliberately does NOT contain, before verification, is a name. The clinic knows
+    whose number this is; it does not know who is holding the phone. Greeting an unverified
+    caller by name is a disclosure to whoever picked it up — a spouse, a new owner of a recycled
+    number, someone who stole the handset — and it is the exact failure the verification gate
+    exists to prevent, arriving one turn earlier and dressed up as good service.
+
+    So a returning caller gets warmth ("you've reached us before") with no identity attached,
+    and the name appears only after the date of birth has matched.
+    """
+    # Nothing to say about a first-time caller: that is the case the prompt already describes,
+    # and an empty note keeps those turns byte-identical to a pre-Phase-13 call.
+    if not (known or verified):
+        return ""
+
+    lines = ["CALLER CONTEXT (from this call's phone number — not proof of identity):"]
+    if known:
+        lines.append(
+            "  - This number has reached the clinic before. You may say so warmly, but you must "
+            "NOT use the caller's name or mention any appointment until identity is verified."
+        )
+        if upcoming:
+            lines.append(
+                f"  - There {'is' if upcoming == 1 else 'are'} {upcoming} upcoming "
+                f"appointment{'' if upcoming == 1 else 's'} on this number. Do NOT state the "
+                "time, the provider, or that it exists until verify_identity has succeeded."
+            )
+    else:
+        lines.append("  - This number is not on file. Treat the caller as new.")
+
+    if verified:
+        lines.append(
+            "  - IDENTITY VERIFIED for this call. You may now use their appointment details, "
+            + (f"and their name is {patient_name}. " if patient_name else "")
+            + "Do not ask for the date of birth again."
+        )
+    return "\n".join(lines) + "\n"

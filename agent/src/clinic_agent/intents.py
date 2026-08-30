@@ -40,9 +40,17 @@ SCHEDULING_INTENTS = frozenset(
 
 # Intents this build can actually complete end to end. Everything else is a routing decision:
 # the agent says what it can do and hands off, rather than improvising a capability it lacks.
-# Reschedule and cancel are NOT here — the tools for them arrive in Phase 13, and an agent that
-# confidently "cancels" an appointment it cannot touch is worse than one that says it can't.
-HANDLED_INTENTS = frozenset({Intent.SCHEDULE_APPOINTMENT, Intent.HOURS_LOCATION})
+#
+# Phase 13 added reschedule, cancel, and refill: each has real tools behind it now, and each is
+# gated on identity verification. Refill counts as "handled" in the only sense an automated
+# system may claim — the request reaches a human. The agent never approves one.
+HANDLED_INTENTS = frozenset({
+    Intent.SCHEDULE_APPOINTMENT,
+    Intent.RESCHEDULE_APPOINTMENT,
+    Intent.CANCEL_APPOINTMENT,
+    Intent.MEDICATION_REFILL,
+    Intent.HOURS_LOCATION,
+})
 
 # Below this the classifier is guessing. The reducer asks a clarifying question instead of
 # committing to a flow — a wrong intent silently sends the caller down the wrong script.

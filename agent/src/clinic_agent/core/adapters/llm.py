@@ -133,6 +133,7 @@ class AnthropicLLM:
         tier: Tier = Tier.STANDARD,
         intent: Intent | None = None,
         routing_reason: str = "",
+        context_note: str = "",
     ) -> None:
         """Kick off a streaming request. Returns immediately; results arrive as events."""
         if request_id in self._tasks:
@@ -148,7 +149,8 @@ class AnthropicLLM:
             )
         )
         self._tasks[request_id] = asyncio.create_task(
-            self._run(request_id, list(messages), decision, intent), name=f"llm-{request_id}"
+            self._run(request_id, list(messages), decision, intent, context_note),
+            name=f"llm-{request_id}",
         )
 
     def cancel(self, request_id: str) -> None:
@@ -157,10 +159,15 @@ class AnthropicLLM:
         if task is not None and not task.done():
             task.cancel()
 
-    async def _run(self, request_id, messages, decision, intent) -> None:
+    async def _run(self, request_id, messages, decision, intent, context_note="") -> None:
         self._emit(ev.LLMStarted(t=time.monotonic(), request_id=request_id))
         text_parts: list[str] = []
-        system = self._system_blocks(self._scoped_prompt(intent))
+        # The per-intent prompt is cached; the per-call context note is appended after it, so
+        # the cached part stays byte-identical across turns and only the tail varies.
+        prompt = self._scoped_prompt(intent)
+        if context_note:
+            prompt = f"{prompt}\n{context_note}"
+        system = self._system_blocks(prompt)
         try:
             async with self._client.messages.stream(
                 model=decision.model,

@@ -29,7 +29,8 @@ from dataclasses import replace
 from typing import Any
 
 from ..intents import Intent, needs_clarification, resolve_intent
-from ..prompts import EMERGENCY_RESPONSE, SYSTEM_ERROR_LINE, greeting_for
+from ..prompts import EMERGENCY_RESPONSE, SYSTEM_ERROR_LINE, caller_context_note, greeting_for
+from ..scheduling_tools import CALLER_SCOPED_TOOLS, VERIFICATION_REQUIRED_TOOLS
 from . import events as ev
 from .actions import (
     Action,
@@ -38,6 +39,7 @@ from .actions import (
     ClassifyIntent,
     EndCall,
     InvokeTool,
+    LoadCallerMemory,
     Speak,
     StartLLM,
     TransferToHuman,
@@ -154,6 +156,16 @@ def _next_request(state: CallState) -> tuple[CallState, StartLLM]:
         tier=tier,
         intent=state.intent,
         routing_reason=reason,
+        # Phase 13: what the engine knows about THIS caller that the static prompt cannot —
+        # whether the number is on file, and whether a date of birth has been matched. It is
+        # computed here, from state, so the model's instructions can never claim a caller is
+        # verified when the gate below says they are not.
+        context_note=caller_context_note(
+            known=state.caller_known,
+            upcoming=state.upcoming_appointments,
+            verified=state.identity_verified,
+            patient_name=state.patient_name,
+        ),
     )
 
 
@@ -238,8 +250,10 @@ def _on_caller_present(state: CallState, e: ev.CallerPresent):
     if state.caller_present:
         return state, []
     state, utterance_id = _open_utterance(state)
-    state = replace(state, caller_present=True, phase=Phase.GREETING)
-    return state, [
+    state = replace(
+        state, caller_present=True, phase=Phase.GREETING, caller_phone=e.phone or ""
+    )
+    actions: list[Action] = [
         Speak(
             utterance_id=utterance_id,
             text=greeting_for(state.mode),
@@ -247,6 +261,19 @@ def _on_caller_present(state: CallState, e: ev.CallerPresent):
             deterministic=True,
         )
     ]
+    # Ordered after the greeting deliberately: the lookup is fire-and-forget, and the caller
+    # hears the disclosure whether or not the database answers.
+    if e.phone:
+        actions.append(LoadCallerMemory(phone=e.phone))
+    return state, actions
+
+
+def _on_caller_memory(state: CallState, e: ev.CallerMemoryLoaded):
+    """Record what the ANI lookup found. Never changes the greeting, which has already been
+    spoken and is deterministic by governance — it scopes the model's context from turn one."""
+    return replace(
+        state, caller_known=e.known, upcoming_appointments=e.upcoming_appointments
+    ), []
 
 
 def _on_speech_started(state: CallState, e: ev.SpeechStarted):
@@ -377,6 +404,37 @@ def _on_llm_delta(state: CallState, e: ev.LLMTextDelta):
     return state, [Speak(utterance_id=utterance_id, text=c) for c in chunks]
 
 
+# What the reducer tells the model when it refuses a PHI tool. Phrased as an instruction the
+# model can act on, not an error: the recovery is to ask for the date of birth, and a bare
+# "denied" invites it to apologize and stall instead.
+_UNVERIFIED_RESULT = {
+    "ok": False,
+    "error": (
+        "identity not verified — call verify_identity with the caller's date of birth first, "
+        "then try again"
+    ),
+}
+
+
+def _scoped_arguments(state: CallState, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Complete a caller-scoped tool call from state (Phase 13).
+
+    The phone number comes from the SIP ANI and the date of birth from the value the API
+    already matched — never from the model. Anything the model *did* put in those fields is
+    overwritten rather than merged: a caller (or a transcript that happens to contain a phone
+    number) must not be able to redirect a lookup at somebody else's chart.
+    """
+    if name not in CALLER_SCOPED_TOOLS:
+        return arguments
+    scoped = dict(arguments)
+    scoped["phone"] = state.caller_phone
+    if name != "confirm_booking":
+        # confirm_booking collects the DOB from the caller as intake for a NEW appointment,
+        # so the model's value is the right one there; everywhere else it is the verified one.
+        scoped["date_of_birth"] = state.verified_dob or arguments.get("date_of_birth", "")
+    return scoped
+
+
 def _on_tool_use(state: CallState, e: ev.LLMToolUse):
     if _stale(state, e.request_id):
         return state, []
@@ -386,12 +444,36 @@ def _on_tool_use(state: CallState, e: ev.LLMToolUse):
         "name": e.name,
         "input": dict(e.arguments),
     }
+
+    # THE GATE. A tool that discloses or changes an existing patient's record does not become
+    # an HTTP request until this caller has matched a date of birth on file. The refusal is
+    # synthesized here, so the tool never runs at all — there is no request to intercept, no
+    # response to leak, and the whole decision is visible in a replayed trace.
+    if e.name in VERIFICATION_REQUIRED_TOOLS and not state.identity_verified:
+        state = replace(
+            state,
+            turn_tool_uses=state.turn_tool_uses + (block,),
+            tool_results=state.tool_results
+            + (_tool_result_block(e.tool_call_id, _UNVERIFIED_RESULT),),
+        )
+        return state, []
+
+    arguments = _scoped_arguments(state, e.name, dict(e.arguments))
+
+    # Stash the date of birth being submitted so a successful result can promote it. Only
+    # while unverified: a second verify_identity later in the call (a caller volunteering a
+    # different date, or a model retry) must not replace a DOB the API has already matched.
+    verified_dob = state.verified_dob
+    if e.name == "verify_identity" and not state.identity_verified:
+        verified_dob = str(arguments.get("date_of_birth") or "")
+
     state = replace(
         state,
         turn_tool_uses=state.turn_tool_uses + (block,),
         pending_tools=state.pending_tools + (e.tool_call_id,),
+        verified_dob=verified_dob,
     )
-    return state, [InvokeTool(tool_call_id=e.tool_call_id, name=e.name, arguments=dict(e.arguments))]
+    return state, [InvokeTool(tool_call_id=e.tool_call_id, name=e.name, arguments=arguments)]
 
 
 def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
@@ -432,6 +514,12 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
 
     if state.pending_tools:
         return replace(state, phase=Phase.TOOL_WAIT), actions
+    if state.tool_results:
+        # Every tool this turn was refused by the gate above, so no ToolCompleted will ever
+        # arrive to drain the turn. Send the refusals back now; without this the call stalls
+        # in silence with an assistant tool_use that has no matching result.
+        state, start = _flush_tool_results(state)
+        return state, actions + [start]
     if utterance_id is not None:
         return replace(state, phase=Phase.SPEAKING), actions
     return replace(state, phase=Phase.LISTENING), actions
@@ -457,6 +545,18 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
         return state, []  # stale result from a turn the caller already interrupted
 
     booked = state.booked or (e.name == "confirm_booking" and e.ok)
+
+    # The gate opens HERE and nowhere else: only the API can say a date of birth matched, and
+    # the DOB it matched is kept so every later PHI call re-sends it for server-side re-checks.
+    # `verified_dob` never leaves this process and is not written to the trace or the logs.
+    verified = state.identity_verified
+    verified_dob = state.verified_dob
+    patient_name = state.patient_name
+    if e.name == "verify_identity" and e.ok:
+        # `verified_dob` was stashed when the call was made (the API does not echo a DOB back —
+        # nothing should return the verification secret). It is inert until this line runs.
+        verified = True
+        patient_name = str(e.result.get("name") or "")
     # An empty availability window is the escalation trigger (a later successful booking
     # overrides it — see CallState.outcome).
     escalated = state.escalated or (
@@ -470,10 +570,19 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
         tool_results=state.tool_results + (_tool_result_block(e.tool_call_id, e.result),),
         booked=booked,
         escalated=escalated,
+        identity_verified=verified,
+        verified_dob=verified_dob,
+        patient_name=patient_name,
     )
     if pending:
         return state, []
 
+    state, start = _flush_tool_results(state)
+    return state, [start]
+
+
+def _flush_tool_results(state: CallState) -> tuple[CallState, StartLLM]:
+    """Hand every completed tool result back to the model and start the follow-up request."""
     blocks = _ordered_results(state, {})
     state = replace(
         state,
@@ -481,8 +590,7 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
         tool_results=(),
         committed_tool_ids=(),
     )
-    state, start = _next_request(state)
-    return state, [start]
+    return _next_request(state)
 
 
 def _on_bot_started(state: CallState, e: ev.BotStartedSpeaking):
@@ -587,6 +695,7 @@ _HANDLERS = {
     ev.UserInterrupted: _on_user_interrupted,
     ev.LLMStarted: _on_llm_started,
     ev.LLMTextDelta: _on_llm_delta,
+    ev.CallerMemoryLoaded: _on_caller_memory,
     ev.LLMToolUse: _on_tool_use,
     ev.LLMCompleted: _on_llm_completed,
     ev.LLMFailed: _on_llm_failed,
