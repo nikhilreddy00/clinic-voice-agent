@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -190,6 +191,15 @@ async def _seed(conn: AsyncConnection) -> None:
             ON CONFLICT (id) DO NOTHING
             """,
             (slot_id, clinic_id, provider_id, start, reason),
+        )
+
+    for topic, content in seed_data.CLINIC_FACTS.items():
+        await conn.execute(
+            """
+            INSERT INTO clinic_facts (clinic_id, topic, content) VALUES (%s, %s, %s)
+            ON CONFLICT (clinic_id, topic) DO UPDATE SET content = EXCLUDED.content
+            """,
+            (clinic_id, topic, content),
         )
 
     await refresh_available_slots(conn)
@@ -397,6 +407,7 @@ async def confirm_booking(
     date_of_birth: str | None = None,
     new_patient: bool | None = None,
     symptom_notes: str | None = None,
+    phone: str | None = None,
 ) -> dict[str, Any]:
     """Turn a valid, unexpired hold into a booking. Atomic across both writes.
 
@@ -439,16 +450,28 @@ async def confirm_booking(
                 "SELECT name FROM providers WHERE id = %s", (slot["provider_id"],)
             )).fetchone()
 
+            # Phase 13: the booking is what creates the patient record, so the NEXT call from
+            # this number is a returning caller. Only with a phone AND a DOB -- a patient row
+            # without a DOB can never be verified, so it would be memory that is permanently
+            # useless for anything except a name we are not allowed to speak.
+            patient_id = None
+            if phone and date_of_birth:
+                patient_id = await _upsert_patient(
+                    conn, slot["clinic_id"], phone, patient_name, date_of_birth
+                )
+
             await conn.execute(
                 """
-                INSERT INTO bookings (confirmation_id, clinic_id, slot_id, patient_name, reason,
+                INSERT INTO bookings (confirmation_id, clinic_id, slot_id, patient_id,
+                                      patient_name, reason,
                                       date_of_birth, new_patient, symptom_notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     confirmation_id,
                     slot["clinic_id"],
                     slot["slot_id"],
+                    patient_id,
                     patient_name,
                     reason,
                     date_of_birth,
@@ -563,3 +586,297 @@ async def release_idempotency_key(key: str, endpoint: str) -> None:
             """,
             (key, endpoint),
         )
+
+
+# =========================================================================================
+# PHASE 13 — caller memory, identity verification, and the expanded tool surface
+# =========================================================================================
+#
+# One rule governs everything below: **recognising a phone number is not authentication.**
+# Caller ID is trivially spoofable, so the ANI alone unlocks nothing. Every function that
+# returns or mutates PHI takes `phone` AND `date_of_birth` and re-verifies the pair here, in
+# the database layer, on every single call. The agent also holds an `identity_verified` flag
+# in CallState and refuses to invoke these tools without it — but that flag is a UX gate in a
+# process that talks to a language model, and a language model is not a security boundary.
+# This is.
+#
+# The failure mode is deliberately "no rows", not "error": a wrong DOB looks exactly like a
+# number the clinic has never seen, so an attacker learns nothing about who is a patient here.
+
+
+class NotVerified(Exception):
+    """The (phone, date_of_birth) pair does not match a patient on file. Fails closed."""
+
+
+class BookingNotFound(Exception):
+    """No confirmed booking with that confirmation id belongs to this verified patient."""
+
+
+def normalize_dob(value: str | None) -> str:
+    """Reduce a date of birth to a comparable form.
+
+    The agent normalizes speech to MM/DD/YYYY, but "03/15/1990", "3/15/1990", and "3-15-1990"
+    are the same birthday, and a caller must not fail verification over a missing leading zero
+    or a dash. Digits-only is not enough for exactly that reason ("3151990" != "03151990"), so
+    a three-part value is zero-padded to MM DD YYYY; anything else falls back to its digits.
+
+    Not a date parser on purpose. It never has to decide whether 03/04 is March or April — both
+    sides of the comparison come from the same clinic in the same format.
+    """
+    parts = [g for g in re.split(r"\D+", (value or "").strip()) if g]
+    if len(parts) == 3:
+        m, d, y = parts
+        return f"{m.zfill(2)}{d.zfill(2)}{y.zfill(4)}"
+    return "".join(parts)
+
+
+async def _upsert_patient(
+    conn: AsyncConnection, clinic_id: int, phone: str, name: str, date_of_birth: str
+) -> int:
+    """Create or refresh the patient record for a phone number. Returns patients.id."""
+    row = await (await conn.execute(
+        """
+        INSERT INTO patients (clinic_id, phone, name, date_of_birth)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (clinic_id, phone) DO UPDATE
+            SET name = EXCLUDED.name,
+                -- Never overwrite a DOB already on file: it is the verification secret, and a
+                -- later booking that mistyped it would otherwise lock the real patient out.
+                date_of_birth = COALESCE(patients.date_of_birth, EXCLUDED.date_of_birth)
+        RETURNING id
+        """,
+        (clinic_id, phone, name, date_of_birth),
+    )).fetchone()
+    return row["id"]
+
+
+async def _verify(conn: AsyncConnection, phone: str, date_of_birth: str) -> dict[str, Any]:
+    """Resolve (phone, DOB) to a patient row, or raise NotVerified. The single gate."""
+    if not phone or not normalize_dob(date_of_birth):
+        raise NotVerified("Identity not verified")
+    row = await (await conn.execute(
+        "SELECT id, name, date_of_birth FROM patients WHERE phone = %s", (phone,)
+    )).fetchone()
+    if row is None or normalize_dob(row["date_of_birth"]) != normalize_dob(date_of_birth):
+        raise NotVerified("Identity not verified")
+    return row
+
+
+async def caller_memory(phone: str) -> dict[str, Any]:
+    """What is known about a number BEFORE verification. Deliberately almost nothing.
+
+    Returns whether this number has called before and how many confirmed appointments it has —
+    enough for the agent to say "welcome back" and offer to look something up, and nothing that
+    identifies anybody. The name is NOT returned: speaking a patient's name to whoever happens
+    to be holding their phone is a disclosure, and this function runs before any verification.
+    """
+    if not phone:
+        return {"known": False, "upcoming_appointments": 0}
+    async with pool().connection() as conn:
+        row = await (await conn.execute(
+            """
+            SELECT p.id,
+                   COUNT(b.confirmation_id) FILTER (
+                       WHERE b.status = 'confirmed' AND s.start_time >= now()
+                   ) AS upcoming
+              FROM patients p
+              LEFT JOIN bookings b ON b.patient_id = p.id
+              LEFT JOIN slots s ON s.id = b.slot_id
+             WHERE p.phone = %s
+             GROUP BY p.id
+            """,
+            (phone,),
+        )).fetchone()
+    if row is None:
+        return {"known": False, "upcoming_appointments": 0}
+    return {"known": True, "upcoming_appointments": int(row["upcoming"] or 0)}
+
+
+async def verify_identity(*, phone: str, date_of_birth: str) -> dict[str, Any]:
+    """Check a spoken DOB against the patient on file for this number."""
+    async with pool().connection() as conn:
+        patient = await _verify(conn, phone, date_of_birth)
+    return {"patient_id": patient["id"], "name": patient["name"]}
+
+
+async def list_appointments(*, phone: str, date_of_birth: str) -> list[dict[str, Any]]:
+    """Upcoming confirmed appointments for a verified caller."""
+    async with pool().connection() as conn:
+        patient = await _verify(conn, phone, date_of_birth)
+        rows = await (await conn.execute(
+            """
+            SELECT b.confirmation_id, b.slot_id, b.reason, s.start_time,
+                   pr.name AS provider_name
+              FROM bookings b
+              JOIN slots s ON s.id = b.slot_id
+              JOIN providers pr ON pr.id = s.provider_id
+             WHERE b.patient_id = %s
+               AND b.status = 'confirmed'
+               AND s.start_time >= now()
+             ORDER BY s.start_time
+            """,
+            (patient["id"],),
+        )).fetchall()
+    return rows
+
+
+async def cancel_appointment(
+    *, confirmation_id: str, phone: str, date_of_birth: str, reason: str | None = None
+) -> dict[str, Any]:
+    """Cancel a verified caller's appointment and return the slot to the pool.
+
+    Idempotent by construction rather than by an idempotency key: cancelling an
+    already-cancelled booking returns the same success payload instead of a 404, because a
+    retried voice turn must not tell the caller their cancellation failed when it did not.
+    """
+    async with pool().connection() as conn:
+        async with conn.transaction():
+            patient = await _verify(conn, phone, date_of_birth)
+            booking = await (await conn.execute(
+                """
+                SELECT confirmation_id, slot_id, status
+                  FROM bookings
+                 WHERE confirmation_id = %s AND patient_id = %s
+                """,
+                (confirmation_id, patient["id"]),
+            )).fetchone()
+            if booking is None:
+                raise BookingNotFound(f"No appointment {confirmation_id} for this caller")
+            if booking["status"] == "cancelled":
+                return {"confirmation_id": confirmation_id, "status": "cancelled"}
+
+            await conn.execute(
+                "UPDATE bookings SET status = 'cancelled' WHERE confirmation_id = %s",
+                (confirmation_id,),
+            )
+            await conn.execute(
+                """
+                UPDATE slots SET status = 'available', hold_id = NULL, hold_expires_at = NULL
+                 WHERE id = %s
+                """,
+                (booking["slot_id"],),
+            )
+            if reason:
+                await conn.execute(
+                    """
+                    INSERT INTO staff_tasks (clinic_id, patient_id, kind, payload)
+                    SELECT clinic_id, %s, 'cancellation_note', %s FROM bookings
+                     WHERE confirmation_id = %s
+                    """,
+                    (patient["id"], Jsonb({"confirmation_id": confirmation_id, "reason": reason}),
+                     confirmation_id),
+                )
+    return {"confirmation_id": confirmation_id, "status": "cancelled"}
+
+
+async def reschedule_appointment(
+    *, confirmation_id: str, new_slot_id: int, phone: str, date_of_birth: str
+) -> dict[str, Any]:
+    """Move a verified caller's appointment to a different open slot.
+
+    One transaction, and the new slot is taken by the same compare-and-swap that `hold_slot`
+    uses, so a concurrent caller cannot win the same slot. There is no hold-then-book dance
+    here: the caller already has an appointment, so the failure mode a hold protects against
+    (losing the slot while reading it back) is bounded — if the swap fails, they still have
+    their original time and the agent offers another.
+
+    Idempotent: rescheduling to the slot the booking already occupies returns success.
+    """
+    async with pool().connection() as conn:
+        async with conn.transaction():
+            patient = await _verify(conn, phone, date_of_birth)
+            booking = await (await conn.execute(
+                """
+                SELECT confirmation_id, slot_id, status
+                  FROM bookings
+                 WHERE confirmation_id = %s AND patient_id = %s
+                """,
+                (confirmation_id, patient["id"]),
+            )).fetchone()
+            if booking is None or booking["status"] != "confirmed":
+                raise BookingNotFound(
+                    f"No confirmed appointment {confirmation_id} for this caller"
+                )
+            old_slot_id = booking["slot_id"]
+            if old_slot_id != new_slot_id:
+                taken = await (await conn.execute(
+                    """
+                    UPDATE slots
+                       SET status = 'booked', hold_id = NULL, hold_expires_at = NULL
+                     WHERE id = %s
+                       AND start_time >= now()
+                       AND (status = 'available'
+                            OR (status = 'held' AND hold_expires_at < now()))
+                    RETURNING id
+                    """,
+                    (new_slot_id,),
+                )).fetchone()
+                if taken is None:
+                    raise SlotUnavailable(f"Slot {new_slot_id} is not available")
+
+                await conn.execute(
+                    "UPDATE bookings SET slot_id = %s WHERE confirmation_id = %s",
+                    (new_slot_id, confirmation_id),
+                )
+                await conn.execute(
+                    """
+                    UPDATE slots SET status = 'available', hold_id = NULL, hold_expires_at = NULL
+                     WHERE id = %s
+                    """,
+                    (old_slot_id,),
+                )
+
+            row = await (await conn.execute(
+                """
+                SELECT s.id AS slot_id, s.start_time, pr.name AS provider_name
+                  FROM slots s JOIN providers pr ON pr.id = s.provider_id
+                 WHERE s.id = %s
+                """,
+                (new_slot_id,),
+            )).fetchone()
+
+    return {
+        "confirmation_id": confirmation_id,
+        "slot_id": row["slot_id"],
+        "start_time": row["start_time"],
+        "provider_name": row["provider_name"],
+    }
+
+
+async def create_staff_task(
+    *, kind: str, phone: str, date_of_birth: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Queue work for a human. The agent creates the task; it never completes it.
+
+    Refills above all: an automated system that says "your refill is approved" has practised
+    medicine. This returns a task id and nothing that resembles an approval, and the tool
+    description tells the model to say only that a staff member will follow up.
+    """
+    async with pool().connection() as conn:
+        async with conn.transaction():
+            patient = await _verify(conn, phone, date_of_birth)
+            row = await (await conn.execute(
+                """
+                INSERT INTO staff_tasks (clinic_id, patient_id, kind, payload)
+                SELECT clinic_id, id, %s, %s FROM patients WHERE id = %s
+                RETURNING id
+                """,
+                (kind, Jsonb(payload), patient["id"]),
+            )).fetchone()
+    return {"task_id": row["id"], "kind": kind, "status": "open"}
+
+
+async def clinic_info(topic: str | None = None) -> dict[str, Any]:
+    """Curated clinic facts. Not PHI, no verification — the one open tool.
+
+    An unknown topic returns the list of topics that DO exist rather than an error, so the
+    model's next move is to pick a real one instead of inventing an address.
+    """
+    async with pool().connection() as conn:
+        rows = await (await conn.execute(
+            "SELECT topic, content FROM clinic_facts ORDER BY topic"
+        )).fetchall()
+    facts = {r["topic"]: r["content"] for r in rows}
+    if topic and topic in facts:
+        return {"topic": topic, "content": facts[topic], "topics": sorted(facts)}
+    return {"topic": topic, "content": None, "topics": sorted(facts)}

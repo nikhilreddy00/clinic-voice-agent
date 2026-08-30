@@ -36,12 +36,24 @@ from fastapi.staticfiles import StaticFiles
 from . import db
 from .metrics import aggregate_metrics
 from .models import (
+    AppointmentOut,
+    AppointmentsResponse,
     AvailabilityResponse,
+    CallerMemoryResponse,
+    CancelRequest,
+    CancelResponse,
+    ClinicInfoResponse,
     ConfirmRequest,
     ConfirmResponse,
     HoldRequest,
     HoldResponse,
+    RescheduleRequest,
+    RescheduleResponse,
     SlotOut,
+    StaffTaskRequest,
+    StaffTaskResponse,
+    VerifiedRequest,
+    VerifyResponse,
 )
 from .seed_data import CLINIC_NAME
 
@@ -51,6 +63,9 @@ logger = logging.getLogger("clinic.api")
 # deployed environment: these endpoints mutate appointment state and, once Phase 13 lands
 # patient lookup, return PHI.
 API_TOKEN = os.getenv("CLINIC_API_TOKEN")
+
+# One message for every verification failure. See the Phase-13 section below.
+_NOT_VERIFIED = "Identity could not be verified"
 
 
 async def require_token(authorization: str | None = Header(None)) -> None:
@@ -208,6 +223,7 @@ async def confirm_booking(
             date_of_birth=req.date_of_birth,
             new_patient=req.new_patient,
             symptom_notes=req.symptom_notes,
+            phone=req.phone,
         )
     except db.HoldInvalid as exc:
         await _release_claim(idempotency_key, endpoint)
@@ -220,6 +236,106 @@ async def confirm_booking(
     if idempotency_key:
         await db.store_idempotent_response(idempotency_key, endpoint, payload)
     return ConfirmResponse(**payload)
+
+
+# =========================================================================================
+# Phase 13 — caller memory, verification, and the expanded tool surface
+# =========================================================================================
+#
+# Every PHI endpoint here re-verifies (phone, date_of_birth) inside the database call, and a
+# failure is a 403 with a fixed message. It is deliberately the SAME message whether the number
+# is unknown, the DOB is wrong, or the appointment belongs to someone else: an attacker probing
+# with a spoofed caller ID must not be able to tell "not a patient" from "wrong birthday".
+
+
+@app.get("/caller-memory", response_model=CallerMemoryResponse,
+         dependencies=[Depends(require_token)])
+async def get_caller_memory(phone: str = Query(..., description="Caller ANI, E.164")):
+    """Pre-greeting lookup. Returns no identity — recognising a number is not authentication."""
+    return CallerMemoryResponse(**await db.caller_memory(phone))
+
+
+@app.get("/clinic-info", response_model=ClinicInfoResponse,
+         dependencies=[Depends(require_token)])
+async def get_clinic_info(topic: str | None = Query(None)):
+    """Curated facts (hours, location, parking, providers, prep). Open — not PHI."""
+    return ClinicInfoResponse(**await db.clinic_info(topic))
+
+
+@app.post("/verify-identity", response_model=VerifyResponse,
+          dependencies=[Depends(require_token)])
+async def verify_identity(req: VerifiedRequest) -> VerifyResponse:
+    try:
+        return VerifyResponse(**await db.verify_identity(
+            phone=req.phone, date_of_birth=req.date_of_birth
+        ))
+    except db.NotVerified as exc:
+        raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
+
+
+@app.post("/appointments", response_model=AppointmentsResponse,
+          dependencies=[Depends(require_token)])
+async def list_appointments(req: VerifiedRequest) -> AppointmentsResponse:
+    """POST, not GET: the request body carries a date of birth, and a DOB does not belong in a
+    URL where it lands in access logs, proxy logs, and browser history."""
+    try:
+        rows = await db.list_appointments(phone=req.phone, date_of_birth=req.date_of_birth)
+    except db.NotVerified as exc:
+        raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
+    return AppointmentsResponse(
+        appointments=[
+            AppointmentOut(**{**r, "start_time": _iso(r["start_time"])}) for r in rows
+        ]
+    )
+
+
+@app.post("/reschedule", response_model=RescheduleResponse,
+          dependencies=[Depends(require_token)])
+async def reschedule(req: RescheduleRequest) -> RescheduleResponse:
+    try:
+        row = await db.reschedule_appointment(
+            confirmation_id=req.confirmation_id,
+            new_slot_id=req.new_slot_id,
+            phone=req.phone,
+            date_of_birth=req.date_of_birth,
+        )
+    except db.NotVerified as exc:
+        raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
+    except db.BookingNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except db.SlotUnavailable as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RescheduleResponse(**{**row, "start_time": _iso(row["start_time"])})
+
+
+@app.post("/cancel", response_model=CancelResponse, dependencies=[Depends(require_token)])
+async def cancel(req: CancelRequest) -> CancelResponse:
+    try:
+        row = await db.cancel_appointment(
+            confirmation_id=req.confirmation_id,
+            phone=req.phone,
+            date_of_birth=req.date_of_birth,
+            reason=req.reason,
+        )
+    except db.NotVerified as exc:
+        raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
+    except db.BookingNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return CancelResponse(**row)
+
+
+@app.post("/staff-tasks", response_model=StaffTaskResponse,
+          dependencies=[Depends(require_token)])
+async def create_staff_task(req: StaffTaskRequest) -> StaffTaskResponse:
+    """Queue work for a human — refills above all. Never an approval."""
+    try:
+        row = await db.create_staff_task(
+            kind=req.kind, phone=req.phone, date_of_birth=req.date_of_birth,
+            payload=req.payload,
+        )
+    except db.NotVerified as exc:
+        raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
+    return StaffTaskResponse(**row)
 
 
 # =========================================================================================

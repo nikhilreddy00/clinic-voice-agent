@@ -70,3 +70,35 @@ def generate_slots() -> list[tuple[int, int, datetime, str]]:
                 slots.append((slot_id, provider_id, start, reason))
                 slot_id += 1
     return slots
+
+
+# Per-tenant curated facts, injected by intent (Phase 13). A fact table rather than a vector
+# store: at this volume it is faster, cheaper, and — the part that matters for a clinic — fully
+# auditable. Every string here is what the agent is allowed to say on the topic; anything not
+# listed is something it must hand to staff rather than infer.
+CLINIC_FACTS: dict[str, str] = {
+    "hours": (
+        "Grove Family Clinic is open Monday through Friday, 8 AM to 5 PM, and closed on "
+        "weekends and federal holidays."
+    ),
+    "location": (
+        "Grove Family Clinic is at 214 Grove Street, Suite 3, in Riverton. It's the brick "
+        "building next to the public library."
+    ),
+    "parking": (
+        "There's a free patient lot behind the building, entered from Willow Lane, and street "
+        "parking on Grove Street."
+    ),
+    "providers": (
+        "The clinic's providers are Dr. Elena Rivera in family medicine, Dr. Marcus Chen in "
+        "pediatrics, and Dr. Aisha Patel in internal medicine."
+    ),
+    "appointment_prep": (
+        "Please arrive ten minutes early, and bring a photo ID, your insurance card, and a list "
+        "of the medications you take."
+    ),
+    "insurance": (
+        "The clinic accepts most major insurance plans. Staff confirm coverage for a specific "
+        "plan before the visit — the agent does not quote coverage."
+    ),
+}
