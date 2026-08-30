@@ -212,7 +212,10 @@ Full telephony provisioning and the demo sequence are in
 - **Docker not locally tested.** The Dockerfiles and `docker-compose.yml` are present and validated
   (compose config parses, standard uv build) but not built locally (no Docker on the dev machine).
   The live demo runs on the host via `start_demo.sh`, which *is* fully tested.
-- **Rescheduling is v1.1.** The mock API has no patient-lookup endpoint, so a returning caller
-  re-collects intake and books a fresh slot rather than amending an existing appointment.
+- **Rescheduling, cancelling, and refills are built but not yet proven on a live call.** A
+  returning caller is recognised by their number, must match a date of birth before anything is
+  disclosed, and can then list, move, or cancel an appointment (`docs/build_spec.md` → Phase 13).
+  It is verified end to end against the real API and Postgres, and by 70 API tests including the
+  spoofed-caller-ID set — but nobody has yet dialled the number and rescheduled by voice.
 - **LLM latency vs Groq.** Median E2E is ~4 s, LLM-bottlenecked (see [Latency](#latency-real-numbers)).
   A Groq-hosted Llama swap is documented as the path to a sub-500 ms latency-optimized build.
