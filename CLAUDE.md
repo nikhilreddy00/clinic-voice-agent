@@ -182,6 +182,35 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
   - **Tier B (real concurrent calls) is NOT run** — no cost-per-minute number exists yet.
   - The router's LiveKit webhook is **unauthenticated**; verify the signing JWT before deploying
     it anywhere public.
+- **Phase 13 — agent memory + expanded tool surface.** ✅ Caller memory by ANI, a hard identity
+  gate, and six new tools (`verify_identity`, `list_appointments`, `reschedule_appointment`,
+  `cancel_appointment`, `request_refill`, `get_clinic_info`) across `scheduling_api` (7 new
+  endpoints, `db.py` Phase-13 section) and the agent (`scheduling_tools.py`, `core/reducer.py`,
+  `prompts.caller_context_note`). Full detail: `docs/build_spec.md` → *Phase 13*. The rules that
+  are easy to break, all of them downstream of one fact — **caller ID is spoofable**:
+  - **The gate is in the reducer, not the prompt.** A tool in `VERIFICATION_REQUIRED_TOOLS`
+    never becomes an `InvokeTool` action while `state.identity_verified` is false, so an
+    unverified request never exists on the wire. The refusal MUST still be handed back as a
+    `tool_result` — a refused tool with no result means no `ToolCompleted`, which means the turn
+    never drains and the call sits in silence.
+  - **The API re-verifies `(phone, date_of_birth)` on every single PHI call anyway.** The flag
+    is a UX gate in a process driven by a language model; the database is the security boundary.
+    Do not "optimize" this into a session or a verification token.
+  - **A wrong DOB and an unknown number must return the identical 403 body.** Differentiating
+    them turns the endpoint into a patient-enumeration oracle.
+  - **Never speak a caller's name before verification** — not in the greeting, not in the
+    context note. It is the same disclosure the gate exists to prevent, one turn earlier. A
+    recognised caller gets "you've reached us before" and nothing identifying;
+    `/caller-memory` deliberately returns no name for the same reason.
+  - **`phone` and `date_of_birth` are injected by the reducer and OVERWRITE the model's
+    values** on caller-scoped tools, so a number in a transcript cannot redirect a lookup.
+    `confirm_booking` is the one exception on DOB (there it is intake, not a credential) — and
+    booking with a phone + DOB is what creates the patient record that makes the next call a
+    returning one.
+  - **The agent never approves a refill.** `request_refill` creates a `staff_tasks` row and
+    there is no code path that could do otherwise.
+  - Memory is loaded **after** the greeting action and never awaited: the AI disclosure must not
+    wait on a database, and a failed lookup just means a colder greeting.
 
 ## Conventions & governance
 
@@ -222,7 +251,7 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
 #   createdb -h 127.0.0.1 -p 55432 -U postgres clinic_dev   # and clinic_test, clinic_eval
 export CLINIC_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/clinic_dev
 cd scheduling_api && uv sync --extra dev && uv run uvicorn app.main:app --reload
-cd scheduling_api && uv run pytest        # 35 tests; SKIPPED if no Postgres is reachable
+cd scheduling_api && uv run pytest        # 70 tests; SKIPPED if no Postgres is reachable
 
 # --- Supabase is the backend database ------------------------------------------------
 # Project : clinic-voice-agent   ref qhrvyhssfytkrfcodbuc   region us-east-1   Postgres 17.6
@@ -261,7 +290,7 @@ cd agent && uv run python -m clinic_agent.pipeline
 # Telephony either way needs the one-time, idempotent SIP trunk + dispatch rule:
 cd agent && uv run python scripts/setup_livekit_sip.py
 
-cd agent && uv run pytest        # 234 tests, no network/keys needed
+cd agent && uv run pytest        # 299 tests, no network/keys needed
 
 # Phase-12 intent eval. --detector-only runs the SAFETY half with no API calls and no cost.
 agent/.venv/bin/python eval/run_intent_eval.py --detector-only
@@ -290,14 +319,18 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 12 of 17.**
+**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 13 of 17.**
 Phase 8 (model bake-off harness) is built but the sweep has not been run; Phases 9 (Postgres +
-Supabase), 10 (in-house event loop), 11 (concurrency + load proof), and 12 (reasoning layer) are
-done, and the engine is validated by real phone calls (see below). **Next: Phase 13 — agent
-memory + expanded tool surface** (caller memory by ANI, the DOB verification gate,
-reschedule/cancel/refill tools). The last live call points straight at it: the agent asked "are
-you a new patient?" of a number it had already served three times, and could not answer "who is
-the doctor?" — that is `lookup_patient` and `get_clinic_info`.
+Supabase), 10 (in-house event loop), 11 (concurrency + load proof), 12 (reasoning layer), and 13
+(memory + verified tool surface) are done, and the engine is validated by real phone calls (see
+below). **Next: Phase 14 — latency finish** (semantic EOU, speculative LLM start,
+sentence-boundary TTS chunking, connection pooling, region colocation).
+
+**Phase 13's exit criterion is not met yet, and it needs a phone, not code:** a returning caller
+recognized, verified, and rescheduling end to end on a live call. Everything below the
+microphone is proven — 70 API tests including the spoofed-ANI adversarial set, 299 agent tests,
+and a full book → recognise → refuse → verify → list → reschedule → refill → cancel run against
+the real API and Postgres.
 
 **Live-call hardening (post-Phase-12, effectively early Phase 14).** Five defects, all found by
 reading traces rather than by a failing test. Do not regress these:

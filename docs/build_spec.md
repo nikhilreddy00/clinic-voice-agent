@@ -937,3 +937,135 @@ Every unit test passed throughout. Only running the thing found it.
   someone else's symptoms in the third person beyond the cases listed.
 - Reschedule and cancel are classified correctly and then handed off — the tools that would let
   the agent act on an existing booking arrive in Phase 13.
+
+---
+
+## Phase 13 — Agent memory + the expanded tool surface
+
+The live call that motivated this phase asked *"are you a new patient?"* of a number the clinic
+had already served three times, and could not answer *"who is the doctor?"*. Both are the same
+gap: the agent had no memory of a caller and no facts about the clinic, so every call started
+from zero and every question outside booking ended in a hand-off.
+
+Phase 13 adds three things — caller memory keyed by ANI, an identity-verification gate, and six
+new tools (`verify_identity`, `list_appointments`, `reschedule_appointment`,
+`cancel_appointment`, `request_refill`, `get_clinic_info`) — and the second of those is what the
+other two are built around.
+
+### Recognising a number is not authentication
+
+Caller ID is trivially spoofable. Everything in this phase follows from taking that seriously:
+
+- **The ANI unlocks nothing.** `/caller-memory` returns `{known, upcoming_appointments}` — no
+  name, no date, no provider, no appointment. It runs before anyone has proved anything, and the
+  phone may be in anyone's hand.
+- **Disclosure needs a matched date of birth.** Every PHI endpoint takes `(phone,
+  date_of_birth)` and re-verifies the pair **on every request**, in the database layer. There is
+  no session, no verification token, and nothing on the wire that says "already verified".
+- **A wrong DOB and an unknown number return the identical 403 body.** Otherwise the endpoint is
+  a patient-enumeration oracle: an attacker with a list of numbers learns who is a patient here
+  without ever guessing a birthday.
+- **The name is not spoken before verification either.** The obvious "welcome back, Dana!" is
+  the same disclosure the gate exists to prevent, arriving one turn earlier and dressed up as
+  good service — a spouse, a recycled number, a stolen handset. A returning caller gets warmth
+  with no identity attached; the name appears in the prompt only after the DOB matches.
+
+### The gate is in the reducer, not the prompt
+
+`CallState.identity_verified` starts false and can only be set by a successful `verify_identity`
+tool result. While it is false, `_on_tool_use` **refuses the call outright**: no `InvokeTool`
+action, no HTTP request, nothing to intercept. The refusal is synthesized as a `tool_result`
+telling the model to call `verify_identity` first — which is required, not cosmetic, because a
+refused tool still owes the model a result. Without it the assistant's `tool_use` block has no
+matching `tool_result`, no `ToolCompleted` ever arrives to drain the turn, and the call stalls
+in silence.
+
+This is the in-process half of a two-layer gate. The API re-verifies regardless, because the
+flag lives in a process driven by a language model and **a language model is not a security
+boundary**.
+
+### The model does not choose whose chart to read
+
+`phone` and `date_of_birth` are injected by the reducer from `CallState` for every
+caller-scoped tool, and they **overwrite** whatever the model supplied rather than merging. A
+caller reading a number aloud, or a transcript that happens to contain one, therefore cannot
+redirect a lookup at somebody else's record. The agent also never asks for a phone number — it
+is already on the call.
+
+`confirm_booking` is the single exception on the DOB: there it is intake for a *new*
+appointment, not a credential, so the value the caller just spoke is the right one. The phone
+still comes from the ANI, and booking with both is what creates the patient record that makes
+the *next* call from that number a returning caller.
+
+### Memory costs the caller nothing
+
+`LoadCallerMemory` is emitted **after** the greeting `Speak` and never awaited: the greeting is
+deterministic and mandatory, so it must not wait on a database. The result arrives as
+`CallerMemoryLoaded` whenever it arrives and scopes the model's context from turn one. A lookup
+that fails or is slow means the agent greets exactly as it did before Phase 13.
+
+The per-call context note lives on the `StartLLM` action (`context_note`), not inside the LLM
+adapter, so a replayed trace reproduces the exact instructions the model was given about who it
+was talking to. It is appended *after* the per-intent prompt so the cacheable prefix stays
+byte-identical across turns.
+
+### Tool scoping became load-bearing
+
+Phase 12 scoped tools by intent for tokens and accuracy. With nine tools, five of which touch an
+existing patient's record, the scoping is what keeps `request_refill` invisible during a booking
+and `hold_slot` invisible during a cancellation:
+
+| Intent | Tools |
+|---|---|
+| `schedule_appointment` (and turn one) | `check_availability`, `hold_slot`, `confirm_booking`, `get_clinic_info` |
+| `reschedule_appointment` | `verify_identity`, `list_appointments`, `check_availability`, `reschedule_appointment`, `get_clinic_info` |
+| `cancel_appointment` | `verify_identity`, `list_appointments`, `cancel_appointment` |
+| `medication_refill` | `verify_identity`, `request_refill` |
+| `hours_location` | `get_clinic_info` |
+| everything else | **none** — a model with no tools cannot invent an outcome |
+
+Prompt sizes follow: hand-off intents stay ~2.8 KB, the newly-completable flows carry their
+verification + flow blocks at 3.7–5.0 KB, and booking is unchanged at 12.7 KB.
+
+### Refills, and the line the agent does not cross
+
+`request_refill` creates a row in `staff_tasks` and returns a task id. It is never an approval.
+The prompt and the tool description both say so, and the API has no code path that could
+approve one — an automated system that says "your refill is approved" has practised medicine.
+
+### Clinic facts are a table, not RAG
+
+`clinic_facts` holds six curated topics (hours, location, parking, providers, appointment prep,
+insurance). At this volume a fact table is faster, cheaper, and fully auditable, and an unknown
+topic returns the **list of real topics** rather than an error — so the model's next move is to
+pick one instead of inventing an address.
+
+### Verification
+
+- `scheduling_api/tests/` — **35 → 70 passing**, including the adversarial set:
+  spoofed ANI with a wrong/blank/garbage DOB, unknown-number vs wrong-DOB indistinguishability,
+  cross-patient booking access, and a failed cancel leaving the appointment intact.
+- `agent/tests/` — **287 → 299 passing**. `test_verification.py` asserts the half that runs
+  before any HTTP request exists: no `InvokeTool` for an unverified PHI tool, the refusal
+  reaching the model, argument overwrite, and no name in the context note pre-verification.
+- **Contract verified end to end** against the running API and Postgres: book → recognised on
+  the next call → wrong DOB refused → verified → list → reschedule → refill task → cancel.
+
+### Not done
+
+- **No live call through this phase yet.** The exit criterion — a returning caller recognized,
+  verified, and rescheduling end to end on a real phone call — is unmet until someone dials the
+  number. Everything below the microphone is proven.
+- **Working-memory summarization is not implemented.** Long calls still send the full message
+  history; the bounded-prompt rolling summary is deferred.
+- **`send_confirmation` and `check_insurance` are not built.** There is no SMS/email provider
+  wired and no coverage data to read — a `check_insurance` that guesses is worse than a
+  hand-off. `transfer_to_human` remains the existing `TransferToHuman` action rather than a
+  model-callable tool; the warm transfer it needs is Phase 15.
+- **No per-tool latency budget or filler line.** The 10 s client timeout still sits in the voice
+  turn; the `ToolTimeout` event and the "let me pull that up" filler move with Phase 15's
+  reliability work.
+- **Episodic call summaries are not written.** `call_summaries` remains an empty table until the
+  Phase 16 eval corpus needs it.
+- **No audit row per PHI read.** `audit_log` exists and is unwritten — it lands with Phase 17,
+  where redaction and retention are handled together rather than piecemeal.
