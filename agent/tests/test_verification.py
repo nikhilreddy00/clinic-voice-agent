@@ -230,3 +230,35 @@ def test_the_verified_name_is_resent_so_a_withheld_number_stays_verified():
     invoke = next(a for a in produced if isinstance(a, InvokeTool))
     assert invoke.arguments["name"] == "Dana Reyes"
     assert invoke.arguments["date_of_birth"] == DOB
+
+
+def test_a_failed_verification_attempt_does_not_poison_the_next_one():
+    """From a live call. The model called verify_identity with only the name collected and the
+    literal string "placeholder" in the required date field. That stashed "placeholder" as the
+    DOB-under-test, and the engine then substituted it back into the NEXT attempt — the one
+    carrying the caller's real, correctly-transcribed date. Every retry for the rest of the
+    call re-sent "placeholder", so a caller with a valid appointment could never get in.
+
+    Nothing is substituted on verify_identity: both fields are the credentials being tested.
+    """
+    d = _on_a_call()
+    d.send(ev.FinalTranscript(text="I need to reschedule"))
+
+    junk = _tool_call(d, "verify_identity", name="Nikhil Kumar", date_of_birth="placeholder")
+    assert next(a for a in junk if isinstance(a, InvokeTool)).arguments["date_of_birth"] == (
+        "placeholder"
+    )
+    d.send(ev.ToolCompleted(
+        tool_call_id="tu-verify_identity", name="verify_identity", ok=False,
+        result={"ok": False, "status": 403, "error": "could not verify"},
+    ))
+
+    real = d.send(ev.LLMToolUse(
+        request_id=d.state.request_id or "req-1", tool_call_id="tu-verify-2",
+        name="verify_identity",
+        arguments={"name": "Nikhil Kumar", "date_of_birth": "12/08/2000"},
+    ))
+    invoke = next(a for a in real if isinstance(a, InvokeTool))
+    assert invoke.arguments["date_of_birth"] == "12/08/2000", (
+        "the real date of birth was replaced by a stale failed attempt"
+    )

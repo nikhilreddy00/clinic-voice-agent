@@ -428,15 +428,23 @@ def _scoped_arguments(state: CallState, name: str, arguments: dict[str, Any]) ->
         return arguments
     scoped = dict(arguments)
     scoped["phone"] = state.caller_phone
+
+    if name == "verify_identity":
+        # NOTHING is substituted here. Both fields are credentials the caller just supplied,
+        # and this is the call that tests them.
+        #
+        # Substituting the stashed DOB here was a live bug: the model called verify_identity
+        # after collecting only the name, filling the required date field with the literal
+        # string "placeholder". That stashed "placeholder" as the DOB-under-test, and the next
+        # attempt — with the caller's real, correctly-transcribed date — had it substituted
+        # straight back in. Every retry for the rest of the call re-sent "placeholder" and was
+        # refused, so a caller with a valid appointment could never get in.
+        return scoped
+
     if name != "confirm_booking":
         # confirm_booking collects the DOB from the caller as intake for a NEW appointment,
         # so the model's value is the right one there; everywhere else it is the verified one.
         scoped["date_of_birth"] = state.verified_dob or arguments.get("date_of_birth", "")
-    if name == "verify_identity":
-        # The NAME is the exception: on this one call it is a credential the caller supplies,
-        # and it is what reaches an appointment the ANI cannot (booked at the front desk, or
-        # before this number was ever seen, or from a different phone).
-        return scoped
     if state.patient_name:
         # Afterwards it is settled, and re-sending it is what lets a caller with a withheld or
         # unknown number stay verified across the rest of the call.
@@ -472,6 +480,7 @@ def _on_tool_use(state: CallState, e: ev.LLMToolUse):
     # Stash the date of birth being submitted so a successful result can promote it. Only
     # while unverified: a second verify_identity later in the call (a caller volunteering a
     # different date, or a model retry) must not replace a DOB the API has already matched.
+    # It is inert until a ToolCompleted says the API matched it.
     verified_dob = state.verified_dob
     if e.name == "verify_identity" and not state.identity_verified:
         verified_dob = str(arguments.get("date_of_birth") or "")

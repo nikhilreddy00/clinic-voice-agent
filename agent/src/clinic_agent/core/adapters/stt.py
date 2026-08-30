@@ -30,7 +30,7 @@ from loguru import logger
 
 from .. import events as ev
 from ..audio import INPUT_SAMPLE_RATE, NUM_CHANNELS
-from ..endpointing import grace_seconds
+from ..endpointing import grace_seconds, looks_unfinished
 
 DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
 
@@ -243,7 +243,16 @@ class DeepgramSTT:
         except asyncio.CancelledError:
             return
         self._grace_task = None
-        self._end_of_turn(time.monotonic())
+        now = time.monotonic()
+        # Renew ONLY on the strong signal. A merely-unpunctuated turn ("December eight two
+        # thousand", "Nikhil Kumar") is usually a complete answer, and re-deciding on those
+        # would silently turn one 0.7 s window into three — taxing every name and date in the
+        # call, which is the exact trade the two-tier design exists to avoid. Measured on a
+        # live call: "Hi. I would like to book an appointment" was held three times.
+        if looks_unfinished(" ".join(self._segments).strip()):
+            self._end_of_turn(now)
+            return
+        self._flush(now)
 
     def _grace_pending(self) -> bool:
         return self._grace_task is not None and not self._grace_task.done()

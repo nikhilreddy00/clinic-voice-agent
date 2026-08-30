@@ -381,3 +381,28 @@ async def test_a_finished_sentence_is_never_held(fake_ws, monkeypatch):
         assert not [e for e in events if isinstance(e, ev.TurnHeld)]
     finally:
         await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_an_unpunctuated_but_complete_answer_gets_one_short_window(fake_ws, monkeypatch):
+    """The other side of the renewal trade, caught on a live call: "Hi. I would like to book an
+    appointment" was held three times in a row.
+
+    That turn is WEAK — no terminal punctuation, but nothing about it is mid-clause. Renewing
+    those would turn one 0.7 s window into three and tax every name and date of birth in the
+    call, which is exactly what the two-tier design exists to avoid. Only the STRONG signal
+    renews.
+    """
+    events: list[ev.Event] = []
+    adapter = build(events)
+    _fast_grace(monkeypatch)
+    await adapter.start()
+    try:
+        adapter._handle(_results("Hi. I would like to book an appointment", is_final=True,
+                                 speech_final=True))
+        await asyncio.sleep(0.05 * 1.6)  # one window, plus slack
+        finals = [e for e in events if isinstance(e, ev.FinalTranscript)]
+        assert len(finals) == 1, "a complete answer was held for more than its one window"
+        assert len([e for e in events if isinstance(e, ev.TurnHeld)]) == 1
+    finally:
+        await adapter.aclose()
