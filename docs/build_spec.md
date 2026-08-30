@@ -1069,3 +1069,61 @@ pick one instead of inventing an address.
   Phase 16 eval corpus needs it.
 - **No audit row per PHI read.** `audit_log` exists and is unwritten — it lands with Phase 17,
   where redaction and retention are handled together rather than piecemeal.
+
+### Two defects found by live calls after the phase landed
+
+**1. Verification keyed only on the ANI, so most appointments were unreachable.** A caller with
+three confirmed bookings phoned in, gave a correct date of birth, and was refused. The trace
+says exactly why:
+
+```
+CALLER phone='+17039066508'
+MEMORY known=False upcoming=0
+TOOL-> verify_identity {'date_of_birth': '12/08/2000'}
+TOOL<- ok=False 403
+```
+
+The bookings were made before `confirm_booking` accepted a phone number, so no `patients` row
+existed and the rows carried `patient_id = NULL`. The same hole swallows anything booked at a
+front desk or on the web, and any caller phoning from a different handset. The agent asked for
+a credential it could never match and dead-ended at a hand-off.
+
+`db._verify` now has **two paths, both two-factor**: phone + DOB (the fast path), and — only
+when the number has no patient record — **name + DOB**, the check a real front desk runs,
+matched against an already-enrolled patient or an unattached confirmed booking. A path-2 match
+**enrolls** the caller: a patient record is created for the number and the matching orphan
+bookings are attached, so the next call is recognised by number alone.
+
+Path 2 is skipped when the number already belongs to an enrolled patient whose DOB did not
+match. That ordering is the hijack guard: without it, whoever holds an enrolled patient's
+handset could verify as somebody else by name and DOB and have that person's bookings
+re-pointed at the phone in their hand.
+
+**2. A mid-sentence pause was answered as if the caller had finished.** Same caller, earlier
+call — four fragments in twenty seconds:
+
+```
+42.4  USER: 'I would like to reschedule my'      43.0  BOT: "I'm listening — take your time."
+47.7  USER: 'well, I would like to'              48.4  BOT: "No rush, I'm here — what do you need?"
+53.8  USER: 'I would like to reschedule my'      54.5  BOT: "Take your time — I'm here to help."
+58.4  USER: 'I would like to reschedule'         59.3  BOT: "I've got you — ... date of birth?"
+```
+
+Zero `UserInterrupted` events: this was not barge-in. `grace_seconds` correctly rated each
+fragment STRONG (they end on determiners), but `_grace_then_flush` expired **straight into a
+flush**, so a visibly-unfinished sentence bought exactly one 1.6 s window. The reply then talked
+over the caller's next attempt, the mic gate clipped it, and the loop repeated — which the
+caller experienced as being interrupted constantly.
+
+A hold now **re-decides** on expiry instead of flushing: it re-enters `_end_of_turn`, which
+opens another window while the text still looks unfinished, up to the existing
+`MAX_GRACE_WINDOWS`. Patience for a mid-clause fragment goes from 1.6 s to ~4.8 s; a finished
+sentence still returns `0.0` from `grace_seconds` and never touches this path, so the turns that
+were already correct stay exactly as fast.
+
+**And the decision is now in the trace.** Neither the hold nor its expiry produced any event, so
+a call where somebody was talked over mid-sentence looked identical to one where they weren't —
+the diagnosis above needed the console log, not the trace. `TurnHeld` records each hold and,
+with `released=True`, the case where patience ran out and a still-unfinished fragment was sent
+anyway. Turn-taking is a derived decision, so it belongs in the event stream by the same rule
+that keeps raw audio out of it.

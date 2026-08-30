@@ -235,14 +235,20 @@ class SchedulingClient:
             return {"ok": False, "error": str(exc), "known": False, "upcoming_appointments": 0}
         return {"ok": True, **resp.json()}
 
-    async def verify_identity(self, *, phone: str, date_of_birth: str) -> dict:
+    async def verify_identity(
+        self, *, phone: str, date_of_birth: str, name: str | None = None
+    ) -> dict:
         return await self._verified_post(
-            "/verify-identity", {"phone": phone, "date_of_birth": date_of_birth}
+            "/verify-identity",
+            {"phone": phone, "date_of_birth": date_of_birth, "name": name},
         )
 
-    async def list_appointments(self, *, phone: str, date_of_birth: str) -> dict:
+    async def list_appointments(
+        self, *, phone: str, date_of_birth: str, name: str | None = None
+    ) -> dict:
         result = await self._verified_post(
-            "/appointments", {"phone": phone, "date_of_birth": date_of_birth}
+            "/appointments",
+            {"phone": phone, "date_of_birth": date_of_birth, "name": name},
         )
         if result.get("ok"):
             appts = [
@@ -253,11 +259,12 @@ class SchedulingClient:
         return result
 
     async def reschedule_appointment(
-        self, *, confirmation_id: str, new_slot_id: int, phone: str, date_of_birth: str
+        self, *, confirmation_id: str, new_slot_id: int, phone: str, date_of_birth: str,
+        name: str | None = None,
     ) -> dict:
         result = await self._verified_post("/reschedule", {
             "confirmation_id": confirmation_id, "new_slot_id": new_slot_id,
-            "phone": phone, "date_of_birth": date_of_birth,
+            "phone": phone, "date_of_birth": date_of_birth, "name": name,
         })
         if result.get("ok"):
             result["display_time"] = _format_slot_time(result["start_time"])
@@ -265,18 +272,19 @@ class SchedulingClient:
 
     async def cancel_appointment(
         self, *, confirmation_id: str, phone: str, date_of_birth: str,
-        reason: str | None = None,
+        reason: str | None = None, name: str | None = None,
     ) -> dict:
         return await self._verified_post("/cancel", {
             "confirmation_id": confirmation_id, "phone": phone,
-            "date_of_birth": date_of_birth, "reason": reason,
+            "date_of_birth": date_of_birth, "reason": reason, "name": name,
         })
 
     async def request_refill(
-        self, *, phone: str, date_of_birth: str, medication: str, notes: str | None = None
+        self, *, phone: str, date_of_birth: str, medication: str, notes: str | None = None,
+        name: str | None = None,
     ) -> dict:
         return await self._verified_post("/staff-tasks", {
-            "phone": phone, "date_of_birth": date_of_birth, "kind": "refill",
+            "phone": phone, "date_of_birth": date_of_birth, "kind": "refill", "name": name,
             "payload": {"medication": medication, "notes": notes},
         })
 
@@ -414,12 +422,14 @@ async def execute_tool(
             f"dob={'set' if args.get('date_of_birth') else 'unset'}}}"
         )
         result = await client.verify_identity(
-            phone=args.get("phone", ""), date_of_birth=args.get("date_of_birth", "")
+            phone=args.get("phone", ""), date_of_birth=args.get("date_of_birth", ""),
+            name=args.get("name"),
         )
     elif name == "list_appointments":
         logger.info(f"TOOL ▶ POST /appointments req={{phone={_redact_phone(args.get('phone'))}}}")
         result = await client.list_appointments(
-            phone=args.get("phone", ""), date_of_birth=args.get("date_of_birth", "")
+            phone=args.get("phone", ""), date_of_birth=args.get("date_of_birth", ""),
+            name=args.get("name"),
         )
     elif name == "reschedule_appointment":
         logger.info(
@@ -431,6 +441,7 @@ async def execute_tool(
             new_slot_id=args.get("new_slot_id"),
             phone=args.get("phone", ""),
             date_of_birth=args.get("date_of_birth", ""),
+            name=args.get("name"),
         )
     elif name == "cancel_appointment":
         logger.info(
@@ -441,6 +452,7 @@ async def execute_tool(
             phone=args.get("phone", ""),
             date_of_birth=args.get("date_of_birth", ""),
             reason=args.get("reason"),
+            name=args.get("name"),
         )
     elif name == "request_refill":
         # The medication name is clinical detail; log its presence, not the drug.
@@ -453,6 +465,7 @@ async def execute_tool(
             date_of_birth=args.get("date_of_birth", ""),
             medication=args.get("medication", ""),
             notes=args.get("notes"),
+            name=args.get("name"),
         )
     elif name == "get_clinic_info":
         logger.info(f"TOOL ▶ GET /clinic-info req={{topic={args.get('topic')!r}}}")
@@ -666,12 +679,14 @@ def _caller_tools() -> list[FunctionSchema]:
         FunctionSchema(
             name="verify_identity",
             description=(
-                "Check the date of birth the caller just spoke against the clinic's records "
-                "for this phone number. Call this BEFORE any tool that reads or changes an "
-                "existing appointment — those will refuse until it succeeds. Ask for the date "
-                "of birth in a natural sentence first. If it fails, you may ask once more in "
-                "case you misheard, then offer to pass them to a staff member. NEVER say "
-                "whether the number is on file, and never guess or read back a date of birth."
+                "Check the caller against the clinic's records. Call this BEFORE any tool that "
+                "reads or changes an existing appointment — those refuse until it succeeds. "
+                "Ask for their FULL NAME and DATE OF BIRTH (one at a time, in natural "
+                "sentences) and send both: the clinic may hold their appointment under a "
+                "number this call is not coming from, and the name is what finds it. If it "
+                "fails, ask once more in case you misheard the name or the date, then offer a "
+                "staff member. NEVER say whether the number is on file, and never guess or "
+                "read back a date of birth."
             ),
             properties={
                 "date_of_birth": {
@@ -680,9 +695,16 @@ def _caller_tools() -> list[FunctionSchema]:
                         "The date of birth the caller just spoke, normalized to MM/DD/YYYY "
                         "(e.g. 'March 15th 1990' -> '03/15/1990')."
                     ),
-                }
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "The caller's full name as they gave it, exactly — do not correct the "
+                        "spelling or expand a nickname."
+                    ),
+                },
             },
-            required=["date_of_birth"],
+            required=["date_of_birth", "name"],
         ),
         FunctionSchema(
             name="list_appointments",

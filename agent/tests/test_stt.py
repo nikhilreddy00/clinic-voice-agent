@@ -235,7 +235,7 @@ async def test_a_mid_sentence_pause_waits_then_resumes(fake_ws, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_caller_who_truly_trails_off_still_gets_an_answer(fake_ws, monkeypatch):
-    """One grace window per utterance. Silence must not become a stall."""
+    """Patience is bounded. Silence must not become a stall."""
     events: list[ev.Event] = []
     adapter = build(events)
     _fast_grace(monkeypatch)
@@ -243,11 +243,15 @@ async def test_a_caller_who_truly_trails_off_still_gets_an_answer(fake_ws, monke
     try:
         adapter._handle(_results("How about", is_final=True, speech_final=True))
         assert not [e for e in events if isinstance(e, ev.FinalTranscript)]
-        await asyncio.sleep(0.12)  # nothing more arrives
+        # Windows renew while the text stays unfinished, so wait out all of them.
+        await asyncio.sleep(0.05 * (adapter.MAX_GRACE_WINDOWS + 1))  # nothing more arrives
 
         finals = [e for e in events if isinstance(e, ev.FinalTranscript)]
         assert len(finals) == 1, "the turn never completed — the caller would hear silence"
         assert finals[0].text == "How about"
+        assert [e for e in events if isinstance(e, ev.TurnHeld) and e.released], (
+            "releasing a still-unfinished turn must be visible in the trace"
+        )
     finally:
         await adapter.aclose()
 
@@ -265,7 +269,7 @@ async def test_utterance_end_does_not_preempt_an_open_grace_window(fake_ws, monk
         assert not [e for e in events if isinstance(e, ev.FinalTranscript)], (
             "UtteranceEnd flushed while the grace window was still open"
         )
-        await asyncio.sleep(0.12)
+        await asyncio.sleep(0.05 * (adapter.MAX_GRACE_WINDOWS + 1))
         assert len([e for e in events if isinstance(e, ev.FinalTranscript)]) == 1
     finally:
         await adapter.aclose()
@@ -327,3 +331,53 @@ def test_grace_is_graded_by_how_certain_the_signal_is(text, seconds):
     from clinic_agent.core.endpointing import grace_seconds
 
     assert grace_seconds(text) == seconds
+
+
+@pytest.mark.asyncio
+async def test_a_mid_clause_pause_gets_more_than_one_window(fake_ws, monkeypatch):
+    """The live-call fix. A caller was cut off four times in twenty seconds saying "I would
+    like to reschedule my …" — one 1.6 s window expired straight into a flush, the agent
+    answered the fragment, and the reply talked over their next attempt.
+
+    A hold now RE-DECIDES on expiry instead of flushing, so a visibly-unfinished sentence buys
+    every window it is entitled to.
+    """
+    events: list[ev.Event] = []
+    adapter = build(events)
+    _fast_grace(monkeypatch)
+    await adapter.start()
+    try:
+        adapter._handle(_results("I would like to reschedule my", is_final=True,
+                                 speech_final=True))
+        await asyncio.sleep(0.05 * 1.5)  # one window has passed
+        assert not [e for e in events if isinstance(e, ev.FinalTranscript)], (
+            "the caller was cut off after a single grace window"
+        )
+        holds = [e for e in events if isinstance(e, ev.TurnHeld) and not e.released]
+        assert len(holds) >= 2 and holds[-1].window >= 2
+
+        # ...and the moment they resume, the hold is dropped and the sentence is joined.
+        adapter._handle(_results("appointment", is_final=False))
+        adapter._handle(_results("appointment for Tuesday.", is_final=True, speech_final=True))
+        await asyncio.sleep(0.01)
+        finals = [e for e in events if isinstance(e, ev.FinalTranscript)]
+        assert len(finals) == 1
+        assert finals[0].text == "I would like to reschedule my appointment for Tuesday."
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_finished_sentence_is_never_held(fake_ws, monkeypatch):
+    """The other half of the trade: turns that were already right stay exactly as fast."""
+    events: list[ev.Event] = []
+    adapter = build(events)
+    _fast_grace(monkeypatch)
+    await adapter.start()
+    try:
+        adapter._handle(_results("December eight two thousand.", is_final=True,
+                                 speech_final=True))
+        assert [e for e in events if isinstance(e, ev.FinalTranscript)], "held a finished turn"
+        assert not [e for e in events if isinstance(e, ev.TurnHeld)]
+    finally:
+        await adapter.aclose()

@@ -267,7 +267,7 @@ async def get_clinic_info(topic: str | None = Query(None)):
 async def verify_identity(req: VerifiedRequest) -> VerifyResponse:
     try:
         return VerifyResponse(**await db.verify_identity(
-            phone=req.phone, date_of_birth=req.date_of_birth
+            phone=req.phone, date_of_birth=req.date_of_birth, name=req.name
         ))
     except db.NotVerified as exc:
         raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
@@ -279,7 +279,9 @@ async def list_appointments(req: VerifiedRequest) -> AppointmentsResponse:
     """POST, not GET: the request body carries a date of birth, and a DOB does not belong in a
     URL where it lands in access logs, proxy logs, and browser history."""
     try:
-        rows = await db.list_appointments(phone=req.phone, date_of_birth=req.date_of_birth)
+        rows = await db.list_appointments(
+            phone=req.phone, date_of_birth=req.date_of_birth, name=req.name
+        )
     except db.NotVerified as exc:
         raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
     return AppointmentsResponse(
@@ -298,6 +300,7 @@ async def reschedule(req: RescheduleRequest) -> RescheduleResponse:
             new_slot_id=req.new_slot_id,
             phone=req.phone,
             date_of_birth=req.date_of_birth,
+            name=req.name,
         )
     except db.NotVerified as exc:
         raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
@@ -316,6 +319,7 @@ async def cancel(req: CancelRequest) -> CancelResponse:
             phone=req.phone,
             date_of_birth=req.date_of_birth,
             reason=req.reason,
+            name=req.name,
         )
     except db.NotVerified as exc:
         raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc
@@ -331,7 +335,7 @@ async def create_staff_task(req: StaffTaskRequest) -> StaffTaskResponse:
     try:
         row = await db.create_staff_task(
             kind=req.kind, phone=req.phone, date_of_birth=req.date_of_birth,
-            payload=req.payload,
+            payload=req.payload, name=req.name,
         )
     except db.NotVerified as exc:
         raise HTTPException(status_code=403, detail=_NOT_VERIFIED) from exc

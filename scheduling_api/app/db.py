@@ -631,7 +631,7 @@ def normalize_dob(value: str | None) -> str:
 
 
 async def _upsert_patient(
-    conn: AsyncConnection, clinic_id: int, phone: str, name: str, date_of_birth: str
+    conn: AsyncConnection, clinic_id: int, phone: str | None, name: str, date_of_birth: str
 ) -> int:
     """Create or refresh the patient record for a phone number. Returns patients.id."""
     row = await (await conn.execute(
@@ -650,16 +650,98 @@ async def _upsert_patient(
     return row["id"]
 
 
-async def _verify(conn: AsyncConnection, phone: str, date_of_birth: str) -> dict[str, Any]:
-    """Resolve (phone, DOB) to a patient row, or raise NotVerified. The single gate."""
-    if not phone or not normalize_dob(date_of_birth):
+def _same_name(a: str | None, b: str | None) -> bool:
+    """Case- and spacing-insensitive name comparison. Deliberately NOT fuzzy.
+
+    A name is half of a two-factor check here, and fuzzy matching weakens a credential — the
+    point of accepting "  dana   reyes " is a transcription artifact, not accepting "D. Reyes".
+    """
+    return " ".join((a or "").lower().split()) == " ".join((b or "").lower().split())
+
+
+async def _verify(
+    conn: AsyncConnection, phone: str, date_of_birth: str, name: str | None = None
+) -> dict[str, Any]:
+    """Resolve a caller to a patient row, or raise NotVerified. The single gate.
+
+    TWO paths, both two-factor, tried in this order:
+
+    1. **Phone + DOB.** The fast path for a caller the clinic has already enrolled.
+    2. **Name + DOB against confirmed bookings**, but ONLY when this number has no patient
+       record yet. This exists because keying on the ANI alone made whole classes of
+       appointment permanently unreachable: anything booked at the front desk or on the web,
+       anything booked before this number was ever seen, and any caller phoning from a
+       different handset. The agent would ask for a date of birth it could never match and
+       then dead-end at a hand-off — which is exactly what happened on a live call.
+       Name + DOB is the check a real front desk runs, and it is still two factors.
+
+    On a path-2 match the caller is **enrolled**: a patient record is created for this number
+    and the matching orphan bookings are attached to it, so the next call is recognised by the
+    number alone and never has to ask for a name again.
+
+    Path 2 is skipped when the number ALREADY belongs to an enrolled patient whose DOB did not
+    match. That is not a convenience gap, it is the hijack this ordering prevents: without it,
+    anyone holding an enrolled patient's handset could verify as somebody else by name and DOB
+    and have that person's bookings re-pointed at the phone they are holding.
+    """
+    if not normalize_dob(date_of_birth):
         raise NotVerified("Identity not verified")
-    row = await (await conn.execute(
-        "SELECT id, name, date_of_birth FROM patients WHERE phone = %s", (phone,)
-    )).fetchone()
-    if row is None or normalize_dob(row["date_of_birth"]) != normalize_dob(date_of_birth):
+
+    if phone:
+        row = await (await conn.execute(
+            "SELECT id, name, date_of_birth FROM patients WHERE phone = %s", (phone,)
+        )).fetchone()
+        if row is not None:
+            if normalize_dob(row["date_of_birth"]) == normalize_dob(date_of_birth):
+                return row
+            raise NotVerified("Identity not verified")  # enrolled number, wrong DOB — stop here
+
+    if not name:
         raise NotVerified("Identity not verified")
-    return row
+
+    # An already-enrolled patient, reached from a number the clinic does not know — a caller on
+    # their partner's phone, a new handset, or a withheld ANI. Same two factors; no rebinding,
+    # because a patient row holds one number and silently moving it would be a surprise.
+    existing = await (await conn.execute(
+        "SELECT id, name, date_of_birth FROM patients WHERE date_of_birth IS NOT NULL"
+    )).fetchall()
+    for row in existing:
+        if _same_name(row["name"], name) and normalize_dob(row["date_of_birth"]) == normalize_dob(
+            date_of_birth
+        ):
+            return row
+
+    # DOB is compared in Python, not SQL: the column stores what the caller spoke, and
+    # normalize_dob is the only thing that knows "3-15-1990" and "03/15/1990" are one date.
+    candidates = await (await conn.execute(
+        """
+        SELECT confirmation_id, clinic_id, patient_name, date_of_birth
+          FROM bookings
+         WHERE status = 'confirmed'
+           AND patient_id IS NULL
+           AND date_of_birth IS NOT NULL
+        """
+    )).fetchall()
+    matched = [
+        b for b in candidates
+        if _same_name(b["patient_name"], name)
+        and normalize_dob(b["date_of_birth"]) == normalize_dob(date_of_birth)
+    ]
+    if not matched:
+        raise NotVerified("Identity not verified")
+
+    clinic_id = matched[0]["clinic_id"]
+    # NULL, not "": phone is UNIQUE per clinic, and an empty string would collide the moment
+    # a second caller verified with no ANI (the local path). NULLs do not collide.
+    patient_id = await _upsert_patient(
+        conn, clinic_id, phone or None, matched[0]["patient_name"], date_of_birth
+    )
+    await conn.execute(
+        "UPDATE bookings SET patient_id = %s WHERE confirmation_id = ANY(%s)",
+        (patient_id, [b["confirmation_id"] for b in matched]),
+    )
+    return {"id": patient_id, "name": matched[0]["patient_name"],
+            "date_of_birth": date_of_birth}
 
 
 async def caller_memory(phone: str) -> dict[str, Any]:
@@ -692,36 +774,43 @@ async def caller_memory(phone: str) -> dict[str, Any]:
     return {"known": True, "upcoming_appointments": int(row["upcoming"] or 0)}
 
 
-async def verify_identity(*, phone: str, date_of_birth: str) -> dict[str, Any]:
-    """Check a spoken DOB against the patient on file for this number."""
+async def verify_identity(
+    *, phone: str, date_of_birth: str, name: str | None = None
+) -> dict[str, Any]:
+    """Check a caller against the records: phone + DOB, or name + DOB. See _verify."""
     async with pool().connection() as conn:
-        patient = await _verify(conn, phone, date_of_birth)
+        async with conn.transaction():  # path 2 enrolls, so this can write
+            patient = await _verify(conn, phone, date_of_birth, name)
     return {"patient_id": patient["id"], "name": patient["name"]}
 
 
-async def list_appointments(*, phone: str, date_of_birth: str) -> list[dict[str, Any]]:
+async def list_appointments(
+    *, phone: str, date_of_birth: str, name: str | None = None
+) -> list[dict[str, Any]]:
     """Upcoming confirmed appointments for a verified caller."""
     async with pool().connection() as conn:
-        patient = await _verify(conn, phone, date_of_birth)
-        rows = await (await conn.execute(
-            """
-            SELECT b.confirmation_id, b.slot_id, b.reason, s.start_time,
-                   pr.name AS provider_name
-              FROM bookings b
-              JOIN slots s ON s.id = b.slot_id
-              JOIN providers pr ON pr.id = s.provider_id
-             WHERE b.patient_id = %s
-               AND b.status = 'confirmed'
-               AND s.start_time >= now()
-             ORDER BY s.start_time
-            """,
-            (patient["id"],),
-        )).fetchall()
+        async with conn.transaction():
+            patient = await _verify(conn, phone, date_of_birth, name)
+            rows = await (await conn.execute(
+                """
+                SELECT b.confirmation_id, b.slot_id, b.reason, s.start_time,
+                       pr.name AS provider_name
+                  FROM bookings b
+                  JOIN slots s ON s.id = b.slot_id
+                  JOIN providers pr ON pr.id = s.provider_id
+                 WHERE b.patient_id = %s
+                   AND b.status = 'confirmed'
+                   AND s.start_time >= now()
+                 ORDER BY s.start_time
+                """,
+                (patient["id"],),
+            )).fetchall()
     return rows
 
 
 async def cancel_appointment(
-    *, confirmation_id: str, phone: str, date_of_birth: str, reason: str | None = None
+    *, confirmation_id: str, phone: str, date_of_birth: str, reason: str | None = None,
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Cancel a verified caller's appointment and return the slot to the pool.
 
@@ -731,7 +820,7 @@ async def cancel_appointment(
     """
     async with pool().connection() as conn:
         async with conn.transaction():
-            patient = await _verify(conn, phone, date_of_birth)
+            patient = await _verify(conn, phone, date_of_birth, name)
             booking = await (await conn.execute(
                 """
                 SELECT confirmation_id, slot_id, status
@@ -770,7 +859,8 @@ async def cancel_appointment(
 
 
 async def reschedule_appointment(
-    *, confirmation_id: str, new_slot_id: int, phone: str, date_of_birth: str
+    *, confirmation_id: str, new_slot_id: int, phone: str, date_of_birth: str,
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Move a verified caller's appointment to a different open slot.
 
@@ -784,7 +874,7 @@ async def reschedule_appointment(
     """
     async with pool().connection() as conn:
         async with conn.transaction():
-            patient = await _verify(conn, phone, date_of_birth)
+            patient = await _verify(conn, phone, date_of_birth, name)
             booking = await (await conn.execute(
                 """
                 SELECT confirmation_id, slot_id, status
@@ -844,7 +934,8 @@ async def reschedule_appointment(
 
 
 async def create_staff_task(
-    *, kind: str, phone: str, date_of_birth: str, payload: dict[str, Any]
+    *, kind: str, phone: str, date_of_birth: str, payload: dict[str, Any],
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Queue work for a human. The agent creates the task; it never completes it.
 
@@ -854,7 +945,7 @@ async def create_staff_task(
     """
     async with pool().connection() as conn:
         async with conn.transaction():
-            patient = await _verify(conn, phone, date_of_birth)
+            patient = await _verify(conn, phone, date_of_birth, name)
             row = await (await conn.execute(
                 """
                 INSERT INTO staff_tasks (clinic_id, patient_id, kind, payload)

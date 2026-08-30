@@ -70,10 +70,20 @@ class ConfirmResponse(BaseModel):
 
 
 class VerifiedRequest(BaseModel):
-    """Base for anything that touches PHI."""
+    """Base for anything that touches PHI.
 
-    phone: str = Field(..., min_length=1, description="Caller's number in E.164, from the ANI")
+    `phone` may be empty: a caller can reach the clinic from a number it has never seen, and
+    the ANI can be withheld. The second factor is then the name (see db._verify) — never the
+    DOB alone, which would be one factor and guessable.
+    """
+
+    phone: str = Field("", description="Caller's number in E.164, from the ANI. May be empty.")
     date_of_birth: str = Field(..., min_length=1, description="Spoken DOB, normalized MM/DD/YYYY")
+    name: str | None = Field(
+        None,
+        description="Caller's name as it appears on the appointment. Used when the number is "
+                    "not on file — the front-desk name+DOB check.",
+    )
 
 
 class VerifyResponse(BaseModel):

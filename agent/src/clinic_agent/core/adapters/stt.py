@@ -201,18 +201,49 @@ class DeepgramSTT:
                 f"[stt] holding the turn {wait:.1f}s "
                 f"({self._grace_windows}/{self.MAX_GRACE_WINDOWS}) — {text[-48:]!r}"
             )
+            self._emit(ev.TurnHeld(
+                t=now, tail=text[-48:], seconds=wait,
+                window=self._grace_windows, windows_max=self.MAX_GRACE_WINDOWS,
+            ))
             self._grace_task = asyncio.create_task(
                 self._grace_then_flush(wait), name="stt-grace"
             )
             return
+        if wait:
+            # Patience exhausted on a sentence that is STILL visibly mid-clause. Sending it is
+            # the least-bad option left — the alternative is dead air — but it is a failure,
+            # and the trace should say so rather than look like a normal turn.
+            logger.info(f"[stt] releasing an unfinished turn after {self.MAX_GRACE_WINDOWS} "
+                        f"holds — {text[-48:]!r}")
+            self._emit(ev.TurnHeld(
+                t=now, tail=text[-48:], seconds=0.0,
+                window=self._grace_windows, windows_max=self.MAX_GRACE_WINDOWS, released=True,
+            ))
         self._flush(now)
 
     async def _grace_then_flush(self, wait: float) -> None:
+        """Wait out one hold, then RE-DECIDE rather than flushing unconditionally.
+
+        This is the fix for a live call where the caller was cut off four times in twenty
+        seconds. Each hold used to expire straight into a flush, so a visibly-unfinished
+        sentence bought exactly one 1.6 s window — and a caller who pauses longer than that to
+        gather their thoughts ("I would like to reschedule my …") got answered mid-sentence.
+        The reply then talked over their next attempt, which the mic gate clipped, which
+        produced another fragment: the loop the caller experienced as being interrupted
+        constantly.
+
+        Re-entering _end_of_turn re-reads the (unchanged) segments and opens another window
+        while the text still looks unfinished, up to MAX_GRACE_WINDOWS. Patience for a
+        mid-clause fragment is therefore ~4.8 s rather than 1.6 s, while a finished sentence
+        still flushes immediately — grace_seconds returns 0.0 for those, so they never reach
+        this path at all.
+        """
         try:
             await asyncio.sleep(wait)
         except asyncio.CancelledError:
             return
-        self._flush(time.monotonic())
+        self._grace_task = None
+        self._end_of_turn(time.monotonic())
 
     def _grace_pending(self) -> bool:
         return self._grace_task is not None and not self._grace_task.done()

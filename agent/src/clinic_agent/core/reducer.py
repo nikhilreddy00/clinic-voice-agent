@@ -432,6 +432,15 @@ def _scoped_arguments(state: CallState, name: str, arguments: dict[str, Any]) ->
         # confirm_booking collects the DOB from the caller as intake for a NEW appointment,
         # so the model's value is the right one there; everywhere else it is the verified one.
         scoped["date_of_birth"] = state.verified_dob or arguments.get("date_of_birth", "")
+    if name == "verify_identity":
+        # The NAME is the exception: on this one call it is a credential the caller supplies,
+        # and it is what reaches an appointment the ANI cannot (booked at the front desk, or
+        # before this number was ever seen, or from a different phone).
+        return scoped
+    if state.patient_name:
+        # Afterwards it is settled, and re-sending it is what lets a caller with a withheld or
+        # unknown number stay verified across the rest of the call.
+        scoped["name"] = state.patient_name
     return scoped
 
 

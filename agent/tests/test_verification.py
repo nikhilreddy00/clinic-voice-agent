@@ -28,12 +28,16 @@ def _on_a_call(phone: str = CALLER) -> Driver:
     return d
 
 
-def _tool_call(d: Driver, name: str, **arguments) -> list:
-    """Drive one model tool call and return the actions it produced."""
+def _tool_call(d: Driver, tool: str, **arguments) -> list:
+    """Drive one model tool call and return the actions it produced.
+
+    The parameter is `tool`, not `name`: `name` is itself a tool argument now (the caller's
+    name, the second verification factor).
+    """
     return d.send(ev.LLMToolUse(
         request_id=d.state.request_id or "req-1",
-        tool_call_id=f"tu-{name}",
-        name=name,
+        tool_call_id=f"tu-{tool}",
+        name=tool,
         arguments=arguments,
     ))
 
@@ -199,3 +203,30 @@ def test_an_unrecognised_number_adds_nothing_to_the_prompt():
     d.send(ev.CallerMemoryLoaded(known=False, upcoming_appointments=0))
     produced = d.send(ev.FinalTranscript(text="hi"))
     assert next(a for a in produced if isinstance(a, StartLLM)).context_note == ""
+
+
+# --- name as the second factor (the live-call fix) -----------------------------------------
+
+
+def test_the_model_supplies_the_name_on_verify_and_the_engine_does_not_overwrite_it():
+    """On verify_identity the name is a credential the CALLER gives — it is the thing that
+    reaches an appointment the ANI cannot. Everywhere else the engine settles it."""
+    d = _on_a_call()
+    d.send(ev.FinalTranscript(text="I need to move my appointment"))
+    produced = _tool_call(d, "verify_identity", date_of_birth=DOB, name="Dana Reyes")
+    invoke = next(a for a in produced if isinstance(a, InvokeTool))
+    assert invoke.arguments["name"] == "Dana Reyes"
+    assert invoke.arguments["phone"] == CALLER
+
+
+def test_the_verified_name_is_resent_so_a_withheld_number_stays_verified():
+    """A caller with no ANI verifies by name + DOB; every later PHI call has to carry the same
+    two factors or the server has nothing to re-verify against."""
+    d = _on_a_call(phone="")
+    d.send(ev.FinalTranscript(text="cancel my appointment"))
+    _verify(d)
+
+    produced = _tool_call(d, "cancel_appointment", confirmation_id="ABC123")
+    invoke = next(a for a in produced if isinstance(a, InvokeTool))
+    assert invoke.arguments["name"] == "Dana Reyes"
+    assert invoke.arguments["date_of_birth"] == DOB

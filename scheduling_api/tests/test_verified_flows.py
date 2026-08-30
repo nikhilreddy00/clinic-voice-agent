@@ -246,3 +246,106 @@ def test_booking_without_a_phone_creates_no_patient(client):
     })
     assert resp.status_code == 200
     assert client.get("/caller-memory", params={"phone": CALLER}).json()["known"] is False
+
+
+# --- name + DOB: the path that exists because ANI-only verification dead-ends ---------------
+#
+# Found on a live call. Three confirmed bookings existed for the caller, made before the API
+# ever recorded a phone number, so no patient row existed for their ANI. The agent asked for a
+# date of birth it could not possibly match, failed, and offered a staff member. The same hole
+# swallows anything booked at the front desk or on the web, and any caller phoning from a
+# different handset.
+
+
+def _orphan_booking(client, *, name="Dana Reyes", dob=DOB, slot_index=0) -> dict:
+    """A confirmed booking with NO phone — i.e. every booking made before Phase 13, and every
+    booking a clinic makes through any other channel."""
+    slots = client.get("/availability").json()["slots"]
+    hold = client.post("/hold-slot", json={"slot_id": slots[slot_index]["slot_id"]}).json()
+    resp = client.post("/confirm-booking", json={
+        "hold_id": hold["hold_id"], "patient_name": name, "reason": "checkup",
+        "date_of_birth": dob,
+    })
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_name_and_dob_reach_a_booking_the_ani_cannot(client):
+    _orphan_booking(client)
+    # The number is unknown, so DOB alone must not be enough...
+    assert client.post("/verify-identity", json={
+        "phone": CALLER, "date_of_birth": DOB,
+    }).status_code == 403
+    # ...but the front-desk check gets in.
+    resp = client.post("/verify-identity", json={
+        "phone": CALLER, "date_of_birth": DOB, "name": "Dana Reyes",
+    })
+    assert resp.status_code == 200, resp.text
+    appts = client.post("/appointments", json={"phone": CALLER, "date_of_birth": DOB})
+    assert len(appts.json()["appointments"]) == 1
+
+
+def test_verifying_by_name_enrolls_the_number_for_next_time(client):
+    """The caller should not have to give their name on every future call."""
+    _orphan_booking(client)
+    assert client.get("/caller-memory", params={"phone": CALLER}).json()["known"] is False
+
+    client.post("/verify-identity", json={
+        "phone": CALLER, "date_of_birth": DOB, "name": "Dana Reyes",
+    })
+
+    memory = client.get("/caller-memory", params={"phone": CALLER}).json()
+    assert memory["known"] is True and memory["upcoming_appointments"] == 1
+    # And the fast path now works with no name at all.
+    assert client.post("/verify-identity", json={
+        "phone": CALLER, "date_of_birth": DOB,
+    }).status_code == 200
+
+
+def test_the_name_is_a_real_factor_not_a_formality(client):
+    _orphan_booking(client)
+    for bad in ("Sam Okafor", "", None):
+        resp = client.post("/verify-identity", json={
+            "phone": CALLER, "date_of_birth": DOB, "name": bad,
+        })
+        assert resp.status_code == 403, f"name {bad!r} must not verify"
+    # ...and the right name with the wrong birthday is equally useless.
+    assert client.post("/verify-identity", json={
+        "phone": CALLER, "date_of_birth": WRONG_DOB, "name": "Dana Reyes",
+    }).status_code == 403
+
+
+def test_transcription_spacing_and_case_do_not_fail_a_caller(client):
+    _orphan_booking(client)
+    assert client.post("/verify-identity", json={
+        "phone": CALLER, "date_of_birth": DOB,
+        "name": "  dana   REYES ",
+    }).status_code == 200
+
+
+def test_an_enrolled_number_cannot_be_used_to_verify_as_someone_else(client):
+    """The hijack this ordering prevents: whoever holds an enrolled patient's handset must not
+    be able to name a different patient and have that person's bookings re-pointed at it."""
+    _book(client, phone=CALLER, dob=DOB, name="Dana Reyes", slot_index=0)   # CALLER is enrolled
+    victim = _orphan_booking(client, name="Sam Okafor", dob="01/02/1980", slot_index=1)
+
+    resp = client.post("/verify-identity", json={
+        "phone": CALLER, "date_of_birth": "01/02/1980", "name": "Sam Okafor",
+    })
+    assert resp.status_code == 403
+
+    # Sam's booking must still be unattached and unreachable from that phone.
+    listed = client.post("/appointments", json={"phone": CALLER, "date_of_birth": DOB}).json()
+    assert victim["confirmation_id"] not in [a["confirmation_id"] for a in listed["appointments"]]
+
+
+def test_a_caller_with_no_ani_can_still_verify(client):
+    """A withheld caller ID is a normal thing, not an error."""
+    _orphan_booking(client)
+    resp = client.post("/verify-identity", json={
+        "phone": "", "date_of_birth": DOB, "name": "Dana Reyes",
+    })
+    assert resp.status_code == 200
+    assert client.post("/appointments", json={
+        "phone": "", "date_of_birth": DOB, "name": "Dana Reyes",
+    }).status_code == 200

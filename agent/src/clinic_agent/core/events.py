@@ -145,6 +145,29 @@ class PartialTranscript(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class TurnHeld(Event):
+    """The engine declined to end the caller's turn, or ran out of patience and ended it.
+
+    Deepgram says the turn is over after 300 ms of silence; ``core.endpointing`` decides
+    whether the caller agrees. That decision is turn-taking — the thing a caller feels most
+    directly when it goes wrong — and it used to leave no trace at all, so a call where
+    somebody was talked over mid-sentence looked identical to one where they weren't. It is a
+    derived decision, not audio, so it belongs in the event stream by the same rule that keeps
+    raw PCM out of it.
+
+    ``released=True`` means the hold expired and the fragment was sent anyway.
+    """
+
+    tail: str = ""          # last few words only — enough to see WHY, without a transcript copy
+    seconds: float = 0.0
+    window: int = 0
+    windows_max: int = 0
+    released: bool = False
+
+    kind: ClassVar[str] = "TurnHeld"
+
+
+@dataclass(frozen=True, slots=True)
 class FinalTranscript(Event):
     """A finalized STT utterance. This is what becomes a user message."""
 
@@ -321,6 +344,7 @@ _EVENT_TYPES: dict[str, type[Event]] = {
         SpeechStopped,
         UserInterrupted,
         PartialTranscript,
+        TurnHeld,
         FinalTranscript,
         LLMStarted,
         LLMTextDelta,
