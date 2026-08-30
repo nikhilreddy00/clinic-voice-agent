@@ -107,6 +107,17 @@ def _now() -> datetime:
 # =========================================================================================
 
 
+def target_name() -> str:
+    """Just the database name — safe for an unauthenticated response.
+
+    This is the half of describe_target() that answers "local or cloud?" ("clinic_dev" vs
+    "postgres") while carrying no host, no username, and no project identifier. /health is the
+    one route with no service token, and start_demo.sh puts it behind a public ngrok tunnel.
+    """
+    path = DATABASE_URL.rsplit("/", 1)[-1]
+    return path.split("?", 1)[0] or "unknown"
+
+
 def describe_target() -> str:
     """Where this process is actually writing, with the password removed.
 

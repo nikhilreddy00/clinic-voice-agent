@@ -120,12 +120,15 @@ app = FastAPI(
 
 @app.get("/health")
 async def health() -> dict:
-    """Liveness — and which database this process is actually writing to.
+    """Liveness — and the NAME of the database this process is writing to.
 
-    The database is named here for the same reason it is logged at startup: an agent booking
-    into the wrong database looks completely healthy from every other angle.
+    The name is here for the same reason the full target is logged at startup: an agent booking
+    into the wrong database looks completely healthy from every other angle. The name alone
+    ("clinic_dev" vs "postgres") answers that, and this route is deliberately the only one with
+    no service token — start_demo.sh publishes it through ngrok. The host, the username, and
+    the Supabase project ref stay in the startup log, where they are not world-readable.
     """
-    return {"status": "ok", "clinic": CLINIC_NAME, "database": db.describe_target()}
+    return {"status": "ok", "clinic": CLINIC_NAME, "database": db.target_name()}
 
 
 @app.get("/metrics")

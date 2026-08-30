@@ -148,3 +148,14 @@ def test_cannot_book_same_slot_twice(client):
     )
     # Slot is now booked; holding it again must fail.
     assert client.post("/hold-slot", json={"slot_id": slot_id}).status_code == 409
+
+
+def test_health_names_the_database_without_leaking_where_it_is(client):
+    """/health is the only route with no service token, and start_demo.sh publishes it through
+    an ngrok tunnel. The database NAME answers "local or cloud?"; the host, the username, and
+    the Supabase project ref must stay in the startup log."""
+    body = client.get("/health").json()
+    assert body["database"]
+    blob = str(body)
+    for leak in ("@", "supabase", "pooler", "postgresql://", "127.0.0.1", ":5432"):
+        assert leak not in blob, f"/health leaked {leak!r}"
