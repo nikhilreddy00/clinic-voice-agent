@@ -99,6 +99,7 @@ async def _sweeper() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("connected to %s", db.describe_target())
     await db.init_db()
     task = asyncio.create_task(_sweeper())
     try:
@@ -119,7 +120,12 @@ app = FastAPI(
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "clinic": CLINIC_NAME}
+    """Liveness — and which database this process is actually writing to.
+
+    The database is named here for the same reason it is logged at startup: an agent booking
+    into the wrong database looks completely healthy from every other angle.
+    """
+    return {"status": "ok", "clinic": CLINIC_NAME, "database": db.describe_target()}
 
 
 @app.get("/metrics")

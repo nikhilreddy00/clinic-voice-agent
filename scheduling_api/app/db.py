@@ -107,6 +107,26 @@ def _now() -> datetime:
 # =========================================================================================
 
 
+def describe_target() -> str:
+    """Where this process is actually writing, with the password removed.
+
+    Exists because "which database is it storing in?" was a real question during live testing,
+    and the honest answer needed `ps eww` on the running process. A service that holds
+    appointments should say what it is connected to when it starts, every time — the failure
+    this prevents is booking happily into a throwaway local database while someone refreshes a
+    cloud dashboard and sees nothing.
+    """
+    url = DATABASE_URL
+    if "@" in url:
+        scheme, _, rest = url.partition("://")
+        creds, _, hostpart = rest.rpartition("@")
+        user, sep, _password = creds.partition(":")
+        # Only print a mask where a password actually exists — "postgres:****@localhost" for a
+        # trust-auth local socket is a small lie, and this line exists to answer questions.
+        return f"{scheme}://{user}{':****' if sep else ''}@{hostpart}"
+    return url
+
+
 async def open_pool() -> AsyncConnectionPool:
     """Open the shared connection pool. Idempotent."""
     global _pool
