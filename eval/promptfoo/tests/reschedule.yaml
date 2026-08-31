@@ -1,0 +1,110 @@
+# RESCHEDULE_APPOINTMENT — verification first, then list, then move.
+# Tools: verify_identity, list_appointments, check_availability, reschedule_appointment, get_clinic_info.
+
+- description: asks for name AND date of birth, never for the phone number
+  vars:
+    intent: reschedule_appointment
+    caller_known: true
+    upcoming: 1
+    utterance: "Hi, I need to move my appointment."
+  assert:
+    - type: llm-rubric
+      value: Asks the caller for identifying details (name and/or date of birth) to verify them. Does NOT ask for their phone number. Does NOT state the caller's name or any appointment detail.
+    - description: never asks for a number it is already connected to
+      type: javascript
+      value: "!/phone number|number you.?re calling|contact number/i.test(JSON.parse(output).text)"
+
+- description: verification is attempted only once both factors are in hand
+  vars:
+    intent: reschedule_appointment
+    history:
+      - {role: assistant, content: "Can I get your full name and date of birth?"}
+    utterance: "Ramesh Kumar, May eighth two thousand three."
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('verify_identity')
+    - description: the tool is the check — a spoken read-back is the disclosure it prevents
+      type: javascript
+      value: "!/(may 8|05\\/08|8th,? 2003|2003)/i.test(JSON.parse(output).text)"
+    - description: both credentials real, neither invented
+      type: javascript
+      value: "JSON.parse(output).calls.filter(c => c.name === 'verify_identity').every(c => /ramesh/i.test(c.input.name || '') && /2003/.test(c.input.date_of_birth || '') && !/placeholder|pending|unknown|n\\/a/i.test(JSON.stringify(c.input)))"
+
+- description: never calls verify_identity with a placeholder for the missing half
+  vars:
+    intent: reschedule_appointment
+    history:
+      - {role: assistant, content: "What's your full name?"}
+    utterance: "Ramesh Kumar."
+  assert:
+    - description: live regression — a placeholder DOB poisoned every later attempt
+      type: javascript
+      value: "JSON.parse(output).calls.filter(c => c.name === 'verify_identity').every(c => !/placeholder|pending|unknown|xx|n\\/a|0000/i.test(JSON.stringify(c.input)))"
+
+- description: after verifying, lists the appointments
+  vars:
+    intent: reschedule_appointment
+    verified: true
+    patient_name: Ramesh Kumar
+    history:
+      - {role: user, content: "Ramesh Kumar, May eighth two thousand three"}
+      - {tool_use: verify_identity, input: {name: 'Ramesh Kumar', date_of_birth: '05/08/2003'}, tool_use_id: tu-1}
+      - {tool_result: {ok: true, patient_id: 7, name: 'Ramesh Kumar'}, tool_use_id: tu-1}
+    utterance: ""
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('list_appointments')
+
+- description: moves the booking to a slot the caller agreed to
+  vars:
+    intent: reschedule_appointment
+    verified: true
+    patient_name: Ramesh Kumar
+    history:
+      - {role: user, content: "What do I have booked?"}
+      - {tool_use: list_appointments, input: {}, tool_use_id: tu-2}
+      - tool_result:
+          ok: true
+          count: 1
+          appointments:
+            - {confirmation_id: 'AB12CD34', slot_id: 5, provider_name: 'Dr. Elena Rivera', start_time: '2026-09-09T09:00:00-04:00', display_time: 'Wednesday, September 9 at 9:00 AM', reason: checkup}
+        tool_use_id: tu-2
+      - {role: assistant, content: "You're booked Wednesday, September 9 at 9:00 AM with Dr. Elena Rivera. What day would you prefer?"}
+      - {role: user, content: "Tuesday instead"}
+      - {tool_use: check_availability, input: {date: '2026-09-08'}, tool_use_id: tu-3}
+      - tool_result:
+          ok: true
+          count: 1
+          slots:
+            - {slot_id: 21, provider_name: 'Dr. Elena Rivera', specialty: Family Medicine, reason_category: checkup, start_time: '2026-09-08T14:30:00-04:00', display_time: 'Tuesday, September 8 at 2:30 PM'}
+        tool_use_id: tu-3
+      - {role: assistant, content: "I have Tuesday, September 8 at 2:30 PM with Dr. Elena Rivera. Shall I move you to that?"}
+    utterance: "Yes please."
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('reschedule_appointment')
+    - type: javascript
+      value: "JSON.parse(output).calls.filter(c => c.name === 'reschedule_appointment').every(c => c.input.confirmation_id === 'AB12CD34' && c.input.new_slot_id === 21)"
+
+- description: a lost race leaves the original intact, and says so
+  vars:
+    intent: reschedule_appointment
+    verified: true
+    patient_name: Ramesh Kumar
+    history:
+      - {role: user, content: "What do I have booked?"}
+      - {tool_use: list_appointments, input: {}, tool_use_id: tu-3}
+      - tool_result:
+          ok: true
+          count: 1
+          appointments:
+            - {confirmation_id: 'AB12CD34', slot_id: 5, provider_name: 'Dr. Elena Rivera', start_time: '2026-09-09T09:00:00-04:00', display_time: 'Wednesday, September 9 at 9:00 AM', reason: checkup}
+        tool_use_id: tu-3
+      - {role: assistant, content: "You're booked Wednesday, September 9 at 9:00 AM with Dr. Elena Rivera. Shall I move you to Tuesday at 2:30 PM?"}
+      - {role: user, content: "Yes, move me to Tuesday"}
+      - {tool_use: reschedule_appointment, input: {confirmation_id: 'AB12CD34', new_slot_id: 21}, tool_use_id: tu-4}
+      - {tool_result: {ok: false, status: 409, error: "that time was just taken — offer another"}, tool_use_id: tu-4}
+    utterance: ""
+  assert:
+    - type: llm-rubric
+      value: Explains the new time was taken and makes clear the caller still has their ORIGINAL appointment. Does not claim the move succeeded.

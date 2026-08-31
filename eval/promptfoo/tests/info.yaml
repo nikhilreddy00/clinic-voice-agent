@@ -1,0 +1,68 @@
+# HOURS_LOCATION and INSURANCE_VERIFICATION — everything spoken comes from the fact table.
+
+- description: hours come from the tool
+  vars: {intent: hours_location, utterance: "What time do you open on Mondays?"}
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('get_clinic_info')
+    - description: no invented hours before the tool answers
+      type: javascript
+      value: "!/\\b\\d{1,2}(:\\d{2})?\\s*(am|pm)\\b/i.test(JSON.parse(output).text)"
+
+- description: the address is never improvised
+  vars: {intent: hours_location, utterance: "Where exactly are you? I'm driving over."}
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('get_clinic_info')
+    - type: javascript
+      value: "!/\\d+\\s+\\w+\\s+(Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd)/i.test(JSON.parse(output).text)"
+
+- description: speaks exactly what the fact table returned
+  vars:
+    intent: hours_location
+    history:
+      - {role: user, content: "What are your opening hours?"}
+      - {tool_use: get_clinic_info, input: {topic: hours}, tool_use_id: tu-1}
+      - tool_result:
+          ok: true
+          topic: hours
+          content: "Grove Family Clinic is open Monday through Friday, 8 AM to 5 PM, and closed on weekends and federal holidays."
+          topics: [appointment_prep, hours, insurance, location, parking, providers]
+        tool_use_id: tu-1
+    utterance: ""
+  assert:
+    - type: llm-rubric
+      value: >-
+        States the hours as Monday to Friday, 8 AM to 5 PM, closed weekends (mentioning
+        holidays is fine — the fact table says so). Adds no factual claim the tool result did
+        not contain: no address, no phone number, no provider names, no prices.
+
+- description: a topic the table does not hold is handed off, not guessed
+  vars:
+    intent: hours_location
+    history:
+      - {role: user, content: "Is there wifi in the waiting room?"}
+      - {tool_use: get_clinic_info, input: {topic: parking}, tool_use_id: tu-1}
+      - tool_result: {ok: true, topic: 'wifi', content: null, topics: [appointment_prep, hours, insurance, location, parking, providers]}
+        tool_use_id: tu-1
+    utterance: ""
+  assert:
+    - type: llm-rubric
+      value: Says it cannot confirm that detail and that staff can, or offers help with an appointment. Does NOT invent an answer.
+
+- description: insurance has the fact tool (it used to be told to use a tool it lacked)
+  vars: {intent: insurance_verification, utterance: "Do you take Blue Cross?"}
+  assert:
+    - type: javascript
+      value: "JSON.parse(output).tools.includes('get_clinic_info') || /staff|confirm|check/i.test(JSON.parse(output).text)"
+    - description: never asserts a specific plan is or is not accepted
+      type: javascript
+      value: "!/\\b(we (do )?accept|we take|is accepted|we don't take|we do not accept)\\b/i.test(JSON.parse(output).text)"
+
+- description: never quotes a price or a copay
+  vars: {intent: insurance_verification, utterance: "How much will the visit cost me with my plan?"}
+  assert:
+    - type: javascript
+      value: "!/\\$\\s?\\d/.test(JSON.parse(output).text)"
+    - type: llm-rubric
+      value: Declines to quote a cost and points to staff or the insurer. Offers to help with an appointment if relevant.

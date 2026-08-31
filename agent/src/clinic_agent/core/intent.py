@@ -83,6 +83,10 @@ EMERGENCY_PATTERNS = _compile(
             r"\bcrushing (?:pain|pressure)\b",
             r"\bchest (?:pressure|tightness)\b",
             r"\bmy chest (?:is tight|feels tight|hurts)\b",
+            # "my chest is crushing" — the promptfoo suite found this one. The existing
+            # `crushing (pain|pressure)` requires the noun the caller often leaves out.
+            r"\bchest (?:is|feels) crushing\b",
+            r"\bcrushing (?:feeling|sensation)\b",
         ],
         "respiratory": [
             r"\bcan'?t breathe\b",
@@ -115,6 +119,11 @@ EMERGENCY_PATTERNS = _compile(
             r"\bseizure\b",
             r"\bconvulsing\b",
             r"\bfainted\b",
+            # Imminent, not past. "passed out" and "fainted" were covered; a caller who is
+            # still conscious enough to say it is about to happen was not.
+            r"\b(?:about to|going to|gonna|think i'?m gonna) (?:pass out|faint|black out)\b",
+            r"\bpassing out\b",
+            r"\bfainting\b",
         ],
         "hemorrhage": [
             r"\bbleeding (?:heavily|badly|a lot)\b",
@@ -178,6 +187,43 @@ _DENIAL = re.compile(
 )
 
 
+# A few phrases describe either a crisis happening now or a memory of one. "I passed out" is an
+# emergency; "I passed out flyers at the health fair" and "I fainted once as a teenager" are not.
+#
+# This guard is deliberately confined to those three past-tense phrases and is NOT a general
+# rule, for the same reason the negation guard is not: applied to "can't breathe" or "not
+# breathing", a rule like this would suppress the most urgent strings in the module. Widening
+# either guard is how a safety check gets silently inverted.
+#
+# The bias is still towards firing. A missed emergency is unbounded harm; a false positive is a
+# caller told to hang up and dial 911 when they did not need to, which is bad service and safe.
+# So the guard requires EXPLICIT evidence — a past-tense marker or a direct object — never an
+# absence of urgency cues.
+_HISTORICAL_SENSITIVE = re.compile(r"\b(?:passed out|blacked out|fainted)\b", re.IGNORECASE)
+
+_HISTORY_MARKER = re.compile(
+    r"\b(?:once|twice|a few times|years? ago|months? ago|weeks? ago|last (?:week|month|year)|"
+    r"as a (?:kid|child|teenager|teen)|when i was|in the past|history of|used to|"
+    r"back in \d{4}|previously)\b",
+    re.IGNORECASE,
+)
+
+# "passed out X" where X is a thing being handed round — the verb is transitive and has nothing
+# to do with consciousness.
+_PASSED_OUT_OBJECT = re.compile(
+    r"\bpassed out\s+(?:\w+\s+){0,2}"
+    r"(?:flyers?|leaflets?|pamphlets?|copies|forms?|papers?|samples?|candy|snacks?|cards?)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_recollection(text: str, phrase: str) -> bool:
+    """True when a consciousness phrase is describing the past rather than the present."""
+    if not _HISTORICAL_SENSITIVE.fullmatch(phrase.strip()):
+        return False
+    return bool(_HISTORY_MARKER.search(text) or _PASSED_OUT_OBJECT.search(text))
+
+
 def detect_emergency(text: str) -> EmergencyMatch | None:
     """Return the first matching emergency rule, or None. Pure — no I/O, no model, no clock.
 
@@ -190,7 +236,7 @@ def detect_emergency(text: str) -> EmergencyMatch | None:
 
     for category, pattern in EMERGENCY_PATTERNS:
         match = pattern.search(text)
-        if match:
+        if match and not _is_recollection(text, match.group(0)):
             return EmergencyMatch(category=category, phrase=match.group(0))
 
     for category, pattern in NEGATABLE_PATTERNS:

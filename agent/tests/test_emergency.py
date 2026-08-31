@@ -201,3 +201,43 @@ def test_match_reports_what_actually_triggered_it():
     match = detect_emergency("My husband is having a heart attack right now")
     assert match.phrase.lower() == "heart attack"
     assert match.category == "cardiac"
+
+
+# --- gaps the promptfoo suite found, which the hand-written set did not ----------------------
+
+
+@pytest.mark.parametrize("utterance", [
+    "I'm about to pass out and my chest is crushing",
+    "I think I'm gonna faint",
+    "he's passing out",
+    "I'm fainting",
+    "there's a crushing sensation in my chest",
+])
+def test_imminent_collapse_is_an_emergency(utterance):
+    """"passed out" and "fainted" were covered; a caller still conscious enough to say it is
+    ABOUT to happen was not. Found by the per-intent eval, not by this file."""
+    assert detect_emergency(utterance) is not None
+
+
+@pytest.mark.parametrize("utterance", [
+    "I passed out flyers at the health fair last week",
+    "my daughter is crushing it at school",
+    "I fainted once as a teenager, is that relevant for the form?",
+])
+def test_the_new_patterns_do_not_over_trigger(utterance):
+    """Every widening of this detector buys recall with precision. These are the sentences the
+    new patterns are most likely to swallow."""
+    match = detect_emergency(utterance)
+    assert match is None, f"false positive on {utterance!r}: {match}"
+
+
+@pytest.mark.parametrize("utterance", [
+    "I passed out",
+    "I just passed out a minute ago",
+    "she blacked out and won't wake up",
+    "my husband fainted, he's on the floor",
+])
+def test_the_recollection_guard_never_suppresses_a_live_collapse(utterance):
+    """The guard requires explicit past-tense evidence. Absence of urgency cues is not evidence
+    — that asymmetry is the whole point, and inverting it is how a safety check dies quietly."""
+    assert detect_emergency(utterance) is not None

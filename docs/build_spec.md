@@ -1127,3 +1127,40 @@ the diagnosis above needed the console log, not the trace. `TurnHeld` records ea
 with `released=True`, the case where patience ran out and a still-unfinished fragment was sent
 anyway. Turn-taking is a derived decision, so it belongs in the event stream by the same rule
 that keeps raw audio out of it.
+
+### Per-intent evals (promptfoo) — and what they found
+
+`eval/promptfoo/` holds a behavioural suite, one file per caller intent, run by
+[promptfoo](https://github.com/promptfoo/promptfoo). The design decision that makes it worth
+having: **the provider imports the agent's own `build_system_prompt()` and
+`build_tools_schema()`**, so there is no second copy of the prompt to drift. It also evaluates
+the SYSTEM rather than the raw model — `mode: classify` runs the deterministic detector before
+the classifier and folds the result through `resolve_intent`, and `mode: respond` mirrors the
+engine's follow-through nudge, because scoring a first reply the engine would have repaired
+measures something no caller ever hears.
+
+**72 cases, 100% on three consecutive runs** (`./run.sh`). Roughly half the failures found
+while building it were the test being wrong — an unfair stage, or a regex reading "I can't
+approve refills" as an approval. The other half were real, and each was fixed at the source:
+
+| Found | Fix |
+|---|---|
+| The classifier could declare an emergency and strip every tool mid-booking | `CLASSIFIER_ONLY_ADVISORY` — only `detect_emergency` sets that intent |
+| `insurance_verification` was told to use `get_clinic_info` and handed no tools | it gets the fact tool |
+| A caller asking for a person produced no escalation of any kind | `TransferToHuman` on the intent, once |
+| The model joined a name and a date of birth in one sentence | worked WRONG/RIGHT examples in the core prompt |
+| "I'm holding that for you" with no tool call | `reducer._ACTION_CLAIM` — one follow-through nudge per caller turn |
+| The agent read a date of birth back aloud to check it | the tool IS the check; read-back forbidden in `_VERIFY_BLOCK` |
+| `detect_emergency` missed "my chest is crushing" and "about to pass out" | patterns extended |
+| `detect_emergency` fired on "I passed out flyers" and a childhood faint | `_is_recollection`, narrowly scoped to three past-tense phrases |
+
+The last two are the argument for the suite existing. `detect_emergency` is the highest-stakes
+control in the system, it scored 100% recall and zero false positives on its own hand-written
+set, and an eval written from a different angle still found gaps in both directions.
+
+**The follow-through nudge is engine enforcement, not a prompt.** A turn that announces an
+action ("I'm booking you now") and calls no tool gets one re-prompt, once per caller turn. The
+prompt has forbidden that since the live call where it cost 100 seconds of silence, with a
+worked example, and the suite still caught it — which is the whole argument for enforcing it in
+the reducer instead of asking again more loudly. A false positive costs one extra request; it
+cannot produce a wrong action.

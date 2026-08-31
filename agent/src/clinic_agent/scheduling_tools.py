@@ -844,7 +844,11 @@ def build_tools_schema(intent: "Intent | None" = None) -> ToolsSchema:
         tools = pick("verify_identity", "list_appointments", "cancel_appointment")
     elif intent is _Intent.MEDICATION_REFILL:
         tools = pick("verify_identity", "request_refill")
-    elif intent is _Intent.HOURS_LOCATION:
+    elif intent in (_Intent.HOURS_LOCATION, _Intent.INSURANCE_VERIFICATION):
+        # Insurance gets the fact lookup and nothing else. Its prompt tells the model to state
+        # the clinic's general policy "from get_clinic_info" — and it used to be handed no
+        # tools at all, so it was instructed to use something it did not have. A model in that
+        # position either invents the policy or stalls; both are worse than the hand-off.
         tools = [info]
     else:
         tools = []

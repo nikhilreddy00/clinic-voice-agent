@@ -1,0 +1,87 @@
+# INTENT CLASSIFICATION — the routing decision every other suite depends on.
+#
+# `mode: classify` runs the deterministic emergency detector first (as the reducer does), then
+# the classifier, then intents.resolve_intent. Stickiness is therefore under test here, not
+# just raw labelling: `established` stages an intent the caller already has.
+
+# --- emergency: the deterministic control, which never reaches a model --------------------
+- vars: {mode: classify, utterance: "I think I'm having a heart attack"}
+  assert:
+    - type: javascript
+      value: JSON.parse(output).intent === 'emergency' && JSON.parse(output).source === 'detector'
+- vars: {mode: classify, utterance: "my chest is tight and I can't breathe"}
+  assert:
+    - type: javascript
+      value: JSON.parse(output).source === 'detector'
+- vars: {mode: classify, utterance: "she's not breathing"}
+  assert:
+    - type: javascript
+      value: JSON.parse(output).source === 'detector'
+- vars: {mode: classify, utterance: "I'm bleeding heavily and can't stop it"}
+  assert:
+    - type: javascript
+      value: JSON.parse(output).source === 'detector'
+
+# A wound is not a 911 call. The classifier may say emergency; it must never be applied.
+- description: a knee laceration mid-booking must not become an emergency (live regression)
+  vars:
+    mode: classify
+    established: schedule_appointment
+    utterance: "there is a severe deep injury and the skin came out"
+  assert:
+    - type: javascript
+      value: JSON.parse(output).intent === 'schedule_appointment'
+- description: an injury description on turn one must not be applied as emergency either
+  vars: {mode: classify, utterance: "I had a severe injury at my knee"}
+  assert:
+    - type: javascript
+      value: JSON.parse(output).intent !== 'emergency'
+
+# --- the ordinary labels ------------------------------------------------------------------
+- vars: {mode: classify, utterance: "I'd like to book an appointment"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'schedule_appointment'}]
+- vars: {mode: classify, utterance: "I need to see someone about a cough next week"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'schedule_appointment'}]
+- vars: {mode: classify, utterance: "I need to move my appointment to another day"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'reschedule_appointment'}]
+- vars: {mode: classify, utterance: "can you cancel my visit on Thursday"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'cancel_appointment'}]
+- vars: {mode: classify, utterance: "I need a refill on my blood pressure medication"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'medication_refill'}]
+- vars: {mode: classify, utterance: "I got a bill I don't understand"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'billing_question'}]
+- vars: {mode: classify, utterance: "are my blood test results back yet?"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'test_results'}]
+- vars: {mode: classify, utterance: "do you take Aetna?"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'insurance_verification'}]
+- vars: {mode: classify, utterance: "what time do you close on Fridays?"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'hours_location'}]
+- vars: {mode: classify, utterance: "just let me talk to a real person"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'speak_to_human'}]
+- vars: {mode: classify, utterance: "should I take ibuprofen for this?"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'clinical_question'}]
+
+# --- stickiness: slot-filling answers are not topic changes -------------------------------
+# Each of these classifies as `unknown` (or worse) in isolation. Applying them would strip the
+# scheduling tools mid-booking, which is how a live call ended with a fabricated confirmation.
+- description: a name mid-booking
+  vars: {mode: classify, established: schedule_appointment, utterance: "Dana Reyes."}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'schedule_appointment'}]
+- description: a date of birth mid-booking
+  vars: {mode: classify, established: schedule_appointment, utterance: "March 15th, 1990."}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'schedule_appointment'}]
+- description: the answer to "what brings you in?" is a clinical description by construction
+  vars:
+    mode: classify
+    established: schedule_appointment
+    utterance: "I've been playing pickleball and I'm getting ankle and wrist pain"
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'schedule_appointment'}]
+- description: a question during a booking is not a change of task
+  vars: {mode: classify, established: schedule_appointment, utterance: "does my insurance cover this?"}
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'schedule_appointment'}]
+- description: but a genuine change of task must still land
+  vars:
+    mode: classify
+    established: schedule_appointment
+    utterance: "actually forget the appointment, I just need a prescription refill"
+  assert: [{type: javascript, value: JSON.parse(output).intent === 'medication_refill'}]

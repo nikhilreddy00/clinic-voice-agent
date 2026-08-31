@@ -1,0 +1,5 @@
+node_modules/
+.promptfoo/
+results.json
+.one-suite.yaml
+run.log

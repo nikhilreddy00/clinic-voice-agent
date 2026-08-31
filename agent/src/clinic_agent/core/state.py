@@ -123,6 +123,10 @@ class CallState:
     patient_name: str = ""
 
     # --- counters / outcome -------------------------------------------------------------
+    # One follow-through nudge per caller turn — see reducer._ACTION_CLAIM. Bounded so a model
+    # that keeps promising cannot loop the engine.
+    nudged: bool = False
+
     turn_index: int = 0
     interruptions: int = 0
     booked: bool = False

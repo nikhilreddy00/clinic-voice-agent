@@ -1,0 +1,124 @@
+# SCHEDULE_APPOINTMENT — the flow this line exists for.
+# Tools: check_availability, hold_slot, confirm_booking, get_clinic_info.
+
+- description: a stated day triggers an availability lookup, not a promise to look
+  vars:
+    intent: schedule_appointment
+    history:
+      - {role: user, content: "I need a checkup"}
+      - {role: assistant, content: "Happy to help. What day works for you?"}
+    utterance: "How about tomorrow?"
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('check_availability')
+    - description: tomorrow resolves off the injected date table (fixed now = Mon 7 Sep 2026)
+      type: javascript
+      value: "JSON.parse(output).calls.filter(c => c.name === 'check_availability').every(c => !c.input.date || c.input.date === '2026-09-08')"
+
+- description: an empty window re-checks with no date filter before giving up
+  vars:
+    intent: schedule_appointment
+    history:
+      - {role: user, content: "Anything tomorrow?"}
+      - {tool_use: check_availability, input: {date: '2026-09-08'}, tool_use_id: tu-1}
+      - {tool_result: {ok: true, count: 0, slots: []}, tool_use_id: tu-1}
+    utterance: ""
+  assert:
+    - description: must widen the search rather than escalate on the first empty result
+      type: javascript
+      value: JSON.parse(output).tools.includes('check_availability')
+    - type: javascript
+      value: "JSON.parse(output).calls.filter(c => c.name === 'check_availability').every(c => !c.input.date)"
+
+- description: a chosen slot is held before the read-back
+  vars:
+    intent: schedule_appointment
+    history:
+      - {role: user, content: "Tuesday please"}
+      - {tool_use: check_availability, input: {date: '2026-09-08'}, tool_use_id: tu-1}
+      - tool_result:
+          ok: true
+          count: 2
+          slots:
+            - {slot_id: 17, provider_name: "Dr. Marcus Chen", specialty: Pediatrics, reason_category: checkup, start_time: '2026-09-08T13:00:00-04:00', display_time: 'Tuesday, September 8 at 1:00 PM'}
+            - {slot_id: 21, provider_name: "Dr. Elena Rivera", specialty: Family Medicine, reason_category: checkup, start_time: '2026-09-08T14:30:00-04:00', display_time: 'Tuesday, September 8 at 2:30 PM'}
+        tool_use_id: tu-1
+      - {role: assistant, content: "I have 1:00 PM with Dr. Marcus Chen or 2:30 PM with Dr. Elena Rivera. Which works?"}
+    utterance: "One PM is fine."
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('hold_slot')
+    - type: javascript
+      value: JSON.parse(output).calls.find(c => c.name === 'hold_slot').input.slot_id === 17
+
+- description: booking is committed only after an explicit yes, and carries the intake
+  vars:
+    intent: schedule_appointment
+    history:
+      - {role: user, content: "My name is Dana Reyes, date of birth March 15th 1990, I'm a new patient with a sore throat"}
+      - {tool_use: hold_slot, input: {slot_id: 17}, tool_use_id: tu-2}
+      - {tool_result: {ok: true, hold_id: 'h-abc', slot_id: 17, expires_at: '2026-09-07T11:05:00-04:00'}, tool_use_id: tu-2}
+      - {role: assistant, content: "I have you down for Tuesday, September 8 at 1:00 PM with Dr. Marcus Chen. Shall I book it?"}
+    utterance: "Yes, please book it."
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('confirm_booking')
+    - type: javascript
+      value: JSON.parse(output).calls.find(c => c.name === 'confirm_booking').input.hold_id === 'h-abc'
+    - description: the DOB collected earlier must be carried into the booking
+      type: javascript
+      value: "JSON.parse(output).calls.filter(c => c.name === 'confirm_booking').every(c => /1990/.test(c.input.date_of_birth || ''))"
+
+- description: a hold is never read back as a confirmation number
+  vars:
+    intent: schedule_appointment
+    history:
+      - {role: user, content: "Book me the 1 PM please"}
+      - {tool_use: hold_slot, input: {slot_id: 17}, tool_use_id: tu-2}
+      - {tool_result: {ok: true, hold_id: '830633cb-8fa2-441e-a74f-15dd71fb6623', slot_id: 17, expires_at: '2026-09-07T11:05:00-04:00'}, tool_use_id: tu-2}
+    utterance: "What's my confirmation number?"
+  assert:
+    - description: the hold UUID must never be spoken (a live caller took one for their code)
+      type: javascript
+      value: "!JSON.parse(output).text.includes('830633cb')"
+    - type: not-icontains
+      value: "confirmation number is"
+
+- description: a slot taken between hold and confirm is recovered, not narrated over
+  vars:
+    intent: schedule_appointment
+    history:
+      - {role: user, content: "Book the 1 PM"}
+      - {tool_use: hold_slot, input: {slot_id: 17}, tool_use_id: tu-3}
+      - {tool_result: {ok: false, status: 409, error: "that slot was just taken — offer another"}, tool_use_id: tu-3}
+    utterance: ""
+  assert:
+    - type: javascript
+      value: "JSON.parse(output).tools.includes('check_availability') || /another|different|else|took|taken|sorry/i.test(JSON.parse(output).text)"
+    - type: llm-rubric
+      value: Apologises or acknowledges the slot is gone and moves towards offering an alternative. Does NOT claim the appointment was booked.
+
+- description: clinic facts come from the tool, never from the model
+  vars:
+    intent: schedule_appointment
+    history:
+      - {role: user, content: "I'd like to book a checkup"}
+      - {role: assistant, content: "Happy to help. What's your name?"}
+      - {role: user, content: "Dana Reyes"}
+      - {role: assistant, content: "Thanks Dana. What day suits you?"}
+    utterance: "Before that — where exactly are you located? I need to know if I can get there."
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('get_clinic_info')
+    - description: no invented address before the tool answers
+      type: javascript
+      value: "!/\\d+\\s+\\w+\\s+(Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd)/i.test(JSON.parse(output).text)"
+
+- description: refills are not on offer during a booking
+  vars:
+    intent: schedule_appointment
+    history: [{role: user, content: "I need an appointment"}]
+    utterance: "Oh and can you refill my inhaler while you're at it?"
+  assert:
+    - type: javascript
+      value: "!JSON.parse(output).tools.includes('request_refill')"

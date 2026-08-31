@@ -365,6 +365,7 @@ def _on_final_transcript(state: CallState, e: ev.FinalTranscript):
         messages=state.messages + ({"role": "user", "content": text},),
         turn_index=state.turn_index + 1,
         last_partial="",
+        nudged=False,  # a fresh caller turn gets a fresh follow-through allowance
     )
     state, start = _next_request(state)
     # Classification runs ALONGSIDE the turn, never before it. Intent is an optimization on the
@@ -444,6 +445,34 @@ def _on_llm_delta(state: CallState, e: ev.LLMTextDelta):
         state, utterance_id = _open_utterance(state)
     return state, [Speak(utterance_id=utterance_id, text=c) for c in chunks]
 
+
+# Phrases that describe a TOOL CALL in progress. A turn that ends with one of these and no
+# tool_use is the failure a caller experiences as the agent freezing: it says "I'm booking you
+# right now", stops, and the line goes quiet until they say "hello?".
+#
+# Measured live: 100 seconds and three repetitions of that exact sentence, no tool call, nothing
+# booked. The prompt has told the model not to do this since that call — in the core prompt, with
+# a worked WRONG/RIGHT example — and the promptfoo suite still catches it, which is the argument
+# for enforcing it here rather than asking again more loudly.
+#
+# The nudge cannot cause a wrong action: it re-runs the same turn with one instruction added, so
+# the worst a false positive costs is one extra request. It fires at most once per caller turn.
+_ACTION_CLAIM = re.compile(
+    r"\b("
+    r"i'?m (holding|booking|checking|looking|pulling|scheduling|cancel[l]?ing|moving)"
+    r"|let me (check|look|see|pull|find|book|hold|get that)"
+    r"|i'?ll (check|look|see|pull|find|book|hold)"
+    r"|one moment|hold on|bear with me|give me (a|one) (second|moment)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_ACTION_NUDGE = (
+    "[system] Your last reply told the caller you were taking an action, but you made no tool "
+    "call, so nothing happened and they are listening to silence. Either make that tool call "
+    "now, or — if you still need something from them first — ask them for it directly. Do not "
+    "repeat the claim."
+)
 
 # What the reducer tells the model when it refuses a PHI tool. Phrased as an instruction the
 # model can act on, not an error: the recovery is to ask for the date of birth, and a bare
@@ -542,6 +571,7 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
 
     actions: list[Action] = []
     blocks: list[dict[str, Any]] = []
+    spoken = state.turn_text  # captured before the reset below clears it
     if state.turn_text.strip():
         blocks.append(_text_block(state.turn_text))
     blocks.extend(state.turn_tool_uses)
@@ -574,6 +604,22 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
 
     if state.pending_tools:
         return replace(state, phase=Phase.TOOL_WAIT), actions
+
+    if (
+        not committed
+        and not state.nudged
+        and _ACTION_CLAIM.search(spoken or e.text or "")
+    ):
+        # Announced an action, took none. Give the model exactly one chance to follow through
+        # before the caller is left waiting on a promise nothing is going to keep.
+        state = replace(
+            state,
+            nudged=True,
+            messages=state.messages + ({"role": "user", "content": _ACTION_NUDGE},),
+        )
+        state, start = _next_request(state)
+        return state, actions + [start]
+
     if state.tool_results:
         # Every tool this turn was refused by the gate above, so no ToolCompleted will ever
         # arrive to drain the turn. Send the refusals back now; without this the call stalls
@@ -707,14 +753,26 @@ def _on_intent_classified(state: CallState, e: ev.IntentClassified):
     )
     intent = resolved
 
+    # A caller asking for a person is an escalation, not a topic. It used to be nothing but a
+    # prompt fragment: the model said it would pass them to staff, and the engine recorded
+    # neither the request nor the outcome — so a call that ended in "I want a human" was
+    # indistinguishable from one that simply stopped. TransferToHuman marks the call escalated
+    # and carries the reason into the Phase-15 warm handoff.
+    escalation: list[Action] = []
+    if intent is Intent.SPEAK_TO_HUMAN and previous is not Intent.SPEAK_TO_HUMAN:
+        escalation = [TransferToHuman(
+            reason="caller_requested_human",
+            summary="The caller asked to speak to a person.",
+        )]
+
     if state.phase is not Phase.THINKING or state.request_id is None:
-        return state, []  # nothing in flight; it scopes the next request
+        return state, escalation  # nothing in flight; it scopes the next request
     if _tool_surface(previous) == _tool_surface(intent):
-        return state, []
+        return state, escalation
 
     state, actions = _abort_in_flight(state)
     state, start = _next_request(state)
-    return state, actions + [start]
+    return state, escalation + actions + [start]
 
 
 def _tool_surface(intent: Intent | None) -> bool:

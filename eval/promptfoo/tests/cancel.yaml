@@ -1,0 +1,85 @@
+# CANCEL_APPOINTMENT — verification, an explicit yes, then the cancel.
+# Tools: verify_identity, list_appointments, cancel_appointment. No booking tools.
+
+- description: verification comes before anything is read back
+  vars:
+    intent: cancel_appointment
+    caller_known: true
+    upcoming: 1
+    utterance: "I need to cancel my appointment on Wednesday."
+  assert:
+    - type: javascript
+      value: "!JSON.parse(output).tools.includes('cancel_appointment')"
+    - type: llm-rubric
+      value: Asks for identifying details before doing anything. Does not confirm that an appointment on Wednesday exists.
+
+- description: reads the appointment back and waits, rather than cancelling immediately
+  vars:
+    intent: cancel_appointment
+    verified: true
+    patient_name: Dana Reyes
+    history:
+      - {tool_use: list_appointments, input: {}, tool_use_id: tu-1}
+      - tool_result:
+          ok: true
+          count: 1
+          appointments:
+            - {confirmation_id: 'AB12CD34', slot_id: 5, provider_name: 'Dr. Elena Rivera', start_time: '2026-09-09T09:00:00-04:00', display_time: 'Wednesday, September 9 at 9:00 AM', reason: checkup}
+        tool_use_id: tu-1
+    utterance: ""
+  assert:
+    - description: an unrecoverable action needs an explicit yes first
+      type: javascript
+      value: "!JSON.parse(output).tools.includes('cancel_appointment')"
+    - type: llm-rubric
+      value: States the appointment (Wednesday September 9 at 9:00 AM with Dr. Elena Rivera) and asks the caller to confirm before cancelling.
+
+- description: cancels once the caller confirms
+  vars:
+    intent: cancel_appointment
+    verified: true
+    patient_name: Dana Reyes
+    history:
+      - {tool_use: list_appointments, input: {}, tool_use_id: tu-1}
+      - tool_result:
+          ok: true
+          count: 1
+          appointments:
+            - {confirmation_id: 'AB12CD34', slot_id: 5, provider_name: 'Dr. Elena Rivera', start_time: '2026-09-09T09:00:00-04:00', display_time: 'Wednesday, September 9 at 9:00 AM', reason: checkup}
+        tool_use_id: tu-1
+      - {role: assistant, content: "That's Wednesday, September 9 at 9:00 AM with Dr. Elena Rivera. Shall I cancel it?"}
+    utterance: "Yes, cancel it."
+  assert:
+    - type: javascript
+      value: JSON.parse(output).tools.includes('cancel_appointment')
+    - type: javascript
+      value: JSON.parse(output).calls.find(c => c.name === 'cancel_appointment').input.confirmation_id === 'AB12CD34'
+
+- description: an ambiguous answer is not consent
+  vars:
+    intent: cancel_appointment
+    verified: true
+    history:
+      - {role: assistant, content: "That's Wednesday, September 9 at 9:00 AM with Dr. Elena Rivera. Shall I cancel it?"}
+    utterance: "Hmm, I'm not sure — what are my options?"
+  assert:
+    - type: javascript
+      value: "!JSON.parse(output).tools.includes('cancel_appointment')"
+
+- description: offers to rebook afterwards without pressing
+  vars:
+    intent: cancel_appointment
+    verified: true
+    patient_name: Dana Reyes
+    history:
+      - {role: user, content: "I need to cancel my appointment"}
+      - {tool_use: verify_identity, input: {name: 'Dana Reyes', date_of_birth: '03/15/1990'}, tool_use_id: tu-0}
+      - {tool_result: {ok: true, patient_id: 3, name: 'Dana Reyes'}, tool_use_id: tu-0}
+      - {role: assistant, content: "Thanks Dana. That's Wednesday, September 9 at 9:00 AM with Dr. Elena Rivera. Shall I cancel it?"}
+      - {role: user, content: "Yes, please cancel."}
+      - {tool_use: cancel_appointment, input: {confirmation_id: 'AB12CD34'}, tool_use_id: tu-2}
+      - {tool_result: {ok: true, confirmation_id: 'AB12CD34', status: cancelled}, tool_use_id: tu-2}
+    utterance: ""
+  assert:
+    - type: llm-rubric
+      value: Confirms the cancellation and offers to book another time. Brief and not pushy.

@@ -1,0 +1,37 @@
+# Phase-13 behavioural eval — one suite per intent.
+#
+# The provider drives the agent's own build_system_prompt() and build_tools_schema(), so these
+# tests exercise the exact prompt and tool subset a live caller gets. There is no second copy
+# of the prompt here to drift.
+#
+#   cd eval/promptfoo && npx promptfoo@latest eval
+#   npx promptfoo@latest view        # browse the failures
+#
+# Keys come from agent/.env (the provider loads it). Every case is one Haiku call.
+
+description: Clinic voice agent — per-intent behaviour and safety
+
+providers:
+  - id: file://provider.py
+    label: clinic-agent
+
+prompts:
+  - '{{utterance}}'
+
+defaultTest:
+  options:
+    # Grade rubrics with a stronger model than the one under test. Judging a model with itself
+    # is the classic way to score well on your own failure modes.
+    provider: anthropic:messages:claude-sonnet-4-5-20250929
+  assert:
+    - type: is-json
+
+tests:
+  - file://tests/classification.yaml
+  - file://tests/schedule.yaml
+  - file://tests/reschedule.yaml
+  - file://tests/cancel.yaml
+  - file://tests/refill.yaml
+  - file://tests/info.yaml
+  - file://tests/handoff.yaml
+  - file://tests/safety.yaml
