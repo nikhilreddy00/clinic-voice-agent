@@ -55,15 +55,38 @@ class MediaAdapter:
 
     # --- playback (called by the TTS adapter) -------------------------------------------
 
+    # How long an open utterance may go without audio or an end-of-synthesis marker before the
+    # engine ends it anyway. Generous: sentences arrive as the model produces them, so real
+    # gaps of a second or two are normal. This is not a latency knob — it is the line between
+    # "the bot is still talking" and "the call has gone deaf".
+    STALL_TIMEOUT_S = 5.0
+
     async def play(self, utterance_id: str, pcm: bytes) -> None:
         await self._queue.put((utterance_id, pcm))
 
     async def end_utterance(self, utterance_id: str) -> None:
-        """Synthesis for this utterance is complete; no more chunks are coming."""
+        """Synthesis for this utterance is complete; no more chunks are coming.
+
+        This is a MARKER ON THE QUEUE, not a decision taken here, and that matters — deciding
+        here is what deadlocked a live call.
+
+        The old version finished the utterance only if ``_speaking is None``, which is a race
+        it loses on exactly the utterances most likely to hit it. A short reply ("What's your
+        name?") is one chunk: the playback loop pops it, sets ``_speaking``, writes it, checks
+        ``synthesis_done`` — not there yet — and goes back to blocking on an empty queue.
+        Cartesia's ``done`` then arrives, sees ``_speaking`` is NOT None, and does nothing at
+        all. Nobody ever emits BotStoppedSpeaking.
+
+        The consequence is not a cosmetic missing event. ``bot_speaking`` stays true forever,
+        so the mic gate never reopens, so the caller's next words never reach STT. Measured on
+        a live call: the agent asked for a name and then went deaf for 37 seconds until the
+        caller hung up.
+
+        Putting the marker through the queue means completion is decided in exactly one place,
+        by the component that knows what has actually been written.
+        """
         self._synthesis_done.add(utterance_id)
-        if self._speaking is None and self._queue.empty():
-            # Everything already drained before the done message arrived.
-            self._finish(utterance_id, completed=True)
+        await self._queue.put((utterance_id, b""))
 
     async def clear(self, utterance_id: str) -> None:
         """Barge-in: throw away everything queued and stop the device mid-buffer."""
@@ -88,6 +111,9 @@ class MediaAdapter:
     def _finish(self, utterance_id: str, *, completed: bool) -> None:
         self._speaking = None
         self._synthesis_done.discard(utterance_id)
+        # Emitted even when no audio ever played: the reducer put the call in SPEAKING when it
+        # opened the utterance, and something has to take it out again. A stop with no start is
+        # harmless — the mic gate simply opens, which is the state we want either way.
         self._emit(
             ev.BotStoppedSpeaking(
                 t=time.monotonic(), utterance_id=utterance_id, completed=completed
@@ -96,7 +122,32 @@ class MediaAdapter:
 
     async def _playback_loop(self) -> None:
         while not self._closing:
-            utterance_id, pcm = await self._queue.get()
+            try:
+                # Wait forever when idle; time out only while an utterance is open, so a
+                # provider that never sends `done` cannot strand the mic gate closed. The
+                # marker below is the normal path — this is the backstop for the abnormal one.
+                utterance_id, pcm = await asyncio.wait_for(
+                    self._queue.get(),
+                    self.STALL_TIMEOUT_S if self._speaking is not None else None,
+                )
+            except asyncio.TimeoutError:
+                stalled = self._speaking
+                if stalled is not None:
+                    logger.warning(
+                        f"[media] no audio for {self.STALL_TIMEOUT_S:.0f}s on {stalled} and no "
+                        "end-of-synthesis — ending the utterance so the caller can be heard"
+                    )
+                    self._finish(stalled, completed=False)
+                continue
+
+            if not pcm:
+                # End-of-synthesis marker. Everything queued before it has been written.
+                if self._queue.empty():
+                    if self._speaking == utterance_id:
+                        await self._drain_device()
+                    self._finish(utterance_id, completed=True)
+                continue
+
             if self._speaking != utterance_id:
                 self._speaking = utterance_id
                 self._emit(ev.BotStartedSpeaking(t=time.monotonic(), utterance_id=utterance_id))
@@ -111,6 +162,8 @@ class MediaAdapter:
                 and self._queue.empty()
                 and utterance_id in self._synthesis_done
             ):
+                # Synthesis finished while this chunk was being written; the marker is still
+                # behind us in the queue and will be a no-op when it arrives.
                 await self._drain_device()
                 self._finish(utterance_id, completed=True)
 
