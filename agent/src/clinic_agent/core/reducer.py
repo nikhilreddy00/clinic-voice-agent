@@ -106,6 +106,41 @@ def _split_speakable(buffer: str) -> tuple[list[str], str]:
     return chunks, remainder
 
 
+# A model may narrate its reasoning in <thinking> tags even when extended thinking is not
+# enabled, and everything the reducer treats as text goes to TTS. On a live call one of these
+# was spoken to the caller in full — including the internal hold UUID, which they heard as "a
+# big number in a different format" and reasonably took for their confirmation code.
+#
+# Streaming makes this a state problem rather than a regex: the opening tag, the body, and the
+# closing tag arrive in different deltas. So text from an OPEN tag onward is held back rather
+# than spoken, and released only if a closing tag never comes (it is then dropped entirely) —
+# the caller must never hear the inside of one of these.
+_THINKING_BLOCK = re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE)
+_THINKING_OPEN = re.compile(r"<thinking>", re.IGNORECASE)
+# A tag split across deltas ("…<thin"). Held one delta, then resolved either way.
+_PARTIAL_TAG = re.compile(r"<[a-zA-Z/]{0,9}$")
+
+
+def _strip_thinking(buffer: str) -> tuple[str, str]:
+    """Split a buffer into (speakable, held-back). Pure.
+
+    >>> _strip_thinking("Hi <thinking>secret</thinking> there")
+    ('Hi  there', '')
+    >>> _strip_thinking("Hi <thinking>half a thoug")
+    ('Hi ', '<thinking>half a thoug')
+    >>> _strip_thinking("Booking now<thin")
+    ('Booking now', '<thin')
+    """
+    text = _THINKING_BLOCK.sub("", buffer)
+    opened = _THINKING_OPEN.search(text)
+    if opened:
+        return text[: opened.start()], text[opened.start() :]
+    partial = _PARTIAL_TAG.search(text)
+    if partial:
+        return text[: partial.start()], text[partial.start() :]
+    return text, ""
+
+
 def _text_block(text: str) -> dict[str, Any]:
     return {"type": "text", "text": text}
 
@@ -393,8 +428,14 @@ def _on_llm_delta(state: CallState, e: ev.LLMTextDelta):
         return state, []
 
     buffer = state.speech_buffer + e.text
-    chunks, remainder = _split_speakable(buffer)
-    state = replace(state, turn_text=state.turn_text + e.text, speech_buffer=remainder)
+    speakable, held = _strip_thinking(buffer)
+    chunks, remainder = _split_speakable(speakable)
+    # `held` follows `remainder` in the original stream, so order is preserved. turn_text keeps
+    # the raw text: it becomes the assistant message, and the model's own history should say
+    # what the model actually produced.
+    state = replace(
+        state, turn_text=state.turn_text + e.text, speech_buffer=remainder + held
+    )
     if not chunks:
         return state, []
 
@@ -513,7 +554,8 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
     # no more text is coming and can flush; otherwise the last sentence sits in Cartesia's
     # buffer waiting for a continuation that never arrives.
     utterance_id = state.utterance_id
-    tail = state.speech_buffer.strip()
+    # An unclosed <thinking> block at the end of a turn is dropped, not spoken.
+    tail = _strip_thinking(state.speech_buffer)[0].strip()
     if tail and utterance_id is None:
         state, utterance_id = _open_utterance(state)
     if utterance_id is not None:

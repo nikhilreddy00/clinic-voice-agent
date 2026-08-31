@@ -102,6 +102,31 @@ def needs_clarification(intent: Intent, confidence: float) -> bool:
     return intent is Intent.UNKNOWN or confidence < MIN_INTENT_CONFIDENCE
 
 
+# `emergency` is the ONE label the classifier is never allowed to act on, and this is not a
+# tuning choice — it is the same separation that keeps the emergency path deterministic.
+#
+# `core.intent.detect_emergency` is the safety control: pure, regex-driven, running in the
+# reducer on every utterance before any request exists. When it fires, the agent speaks a
+# scripted 911 hand-off and the model is out of the loop for good. The classifier's `emergency`
+# label does NOT do any of that — it only sets `state.intent`, and everything downstream then
+# treats the call as an emergency that the actual emergency machinery knows nothing about.
+#
+# Measured on a live call. The classifier labelled "I had a severe injury at my [knee]" and
+# "there is a severe [deep] injury and the skin came out" as emergency at 0.95, twice. The
+# detector — correctly — did not fire: a knee laceration is a same-week appointment, not a 911
+# call. But each label flipped the intent, which stripped ALL tools (an emergency gets none)
+# and swapped the booking prompt for emergency instructions. The model, mid-booking with a
+# held slot, then had nothing to call: it said "Let me check what we have available" and could
+# not, said "I'm booking you right now" three times over 100 seconds and could not, invented a
+# `book_appointment` tool, and finally spoke its own <thinking> block — hold UUID included —
+# aloud to the caller. Nothing was booked. The caller waited two minutes and hung up.
+#
+# So the label is pure downside: zero safety benefit (it never triggers the scripted response)
+# against a broken call. It stays in the enum and in the trace, where an eval can measure the
+# detector's recall gap against it — which is the only thing it is actually good for.
+CLASSIFIER_ONLY_ADVISORY = frozenset({Intent.EMERGENCY})
+
+
 def resolve_intent(
     current: Intent | None, proposed: Intent, confidence: float
 ) -> Intent | None:
@@ -109,6 +134,8 @@ def resolve_intent(
 
     Three rules, in order:
 
+    0. ``emergency`` from the classifier is advisory and never applied at all — the
+       deterministic detector owns that path. See ``CLASSIFIER_ONLY_ADVISORY``.
     1. ``unknown`` never overwrites an established intent. A caller answering "Dana Reyes" has
        not stopped wanting an appointment; the utterance simply carries no intent on its own.
     2. Establishing the *first* intent needs ``MIN_INTENT_CONFIDENCE``.
@@ -118,6 +145,8 @@ def resolve_intent(
        genuine change of task ("actually, I need a refill instead") is confidently a different
        thing, while an out-of-context slot-fill answer is not.
     """
+    if proposed in CLASSIFIER_ONLY_ADVISORY:
+        return current  # only detect_emergency may set this — see the note above
     if proposed is Intent.UNKNOWN:
         return current if current is not None else Intent.UNKNOWN
     if current is None or current is Intent.UNKNOWN:

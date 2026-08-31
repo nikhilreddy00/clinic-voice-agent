@@ -401,11 +401,17 @@ def test_intent_scoping_shrinks_non_booking_prompts():
     prompt plus a few lines, because there is nothing for it to do. An intent this build can
     now COMPLETE (reschedule, cancel, refill) carries its flow rules and the verification
     block, so it is bigger — and still less than half a booking prompt.
+
+    The hand-off bar moved 2,900 -> 3,300 for the same reason it moved 2,100 -> 2,900: another
+    rule earned its place in the CORE prompt, where every intent pays for it. This one is
+    "never announce an action without taking it in the same reply", after a live call spent
+    100 seconds saying "I'm booking you right now" without ever calling a tool. Rules land in
+    the core when the failure they prevent is not specific to one flow.
     """
     sizes = prompt_sizes()
     assert sizes["schedule_appointment"] > 9000, "booking rules are load-bearing; do not shrink"
     for intent in ("billing_question", "hours_location", "test_results", "speak_to_human"):
-        assert sizes[intent] < 2900, f"{intent} prompt is {sizes[intent]} chars"
+        assert sizes[intent] < 3300, f"{intent} prompt is {sizes[intent]} chars"
     for intent in ("medication_refill", "cancel_appointment", "reschedule_appointment"):
         assert sizes[intent] * 2 < sizes["schedule_appointment"], (
             f"{intent} prompt is {sizes[intent]} chars — a completed flow should still be far "
@@ -458,3 +464,76 @@ def test_describing_symptoms_mid_booking_keeps_the_scheduling_tools():
     assert d.state.intent is Intent.SCHEDULE_APPOINTMENT
     assert produced == [], "re-planned the turn — the tool surface moved mid-booking"
     assert build_tools_schema(d.state.intent).standard_tools, "scheduling tools were stripped"
+
+
+# --- the live call where a knee injury stripped every tool ---------------------------------
+
+
+def test_the_classifier_cannot_declare_an_emergency():
+    """From a live call, and it explains every symptom the caller reported.
+
+    The classifier labelled "there is a severe deep injury and the skin came out" as emergency
+    at 0.95. detect_emergency — the actual safety control — correctly did not fire: a knee
+    laceration is a same-week appointment, not a 911 call. But the label flipped state.intent,
+    which strips ALL tools and swaps the booking prompt for emergency instructions, while the
+    scripted emergency path stays untouched (state.emergency is still False).
+
+    The model was mid-booking with a held slot and suddenly had nothing to call. It said "I'm
+    booking you right now" three times over 100 seconds, invented a `book_appointment` tool,
+    and spoke its own <thinking> block aloud. Nothing was booked.
+    """
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="I'd like to book an appointment"))
+    d.send(ev.IntentClassified(intent="schedule_appointment", confidence=0.95))
+    d.send(ev.LLMCompleted(request_id="req-1", stop_reason="end_turn"))
+
+    d.send(ev.FinalTranscript(text="there is a severe deep injury and the skin came out"))
+    d.send(ev.IntentClassified(intent="emergency", confidence=0.95))
+
+    assert d.state.intent is Intent.SCHEDULE_APPOINTMENT, "the classifier preempted the flow"
+    assert d.state.emergency is False, "no scripted emergency was ever triggered"
+    names = {t.name for t in build_tools_schema(d.state.intent).standard_tools}
+    assert "confirm_booking" in names, "the booking tools were stripped mid-booking"
+
+
+def test_the_deterministic_detector_still_owns_the_emergency_path():
+    """The other half: a real emergency must still take the call away from the model."""
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="I'd like to book an appointment"))
+    d.send(ev.IntentClassified(intent="schedule_appointment", confidence=0.95))
+
+    produced = d.send(ev.FinalTranscript(text="my chest hurts and I can't breathe"))
+    assert d.state.emergency is True
+    assert d.state.intent is Intent.EMERGENCY
+    assert any(isinstance(a, Speak) and a.text == EMERGENCY_RESPONSE for a in produced)
+
+
+def test_a_thinking_block_is_never_spoken_to_the_caller():
+    """The caller heard one read out in full, hold UUID included, and took the UUID for their
+    confirmation number."""
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="book me in"))
+    rid = d.state.request_id
+    spoken = []
+    for chunk in ["Sure. ", "<thin", "king>\nI have hold_id ",
+                  "830633cb-8fa2-441e-a74f-15dd71fb6623 and should call ",
+                  "confirm_booking.\n</thinking>", " You're all set. "]:
+        spoken += [a.text for a in d.send(ev.LLMTextDelta(request_id=rid, text=chunk))
+                   if isinstance(a, Speak)]
+    spoken += [a.text for a in d.send(ev.LLMCompleted(request_id=rid, stop_reason="end_turn"))
+               if isinstance(a, Speak)]
+
+    said = " ".join(spoken)
+    assert "830633cb" not in said and "thinking" not in said and "hold_id" not in said, said
+    assert "Sure." in said and "You're all set." in said
+
+
+def test_an_unclosed_thinking_block_is_dropped_rather_than_spoken():
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="book me in"))
+    rid = d.state.request_id
+    spoken = [a.text for a in d.send(ev.LLMTextDelta(request_id=rid, text="Okay. <thinking>the"))
+              if isinstance(a, Speak)]
+    spoken += [a.text for a in d.send(ev.LLMCompleted(request_id=rid, stop_reason="end_turn"))
+               if isinstance(a, Speak)]
+    assert "thinking" not in " ".join(spoken) and "the" not in " ".join(spoken).split("Okay.")[-1]
