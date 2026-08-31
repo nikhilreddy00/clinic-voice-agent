@@ -212,6 +212,31 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
   - Memory is loaded **after** the greeting action and never awaited: the AI disclosure must not
     wait on a database, and a failed lookup just means a colder greeting.
 
+**Per-intent hardening + promptfoo evals (post-Phase-13).** `eval/promptfoo/` — 72 behavioural
+cases, one suite per intent, **100% on three consecutive runs**. Full detail:
+`docs/build_spec.md` → *Per-intent evals*. The rules it produced, all of them load-bearing:
+  - **The classifier may never set `Intent.EMERGENCY`** (`intents.CLASSIFIER_ONLY_ADVISORY`).
+    `detect_emergency` owns that path. A live call classified a knee laceration as emergency at
+    0.95 twice; the label strips every tool and swaps the prompt while the scripted 911 path
+    stays untouched, so the model spent 100 seconds saying "I'm booking you right now" with
+    nothing to call, invented a `book_appointment` tool, and read its own `<thinking>` block —
+    hold UUID included — to the caller.
+  - **`<thinking>` never reaches TTS** (`reducer._strip_thinking`). Held across streaming
+    deltas, dropped entirely if never closed. Everything the reducer treats as text is spoken.
+  - **`reducer._ACTION_CLAIM` — one follow-through nudge per caller turn.** A turn that
+    announces an action and calls no tool is re-prompted once. This is engine enforcement
+    because the prompt rule (with a worked example) demonstrably did not hold.
+  - **`media.end_utterance` puts a MARKER on the queue; it must not decide completion itself.**
+    The old `if self._speaking is None` test lost a race on short replies, so
+    `BotStoppedSpeaking` never fired, the mic gate never reopened, and the agent went deaf for
+    the rest of the call. Plus a 5 s stall timeout for a provider that never sends `done`.
+  - **`intent._is_recollection`** — narrowly scoped to "passed out"/"blacked out"/"fainted",
+    requiring EXPLICIT past-tense evidence. Never widen it: absence of urgency cues is not
+    evidence, and a general rule here would suppress "can't breathe" the way a general negation
+    rule would.
+  - The eval provider imports the agent's real prompt/tool builders and mirrors the nudge, so
+    it measures the system a caller meets. Do not let it grow a private copy of the prompt.
+
 ## Conventions & governance
 
 - **Synthetic data only.** No real PHI in code, seeds, logs, or prompts.
@@ -290,11 +315,16 @@ cd agent && uv run python -m clinic_agent.pipeline
 # Telephony either way needs the one-time, idempotent SIP trunk + dispatch rule:
 cd agent && uv run python scripts/setup_livekit_sip.py
 
-cd agent && uv run pytest        # 299 tests, no network/keys needed
+cd agent && uv run pytest        # 330 tests, no network/keys needed
 
 # Phase-12 intent eval. --detector-only runs the SAFETY half with no API calls and no cost.
 agent/.venv/bin/python eval/run_intent_eval.py --detector-only
 agent/.venv/bin/python eval/run_intent_eval.py
+
+# Per-intent behavioural evals (promptfoo). One suite per intent; 72 cases; needs an API key.
+cd eval/promptfoo && ./run.sh                    # everything
+cd eval/promptfoo && ./run.sh tests/refill.yaml  # one intent, while iterating
+cd eval/promptfoo && ./run.sh --view             # browse the last run
 
 # Session router (Phase 11 control plane) — only needed for room-per-call dispatch
 cd session_router && uv sync --extra dev && uv run pytest    # 26 tests
