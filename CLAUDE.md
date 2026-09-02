@@ -356,6 +356,22 @@ Supabase), 10 (in-house event loop), 11 (concurrency + load proof), 12 (reasonin
 below). **Next: Phase 14 — latency finish** (semantic EOU, speculative LLM start,
 sentence-boundary TTS chunking, connection pooling, region colocation).
 
+**BLOCKED ON BILLING, not code (2026-09-02).** The Anthropic account is out of credit:
+`invalid_request_error: Your credit balance is too low`. Both the dialogue LLM and the intent
+classifier fail with it, so a call connects, transcribes perfectly, and then speaks the scripted
+error line. Verified by direct probe. Cartesia, Deepgram, LiveKit SIP and Postgres are all
+healthy — do not go looking for a code defect until the balance is topped up.
+
+Note for whoever runs the promptfoo suite: `eval/promptfoo/run.sh` passes `--no-cache`, so every
+run is 72 live model calls plus rubric grading. That was right while the prompt was changing;
+for routine runs, drop the flag and let promptfoo replay unchanged cases from cache.
+
+**Live-testing loop that works:** place the call, then
+`agent/.venv/bin/python agent/scripts/inspect_call.py` — it prints the caller turns, every tool
+call and whether it succeeded, and a verdict line. `NO TOOL CALLS AT ALL` or
+`booking committed: no` after the caller heard a confirmation is the tell for a fabricated
+booking. Console `[media]` lines say whether caller audio arrived at all.
+
 **Phase 13's exit criterion is not met yet, and it needs a phone, not code:** a returning caller
 recognized, verified, and rescheduling end to end on a live call. Everything below the
 microphone is proven — 70 API tests including the spoofed-ANI adversarial set, 299 agent tests,
