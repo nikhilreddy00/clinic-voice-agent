@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable
 
 from loguru import logger
 
+from ...barge_in import frame_rms
 from .. import events as ev
 from ..audio import (
     INPUT_SAMPLE_RATE,
@@ -52,6 +53,11 @@ class MediaAdapter:
         self._speaking: str | None = None
         self._playback_task: asyncio.Task | None = None
         self._closing = False
+        # Inbound audio accounting. Frames are counted, never stored — raw audio is not an
+        # event and does not belong in a trace.
+        self.frames_in = 0
+        self.loudest_in = 0.0
+        self._input_watchdog: asyncio.Task | None = None
 
     # --- playback (called by the TTS adapter) -------------------------------------------
 
@@ -60,6 +66,12 @@ class MediaAdapter:
     # gaps of a second or two are normal. This is not a latency knob — it is the line between
     # "the bot is still talking" and "the call has gone deaf".
     STALL_TIMEOUT_S = 5.0
+
+    # How long after the greeting ends before silence from the caller's direction is reported
+    # as a fault rather than as a caller who has not spoken yet. A one-way SIP leg looks
+    # EXACTLY like a thoughtful caller from inside this process — same events, same logs — and
+    # that ambiguity cost a live debugging session, so the engine now says which it is seeing.
+    NO_INPUT_WARN_S = 8.0
 
     async def play(self, utterance_id: str, pcm: bytes) -> None:
         await self._queue.put((utterance_id, pcm))
@@ -169,6 +181,34 @@ class MediaAdapter:
 
     # --- subclass hooks -----------------------------------------------------------------
 
+    def note_inbound(self, pcm: bytes) -> None:
+        """Record that caller audio arrived. Called by the transport for every frame."""
+        self.frames_in += 1
+        if self.frames_in % 50 == 0:  # ~1s of audio at 20ms frames
+            self.loudest_in = max(self.loudest_in, frame_rms(pcm))
+
+    def watch_for_input(self) -> None:
+        """Start the one-shot check that the caller's audio is actually arriving."""
+        if self._input_watchdog is None:
+            self._input_watchdog = asyncio.create_task(
+                self._warn_if_deaf(), name="input-watchdog"
+            )
+
+    async def _warn_if_deaf(self) -> None:
+        await asyncio.sleep(self.NO_INPUT_WARN_S)
+        if self.frames_in == 0:
+            logger.error(
+                "[media] NO CALLER AUDIO after "
+                f"{self.NO_INPUT_WARN_S:.0f}s — the agent cannot hear anything. The call is "
+                "connected and signalling is fine, so this is the media leg: check the SIP "
+                "trunk and whether the caller can hear the greeting either."
+            )
+        else:
+            logger.info(
+                f"[media] caller audio flowing: {self.frames_in} frames, "
+                f"peak RMS {self.loudest_in:.0f}"
+            )
+
     async def _write(self, pcm: bytes) -> None:
         """Write one output frame. MUST pace — return no sooner than the audio is consumed."""
         raise NotImplementedError
@@ -184,6 +224,8 @@ class MediaAdapter:
 
     async def aclose(self) -> None:
         self._closing = True
+        if self._input_watchdog is not None:
+            self._input_watchdog.cancel()
         if self._playback_task is not None:
             self._playback_task.cancel()
             try:
@@ -374,6 +416,8 @@ class LiveKitMedia(MediaAdapter):
             f"greeting in {settle_ms:.0f} ms"
         )
 
+        self.watch_for_input()
+
         async def _greet_when_ready() -> None:
             await asyncio.sleep(settle_ms / 1000.0)
             self._emit(
@@ -389,7 +433,9 @@ class LiveKitMedia(MediaAdapter):
             track, sample_rate=INPUT_SAMPLE_RATE, num_channels=NUM_CHANNELS
         )
         async for event in stream:
-            await self._on_audio(bytes(event.frame.data), time.monotonic())
+            pcm = bytes(event.frame.data)
+            self.note_inbound(pcm)
+            await self._on_audio(pcm, time.monotonic())
 
     async def _write(self, pcm: bytes) -> None:
         samples = len(pcm) // (2 * NUM_CHANNELS)

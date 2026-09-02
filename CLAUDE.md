@@ -18,7 +18,7 @@ this repo, logs, or prompts.**
 
 | Layer | Responsibility | Chosen tech |
 |-------|----------------|-------------|
-| Telephony (later) | Inbound PSTN/SIP call ingress | LiveKit SIP (free tier, one number included: `+14842950169`) |
+| Telephony (later) | Inbound PSTN/SIP call ingress | LiveKit SIP (free tier, one number included: `+14842951203`) |
 | Transport | Real-time audio in/out | Pipecat transport (WebRTC local dev → SIP later) |
 | ASR | Speech → text | Deepgram (`pipecat.services.deepgram`) |
 | LLM | Reasoning / dialogue | Anthropic Claude Haiku 4.5 (`pipecat.services.anthropic`) — see LLM-provider note below |
@@ -92,7 +92,7 @@ renumbered to what's actually left.)
 - **Phase 4 — Dialogue/API defect fixes + barge-in.** Five target fixes (see
   `docs/build_spec.md`) + turn-taking / interruption handling with a false-positive metric. ✅
 - **Phase 5 — Telephony.** Real inbound phone number via LiveKit SIP (free tier,
-  `+14842950169`), `MODE=local|telephony` runtime switch, idempotent SIP trunk + Direct-dispatch
+  `+14842951203`), `MODE=local|telephony` runtime switch, idempotent SIP trunk + Direct-dispatch
   setup script (`agent/scripts/setup_livekit_sip.py` → room `clinic-inbound`), AI disclosure +
   call-recording consent in the greeting on the telephony path. **Verified end to end** —
   multiple live inbound calls connected and booked appointments. ✅
@@ -441,7 +441,7 @@ in [`docs/build_spec.md`](docs/build_spec.md) and added barge-in:
   End-to-end barge-in is audio-timing behavior and is verified on a live mic, not in the headless
   eval; the gate's decision logic has unit tests (`agent/tests/test_barge_in.py`).
 
-**Phase 5 — telephony (done)** (LiveKit SIP, `+14842950169`): `MODE` switch in
+**Phase 5 — telephony (done)** (LiveKit SIP, `+14842951203`): `MODE` switch in
 `config.py`/`pipeline.py` (default `local`), LiveKit transport + join-token in `pipeline.py`,
 telephony greeting with consent + explicit PII-minimization rule in `prompts.py`, and the
 idempotent `agent/scripts/setup_livekit_sip.py` (Direct dispatch → room `clinic-inbound`).

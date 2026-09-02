@@ -126,3 +126,33 @@ async def test_barge_in_still_ends_the_utterance_as_interrupted():
         assert stops and stops[0].completed is False
     finally:
         await media.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_silent_inbound_leg_is_reported_not_guessed_at():
+    """A one-way SIP leg looks exactly like a caller who has not spoken yet — same events, same
+    logs. It cost a live debugging session, so the engine says which it is seeing."""
+    events: list = []
+    media = FakeMedia(events)
+    media.NO_INPUT_WARN_S = 0.05
+    await media.start()
+    try:
+        media.watch_for_input()
+        await asyncio.sleep(0.12)
+        assert media.frames_in == 0        # nothing arrived...
+        media.note_inbound(b"\x00" * 640)  # ...and the counter is what the warning reads
+        assert media.frames_in == 1
+    finally:
+        await media.aclose()
+
+
+@pytest.mark.asyncio
+async def test_inbound_frames_are_counted_never_stored():
+    """Raw audio is not an event and must not end up in a trace — only the count and a level."""
+    events: list = []
+    media = FakeMedia(events)
+    for _ in range(120):
+        media.note_inbound(b"\x10\x00" * 320)
+    assert media.frames_in == 120
+    assert media.loudest_in > 0
+    assert not events, "counting inbound audio must not emit events"

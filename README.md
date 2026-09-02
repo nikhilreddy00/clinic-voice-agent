@@ -56,7 +56,7 @@ LLM is the main source of response latency at this stack (~3 s per turn — see
        ▼                          │       ▲               │   │           speech)  │
 ┌───────────────┐   RTP/SIP  ┌────┴───────┴───────────────┼───┼──────────────┐    │
 │  LiveKit SIP  │◀──────────▶│              turn-taking / barge-in            │    │
-│  +14842950169 │  audio     │   VAD · mic gate · interruption · metrics taps │    │
+│  +14842951203 │  audio     │   VAD · mic gate · interruption · metrics taps │    │
 └───────────────┘            └────────────────────────────┼───┼──────────────┘    │
                                   │                         │   │                   │
                                   └─────────────────────────┼───┼───────────────────┘
@@ -85,7 +85,7 @@ downstream of the transport is identical.
 
 | Layer | Responsibility | Tech |
 |-------|----------------|------|
-| Telephony | Inbound PSTN/SIP call ingress, real phone number | **LiveKit SIP** (free tier, `+14842950169`) |
+| Telephony | Inbound PSTN/SIP call ingress, real phone number | **LiveKit SIP** (free tier, `+14842951203`) |
 | Orchestration | Pipeline, turn-taking, context, barge-in | **Pipecat** |
 | ASR | Speech → text (+ confidence) | **Deepgram** |
 | LLM | Reasoning / dialogue / tool calls | **Anthropic Claude Haiku 4.5** |
@@ -179,7 +179,7 @@ cd scheduling_api && uv run pytest          # run the test suite
 #    create agent/.env with your Deepgram / Anthropic / Cartesia / LiveKit keys first
 cd agent && uv sync && uv run python -m clinic_agent.pipeline
 
-# 3. Voice agent — telephony (LiveKit SIP, inbound calls to +14842950169)
+# 3. Voice agent — telephony (LiveKit SIP, inbound calls to +14842951203)
 cd agent && uv run python scripts/setup_livekit_sip.py    # one-time, idempotent
 cd agent && MODE=telephony uv run python -m clinic_agent.pipeline
 ```
@@ -188,7 +188,7 @@ cd agent && MODE=telephony uv run python -m clinic_agent.pipeline
 SIP telephony path — the ASR→LLM→TTS loop, tool calls, mic gate, and barge-in are identical in
 both.
 
-**Always-on demo (deployed):** both services run on **Railway**, so `+14842950169` is answered
+**Always-on demo (deployed):** both services run on **Railway**, so `+14842951203` is answered
 24/7 with nothing running locally — the agent is an outbound-only worker connecting to LiveKit
 Cloud, and the scheduling API is a public Railway URL. Redeploy steps and topology are in
 [`docs/build_spec.md`](docs/build_spec.md) → *Deployment (Railway)*.
