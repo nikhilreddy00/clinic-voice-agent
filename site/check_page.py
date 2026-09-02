@@ -35,7 +35,7 @@ EXTERNAL = re.compile(
 
 # Markup that must exist verbatim in the source.
 REQUIRED_MARKUP = [
-    'href="tel:+14842950169"',
+    'href="tel:+14842951203"',
     "/* BEGIN GENERATED TRACE */",
     "const CALL_REPLAY",
 ]
@@ -48,7 +48,7 @@ REQUIRED_COPY = [
     "Attend",
     "The front desk that never misses a call.",
     "Grove Family Clinic",
-    "+1 (484) 295-0169",
+    "+1 (484) 295-1203",
     "Three in ten calls to a busy practice go unanswered",
     "It cannot tell a caller they are booked unless they are.",
     "The clinic's phone line has a pulse.",

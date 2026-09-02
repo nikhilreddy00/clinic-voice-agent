@@ -193,7 +193,7 @@ async def main() -> None:
     if not (settings.livekit_url and settings.livekit_api_key and settings.livekit_api_secret):
         _fail("LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET must be set in agent/.env")
     if not settings.livekit_phone_number:
-        _fail("LIVEKIT_PHONE_NUMBER must be set in agent/.env (the clinic number, e.g. +14842950169)")
+        _fail("LIVEKIT_PHONE_NUMBER must be set in agent/.env (the clinic number, e.g. +14842951203)")
 
     number = settings.livekit_phone_number
     individual = args.dispatch == "individual"

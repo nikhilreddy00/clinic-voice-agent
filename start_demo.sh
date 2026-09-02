@@ -5,9 +5,9 @@
 #   1. starts the mock scheduling API (with /metrics + /dashboard) on :8000
 #   2. waits until it is healthy
 #   3. prints the dashboard URL (and the public ngrok URL if ngrok is already running)
-#   4. starts the voice agent in MODE=telephony (inbound LiveKit SIP calls to +14842950169)
+#   4. starts the voice agent in MODE=telephony (inbound LiveKit SIP calls to +14842951203)
 #
-# Then just call +14842950169. Ctrl-C stops everything; the agent prints its session summary
+# Then just call +14842951203. Ctrl-C stops everything; the agent prints its session summary
 # (P50/P95/P99 latencies + call outcome) on the way out.
 #
 # ngrok is OPTIONAL and only needed to expose the dashboard/API publicly. The agent itself
@@ -73,7 +73,7 @@ else
 fi
 
 # --- 4. voice agent (telephony) --------------------------------------------------------
-echo "[demo] starting voice agent (MODE=telephony) — call +14842950169. Ctrl-C to stop."
+echo "[demo] starting voice agent (MODE=telephony) — call +14842951203. Ctrl-C to stop."
 echo
 # Background the agent (tracked PID) and wait on it, so the cleanup trap can deterministically
 # stop BOTH services on Ctrl-C — including the programmatic case where only this script's shell
