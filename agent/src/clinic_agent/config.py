@@ -69,7 +69,12 @@ def load_settings() -> Settings:
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
         anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
         groq_api_key=os.getenv("GROQ_API_KEY", ""),
-        groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        # `llama-3.3-70b-versatile` was the default here until it was verified dead: Groq
+        # deprecated it (and `llama-3.1-8b-instant`) on 2026-06-17 and shut both down on
+        # 2026-08-16. Confirmed against the live /models endpoint on 2026-09-03 — neither is
+        # served any more, so the old default could only ever 404. The current fleet is
+        # openai/gpt-oss-{20b,120b} and qwen/qwen3.{6,8}-27b.
+        groq_model=os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
         cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),
         cartesia_voice_id=os.getenv("CARTESIA_VOICE_ID", ""),
         # Telephony — LiveKit SIP. Not required until Phase 5, so these default
