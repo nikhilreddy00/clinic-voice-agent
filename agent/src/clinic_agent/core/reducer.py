@@ -366,6 +366,7 @@ def _on_final_transcript(state: CallState, e: ev.FinalTranscript):
         turn_index=state.turn_index + 1,
         last_partial="",
         nudged=False,  # a fresh caller turn gets a fresh follow-through allowance
+        turn_had_tool=False,
     )
     state, start = _next_request(state)
     # Classification runs ALONGSIDE the turn, never before it. Intent is an optimization on the
@@ -511,6 +512,12 @@ def _scoped_arguments(state: CallState, name: str, arguments: dict[str, Any]) ->
         # refused, so a caller with a valid appointment could never get in.
         return scoped
 
+    if name == "confirm_booking" and state.active_hold_id:
+        # See CallState.active_hold_id: the engine remembers the token, the model does not
+        # retype it. Overwrite rather than merge, exactly like phone and date_of_birth — a
+        # value the model got wrong is not more trustworthy than the one the API just issued.
+        scoped["hold_id"] = state.active_hold_id
+
     if name != "confirm_booking":
         # confirm_booking collects the DOB from the caller as intake for a NEW appointment,
         # so the model's value is the right one there; everywhere else it is the verified one.
@@ -540,6 +547,7 @@ def _on_tool_use(state: CallState, e: ev.LLMToolUse):
         state = replace(
             state,
             turn_tool_uses=state.turn_tool_uses + (block,),
+            turn_had_tool=True,
             tool_results=state.tool_results
             + (_tool_result_block(e.tool_call_id, _UNVERIFIED_RESULT),),
         )
@@ -547,19 +555,31 @@ def _on_tool_use(state: CallState, e: ev.LLMToolUse):
 
     arguments = _scoped_arguments(state, e.name, dict(e.arguments))
 
-    # Stash the date of birth being submitted so a successful result can promote it. Only
-    # while unverified: a second verify_identity later in the call (a caller volunteering a
-    # different date, or a model retry) must not replace a DOB the API has already matched.
-    # It is inert until a ToolCompleted says the API matched it.
-    verified_dob = state.verified_dob
-    if e.name == "verify_identity" and not state.identity_verified:
-        verified_dob = str(arguments.get("date_of_birth") or "")
+    # Stash the date of birth being submitted, TAGGED WITH THIS CALL. Nothing is promoted here:
+    # only the API can say a date matched, so this is inert until a ToolCompleted says so.
+    #
+    # It used to stash into `verified_dob` directly, and only while unverified — an
+    # anti-tampering rule that stopped a later attempt from overwriting a matched DOB. The rule
+    # was right and the mechanism was wrong: a SUCCESSFUL second verification still updated
+    # `patient_name` (that happens on the result), so the two fields ended up describing
+    # different people. On a shared handset that is a cross-person disclosure. Measured: verify
+    # as Joe, then verify as Nick, and the engine reports the caller as Nick while every PHI
+    # call still carries Joe's date of birth and reads Joe's chart.
+    #
+    # Keying by tool_call_id keeps the protection (a FAILED attempt promotes nothing) without
+    # the inconsistency (a SUCCEEDED one promotes name and date together).
+    submitted = state.submitted_dobs
+    if e.name == "verify_identity":
+        submitted = submitted + (
+            (e.tool_call_id, str(arguments.get("date_of_birth") or "")),
+        )
 
     state = replace(
         state,
         turn_tool_uses=state.turn_tool_uses + (block,),
+        turn_had_tool=True,
         pending_tools=state.pending_tools + (e.tool_call_id,),
-        verified_dob=verified_dob,
+        submitted_dobs=submitted,
     )
     return state, [InvokeTool(tool_call_id=e.tool_call_id, name=e.name, arguments=arguments)]
 
@@ -607,6 +627,7 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
 
     if (
         not committed
+        and not state.turn_had_tool
         and not state.nudged
         and _ACTION_CLAIM.search(spoken or e.text or "")
     ):
@@ -652,17 +673,35 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
 
     booked = state.booked or (e.name == "confirm_booking" and e.ok)
 
+    # Track the live hold so `_scoped_arguments` can re-send it verbatim. A successful confirm
+    # spends it; a failed one does not, so the model can retry the same hold rather than
+    # re-holding a slot it already owns.
+    active_hold_id = state.active_hold_id
+    if e.name == "hold_slot" and e.ok:
+        active_hold_id = str(e.result.get("hold_id") or "")
+    elif e.name == "confirm_booking" and e.ok:
+        active_hold_id = ""
+
     # The gate opens HERE and nowhere else: only the API can say a date of birth matched, and
     # the DOB it matched is kept so every later PHI call re-sends it for server-side re-checks.
     # `verified_dob` never leaves this process and is not written to the trace or the logs.
     verified = state.identity_verified
     verified_dob = state.verified_dob
     patient_name = state.patient_name
+    submitted_dobs = tuple(pair for pair in state.submitted_dobs if pair[0] != e.tool_call_id)
     if e.name == "verify_identity" and e.ok:
-        # `verified_dob` was stashed when the call was made (the API does not echo a DOB back —
-        # nothing should return the verification secret). It is inert until this line runs.
+        # Promote the name and the date of birth from the SAME call — the one the API just
+        # accepted. The API does not echo a DOB back (nothing should return the verification
+        # secret), so it comes from what was submitted with this tool_call_id.
+        #
+        # Both together or neither: a caller on a shared handset may legitimately verify as a
+        # second person mid-call, and when they do, every later PHI call must read that
+        # person's chart, not the previous one's. A FAILED attempt still promotes nothing.
         verified = True
         patient_name = str(e.result.get("name") or "")
+        matched = next((dob for tid, dob in state.submitted_dobs if tid == e.tool_call_id), "")
+        if matched:
+            verified_dob = matched
     # An empty availability window is the escalation trigger (a later successful booking
     # overrides it — see CallState.outcome).
     escalated = state.escalated or (
@@ -679,6 +718,8 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
         identity_verified=verified,
         verified_dob=verified_dob,
         patient_name=patient_name,
+        submitted_dobs=submitted_dobs,
+        active_hold_id=active_hold_id,
     )
     if pending:
         return state, []
