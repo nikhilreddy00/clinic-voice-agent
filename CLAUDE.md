@@ -116,10 +116,33 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
 - **Phase 8 — model bake-off.** `eval/providers.py` (backend abstraction over Anthropic + the
   OpenAI wire format for Groq/Cerebras, all streaming so TTFT is measurable) and `eval/bakeoff.py`
   (runs the 19-case suite per candidate; compares TTFT, cost/call, and cache viability). Harness
-  done; the full sweep has not been run. **Key measurement: prompt caching cannot engage on Haiku
-  4.5** — the cacheable prefix (tools + system) is 3,811 tokens against a 4,096 minimum, and
-  Anthropic accepts `cache_control` then silently caches nothing. Sonnet 4.6/5 cache fine
-  (1,024 minimum). Do NOT "shrink the prompt" — that makes it permanently impossible.
+  done. **First real runs executed 2026-09-03** (partial: 3 of 19 cases, Haiku + Groq).
+  - **Prompt caching NOW ENGAGES on Haiku 4.5 — this reverses the Phase-8 finding.** The
+    cacheable prefix was 3,811 tokens against the 4,096 minimum; Phase 13's six new tools pushed
+    it to **5,023**, so the breakpoint is live. Measured over 3 cases: TTFT p50 830 → 642 ms,
+    p95 1,927 → 988 ms, **$0.0705 → $0.0195 a call**, 145,700 tokens served from cache.
+    `CLINIC_PROMPT_CACHE` now defaults to ON (`=0` opts out).
+  - Caching is **per-intent**, and only two intents clear the floor: `None` (turn one) and
+    `schedule_appointment`, both 5,023. Reschedule is 3,366, cancel 2,778, refill 2,293,
+    everything else under 1,700. So it pays on new bookings and is inert elsewhere — a zero
+    cache-read on a refill call is expected, not a bug. Full table in `core/adapters/llm.py`.
+  - **Still do NOT shrink the booking prompt.** There are only ~900 tokens of headroom over the
+    floor; trimming it turns the optimization off silently, with no error.
+  - **Groq is NOT the dialogue LLM, and the measurement says don't make it one.** On the real
+    5,023-token booking prompt: cached Haiku TTFT p50 **621 ms** vs Groq Qwen3.8 **4,614 ms**
+    and gpt-oss-120b **4,647 ms** (free tier, 429s included; best-case single samples were
+    745/559 ms — still no better). Groq has no prompt caching, so it pays full prefill every
+    turn while Haiku reads 5k tokens back at 0.1x. **Groq's speed advantage is real on SHORT
+    prompts and disappears on long cached ones** — which is why it wins for the classifier
+    (below) and loses here.
+  - **Groq's Llama fleet is dead.** `llama-3.3-70b-versatile` and `llama-3.1-8b-instant` were
+    deprecated 2026-06-17 and shut down 2026-08-16 — confirmed against the live `/models`
+    endpoint. Both `config.py` and `eval/providers.py` pointed at the first one. The served
+    fleet is `openai/gpt-oss-{20b,120b}` and `qwen/qwen3.{6,8}-27b`. **`agent/.env` still has a
+    stale `GROQ_MODEL=llama-3.3-70b-versatile` — change it or unset it.**
+  - `eval/providers.py` set no SDK timeout or retry cap, so a rate-limited candidate hung a
+    ONE-CASE run for six minutes with zero output. Now `BAKEOFF_TIMEOUT_SECS` (60) and
+    `BAKEOFF_MAX_RETRIES` (1).
 - **Phase 9 — data layer.** ✅ SQLite → Postgres. Every state transition is a single-statement
   compare-and-swap (`UPDATE ... WHERE <expected state> RETURNING`), which is what makes concurrent
   holds safe: the old read-then-write let **9 of 20** concurrent callers "win" the same slot.
@@ -237,6 +260,191 @@ cases, one suite per intent, **100% on three consecutive runs**. Full detail:
   - The eval provider imports the agent's real prompt/tool builders and mirrors the nudge, so
     it measures the system a caller meets. Do not let it grow a private copy of the prompt.
 
+**RESTART THE SCHEDULING API AFTER CHANGING IT.** Python imports a module once; editing
+`app/db.py` does nothing to a process that is already running, and `uvicorn` is started here
+WITHOUT `--reload`. This cost a full round of live calls: the shared-phone fix was written at
+17:19, the API serving the calls had been up since 12:57, and the caller hit the original
+unfixed bug at 17:52 — identical trace, no new defect, the fix simply was not loaded.
+`migrate_patient_identity` runs at boot, so an un-restarted API also means an un-migrated
+database. After ANY change under `scheduling_api/`, restart it and re-check `/health`.
+
+**The follow-through nudge must not fire on a turn whose tool already ran (2026-09-03).** The
+dead-air the caller heard as "the bot stopped speaking, so I said hello".
+
+`reducer._ACTION_CLAIM` re-prompts a turn that announces an action and calls no tool. It tested
+`committed` — the tool calls made by THIS REQUEST — but `turn_tool_uses` is cleared at the end
+of every request and `committed_tool_ids` is cleared when results are flushed back, so after a
+successful tool round trip the follow-up request that narrates the result looked like an empty
+promise. Trace 20260903T215242896036Z at t=130.4: the caller said "Yeah. Sure.", `hold_slot`
+succeeded, and the read-back "I'm holding that for you. So I have you as Olivia. Your date of
+birth is…" triggered a nudge. Starting that extra request closed the live TTS context —
+Cartesia reported `Context closed`, `BotStoppedSpeaking` arrived with `completed: false` **1.06
+seconds into an ~8 second sentence**, and the nudge's own reply was queued to the dying context
+and never spoken at all. The caller heard "…So I have you as Ol—" then 6.5 s of silence, on the
+confirmation read-back, and said "Hello?" to get the agent back.
+
+  - `CallState.turn_had_tool` is set on any tool use (invoked OR gate-refused) and reset with
+    `nudged` on each new caller turn. The rule was always per CALLER TURN; only the mechanism
+    was per request.
+  - **A `ProviderDegraded` tts `Context closed` with no preceding `SpeechStarted` is the
+    signature.** With a barge-in it is normal (CLAUDE.md, Phase-14 notes); without one it means
+    the engine cut the agent off mid-sentence and the remaining text was dropped.
+
+**`scripts/reset_demo_data.py` — fresh slots, no appointments.** Dry-run by default, `--yes` to
+apply. Slots are DELETED and regenerated rather than re-seeded: `db._seed` inserts them with
+fixed ids and `ON CONFLICT (id) DO NOTHING`, which is right for boot-time idempotency and means
+re-running it leaves every stale `start_time` untouched. Keeps `clinics`/`providers`/
+`clinic_facts` — those are the clinic, not call data.
+
+**Testing without a phone — `./run_e2e.sh`.** Live calls cost Cartesia/Deepgram/LiveKit credit
+and the author has one test handset, so **every identity scenario must be provable offline**.
+`agent/tests/test_shared_phone_e2e.py` drives a scripted call through the REAL reducer, the REAL
+`ToolExecutor`, real HTTP, and real Postgres — only the model and the microphone are scripted.
+
+This layer exists because the previous suites could not have caught the last three defects.
+`scheduling_api/tests` covers HTTP-to-Postgres; `test_reducer` covers the reducer as a pure
+function with fake tool results. Neither sees the SEAM between them — argument injection, the
+identity gate, the order tools fire in — and the seam is where every live failure has been.
+
+  - **`./run_e2e.sh` is the gate before placing a call.** It brings up a throwaway database and
+    an API on its own port, runs all four suites plus the emergency detector, and tears down.
+  - **The e2e suite REFUSES to run unless the API reports the scratch database by name.** It
+    books and truncates, and the default port is the one a developer already has pointed at
+    real data. Wrong database is a skip, never a run.
+  - The reset fixture is not hygiene: without it every test inherits the previous one's bookings
+    on the SAME number, so "Nick can see his appointments" passes while showing six of them —
+    exactly the shape of leakage these tests exist to detect.
+
+**Identity is per-person, not per-call (2026-09-03).** `patient_name` was promoted from the API
+result while `verified_dob` was stashed only while UNVERIFIED — an anti-tampering rule whose
+mechanism let the two fields describe DIFFERENT PEOPLE. Verify as Joe, then verify as Nick, and
+the engine reported the caller as Nick (the prompt literally says "their name is Nick") while
+every PHI call still carried Joe's date of birth and read Joe's chart. The agent would have said
+"Nick, your appointment is…" and read out Joe's appointment. On a single shared handset this is
+the likeliest cross-person disclosure in the system.
+
+  - `CallState.submitted_dobs` tags each submitted date with its `tool_call_id`, and
+    `_on_tool_completed` promotes the name and the date **from the same call the API accepted**.
+    Both together or neither. A FAILED attempt still promotes nothing, which was the whole point
+    of the original rule.
+  - A caller on a shared handset may legitimately verify as a second person mid-call. When they
+    do, every later PHI call must follow them.
+
+**`caller_memory` counts the household, not one member (2026-09-03).** It did `GROUP BY p.id`
+and took the first row, so a number with three confirmed appointments reported two — and which
+two depended on row order. The number is the right unit (this runs BEFORE verification; nobody
+has said who they are yet) and it still returns nothing identifying.
+
+**Known limitation, deliberately not fixed: two people sharing a phone AND a birthday.** Twins
+land on one row — the later booking renames it, and verifying as either returns that name and
+both sets of appointments. Adding `name` to the key would fix twins and break something
+commoner: "Nick" on one call and "Nicholas Kumar" on the next is one person, and a name-keyed
+record files them as two. Spoken names are not stable enough to key on; birthdays are. Pinned by
+`test_two_people_sharing_a_phone_AND_a_birthday_collapse_into_one_record` so it stays a decision.
+The real fix, if it is ever needed, is a patient identifier the caller states — not a fuzzier
+name match, which weakens a credential to solve a data-modelling problem.
+
+**A phone number is a household, not a person (2026-09-03).** The highest-severity defect
+found so far, and it was a data-model bug rather than a prompt or engine one.
+
+`patients` was `UNIQUE (clinic_id, phone)` — one identity per number, forever. Two rules that
+are each individually correct combined into a permanent lockout AND a PHI mix-up:
+
+  * `_upsert_patient` refused to overwrite a `date_of_birth` already on file (right: the DOB is
+    the verification secret, and a later booking that mistyped it would lock the real patient
+    out), but it did NOT protect `name`; and
+  * `_verify` stops dead when an enrolled number presents a wrong DOB (right: falling through
+    to the name+DOB search would let anyone holding an enrolled handset reach a stranger's
+    chart by naming them).
+
+So the first caller from a number owned it. **Live:** "Joe" (DOB 03/05/2001) booked from a
+number already enrolled to "Nick" (DOB 05/08/2003) and was given confirmation E938C8F6. The row
+became a MERGE — renamed *Joe*, still carrying *Nick's* DOB, owning *Nick's* bookings. Joe
+called back and was refused twice on the exact date of birth he had just booked with. The
+lockout is the visible half; the disclosure is the worse half — verifying with Nick's DOB would
+have returned Joe's name and Nick's appointments.
+
+  - **The key is now `UNIQUE (clinic_id, phone, date_of_birth)`.** A different person on the
+    same handset is simply a different row, so no `COALESCE` guard is needed — nothing can
+    reach another person's record to overwrite it.
+  - **`patients.date_of_birth` now stores the NORMALIZED form** (`normalize_dob`). The column
+    used to hold whatever the caller said, normalized on every comparison; that is fine for
+    comparing and useless for a key, where "3/5/2001" and "03/05/2001" file one person twice.
+  - **`_verify` matches the DOB against EVERY patient on the number**, then keeps the original
+    hard stop when none match. Widening who can be found must not widen who gets in — there is
+    a test for exactly that (`..._cannot_be_used_to_reach_a_stranger_by_name`).
+  - **`db.migrate_patient_identity` runs on every boot** and is idempotent. It has to be Python,
+    not SQL in `schema.sql`: the stored dates must be canonicalized BEFORE the new key exists,
+    and canonicalizing can itself create duplicates that must be merged first.
+  - **`scripts/repair_patient_identities.py` un-merges rows that already exist** — dry-run by
+    default. The migration cannot do this: nothing in `patients` records who the second person
+    was, but `bookings` carries its own `patient_name`/`date_of_birth`, so a booking that
+    disagrees with its patient row belongs to someone else. Verified against a rebuilt copy of
+    the live corruption: both callers verify afterwards and each sees only their own bookings.
+  - 8 new tests in `tests/test_verified_flows.py` covering shared handsets end to end
+    (verify / list / reschedule / cancel / third-DOB refusal / stranger-by-name refusal /
+    same-birthday-spoken-differently). **4 of them fail against the old lookup.**
+
+**Live-call hardening round 2 (2026-09-03).** Two calls placed — a booking and a "reschedule"
+— both of which *sounded* perfect. Reading `logs/traces/` found two defects neither the audio
+nor the console log showed. Do not regress these:
+
+  - **`intents.SCHEDULING_PREEMPT_BLOCKED` — `schedule_appointment` never preempts an
+    established scheduling flow.** This is the double-book fix, and it is the QUESTION_INTENTS
+    lesson one level in. A reschedule and a cancellation both CONTAIN picking a time, so
+    slot-fill answers inside them ("Tuesday.", "Yeah, sure.") are word-for-word what starting a
+    new booking sounds like, and the classifier — which sees one utterance with no history —
+    cannot tell them apart. Live: an intent established at `reschedule_appointment` flipped to
+    `schedule_appointment` at 0.85 (exactly `INTENT_SWITCH_CONFIDENCE`), which swapped the tool
+    set from `{list, check_availability, reschedule}` to `{check_availability, hold_slot,
+    confirm_booking}`. The model instantly lost the ability to reschedule and gained the ability
+    to book, so it booked. The caller heard a reschedule confirmation and hung up with **two
+    live appointments** (104BF84D Sept 7, 38510718 Sept 8). Raising the threshold cannot fix
+    this — the bar was already 0.85 and the classifier was at 0.85. **The block is
+    one-directional on purpose:** `cancel` and `reschedule` still preempt, because those are
+    distinctive phrases and neither can create an appointment nobody asked for.
+  - **`CallState.active_hold_id` — the reducer owns the hold_id, the model never retypes it.**
+    A hold_id is a 36-character random UUID with no redundancy; every character is load-bearing
+    and none of it can be inferred. Live: `hold_slot` issued
+    `c1154b66-3d70-4585-908c-2aa92646049f` and the model sent `...2aa92642049f` to
+    `confirm_booking` — one hex digit, 6 → 2. The API correctly 409'd, the caller heard a
+    stumble, and the whole hold-and-confirm round trip ran again: **30 seconds of the call spent
+    re-doing work that had already succeeded.** Injected and overwritten in `_scoped_arguments`
+    exactly like `phone` and `date_of_birth`. Spent on a successful confirm, kept on a failed
+    one (so a retry reuses the hold rather than re-holding), and left alone when there is no
+    live hold so the API's own error still speaks. **This was NOT a TTL problem** — the TTL is
+    120 s and the gap was 14 s; do not "fix" it by raising the TTL.
+  - **`CLINIC_FAST_BASE_URL` switches the classifier to the OpenAI wire format** (Groq /
+    Cerebras) without touching the prompt, the enum, the forced tool call, or the events. This
+    is where Groq actually wins: on the classifier's short prompt, `qwen/qwen3.8-27b` measured
+    **p50 203 ms / p95 399 ms, 13/13 clean** against Haiku's **888 / 1,268**. Two caveats that
+    are the reason it is **not** the default: `openai/gpt-oss-*` are REASONING models that spend
+    `max_tokens` thinking before the forced tool call and get truncated mid-JSON at the
+    classifier's 128-token ceiling (400 `tool_use_failed`) — qwen does not; and **Groq's free
+    tier rate-limited this at ~12 concurrent requests and burned its daily budget in two
+    benchmark runs.** A 429 mid-call is survivable (the reducer falls back to the unscoped
+    prompt) but means no intent scoping at all. Worth switching on a paid tier, not before.
+  - **`scripts/inspect_call.py` now prints the per-stage latency table** — endpointing,
+    dispatch, LLM TTFT, speech queue, E2E, plus the parallel classifier. Use it after every
+    call. A single voice-to-voice number cannot say whether a slow call is the model, the
+    endpointer, or the speech queue, and those have completely different fixes.
+
+**Measured on the 2026-09-03 calls** (`inspect_call.py`, 23 turns across two calls):
+
+| stage | p50 | p95 |
+|---|---|---|
+| endpointing (speech stop → transcript) | 372 ms | 475 ms |
+| dispatch (transcript → LLM start) | 1 ms | 2 ms |
+| **LLM TTFT** | **855 ms** | 3,699 ms |
+| speech queue (first token → speaking) | 380 ms | 949 ms |
+| **E2E voice-to-voice** | **1,642 / 1,973 ms** | 2,522 / 4,673 ms |
+| classifier (parallel) | 911 ms | 1,036 ms |
+
+LLM TTFT was **52% of every turn** — which is why prompt caching, not endpointing and not TTS,
+was the thing worth changing. The endpointing grace is measured at 372 ms p50, NOT the ~800 ms
+this file previously implied; it is not currently the bottleneck and should not be the next
+target. **Not yet re-measured on a live call after the caching change** — that needs a phone.
+
 ## Conventions & governance
 
 - **Synthetic data only.** No real PHI in code, seeds, logs, or prompts.
@@ -276,7 +484,7 @@ cases, one suite per intent, **100% on three consecutive runs**. Full detail:
 #   createdb -h 127.0.0.1 -p 55432 -U postgres clinic_dev   # and clinic_test, clinic_eval
 export CLINIC_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/clinic_dev
 cd scheduling_api && uv sync --extra dev && uv run uvicorn app.main:app --reload
-cd scheduling_api && uv run pytest        # 70 tests; SKIPPED if no Postgres is reachable
+cd scheduling_api && uv run pytest        # 90 tests; SKIPPED if no Postgres is reachable
 
 # --- Supabase is the backend database ------------------------------------------------
 # Project : clinic-voice-agent   ref qhrvyhssfytkrfcodbuc   region us-east-1   Postgres 17.6
@@ -315,7 +523,8 @@ cd agent && uv run python -m clinic_agent.pipeline
 # Telephony either way needs the one-time, idempotent SIP trunk + dispatch rule:
 cd agent && uv run python scripts/setup_livekit_sip.py
 
-cd agent && uv run pytest        # 330 tests, no network/keys needed
+cd agent && uv run pytest        # 389 tests (9 e2e SKIP without a scratch API)
+./run_e2e.sh                     # everything, incl. the e2e seam. Run before any live call.
 
 # Phase-12 intent eval. --detector-only runs the SAFETY half with no API calls and no cost.
 agent/.venv/bin/python eval/run_intent_eval.py --detector-only
@@ -350,17 +559,33 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 ## Current status
 
 **Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 13 of 17.**
-Phase 8 (model bake-off harness) is built but the sweep has not been run; Phases 9 (Postgres +
-Supabase), 10 (in-house event loop), 11 (concurrency + load proof), 12 (reasoning layer), and 13
-(memory + verified tool surface) are done, and the engine is validated by real phone calls (see
-below). **Next: Phase 14 — latency finish** (semantic EOU, speculative LLM start,
-sentence-boundary TTS chunking, connection pooling, region colocation).
+Phases 9 (Postgres + Supabase), 10 (in-house event loop), 11 (concurrency + load proof), 12
+(reasoning layer), and 13 (memory + verified tool surface) are done. Phase 8's bake-off harness
+has now had its **first real runs** (partial — 3 of 19 cases) and produced the prompt-caching
+result below.
 
-**BLOCKED ON BILLING, not code (2026-09-02).** The Anthropic account is out of credit:
-`invalid_request_error: Your credit balance is too low`. Both the dialogue LLM and the intent
-classifier fail with it, so a call connects, transcribes perfectly, and then speaks the scripted
-error line. Verified by direct probe. Cartesia, Deepgram, LiveKit SIP and Postgres are all
-healthy — do not go looking for a code defect until the balance is topped up.
+**Phase 13's exit criterion is met on the API and the engine, and NOT yet on a live call.** A
+returning caller being recognised, verified, and rescheduling end to end is proven offline by
+`./run_e2e.sh` (real reducer, real tool executor, real HTTP, real Postgres) and by 90 API tests.
+Every live attempt so far has been defeated by one of the defects recorded below; the last one
+was not a defect at all but an un-restarted API serving pre-fix code.
+
+**Before the next live call, in this order:** reset the data
+(`scheduling_api/scripts/reset_demo_data.py --yes`), **restart the scheduling API** so the
+migration runs, restart the agent, then dial. See the restart note under *Live-call hardening*.
+
+**Next: Phase 14 — latency finish.** The stage breakdown now exists (`inspect_call.py`), and it
+says LLM TTFT is ~52% of every turn while endpointing is 372 ms p50 — so the Phase-14 list is
+re-ordered by measurement: prompt caching (**done**, below), then the speech queue (~380 ms
+p50), and NOT semantic EOU, which is not currently the bottleneck.
+
+**What is measured and what is not.** Voice-to-voice was **1,642 / 1,973 ms p50** across the two
+2026-09-03 booking calls, before prompt caching was enabled. **The post-caching number has not
+been measured on a phone** — the harness predicts TTFT 855 → ~642 ms, i.e. roughly 1.2–1.4 s
+voice-to-voice, but that is an extrapolation, not a result. Do not quote it as one.
+
+**Billing blocker CLEARED (2026-09-03).** Credits topped up; the previous
+`credit balance is too low` failure is resolved and live calls run end to end again.
 
 Note for whoever runs the promptfoo suite: `eval/promptfoo/run.sh` passes `--no-cache`, so every
 run is 72 live model calls plus rubric grading. That was right while the prompt was changing;
