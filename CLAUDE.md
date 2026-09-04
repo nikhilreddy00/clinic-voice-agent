@@ -636,6 +636,18 @@ instead of a late start. It is a plain constant and **not an env var on purpose*
 pure so traces replay identically anywhere, and reading the environment there would make one
 trace produce different `Speak` actions on different machines.
 
+**Endpointing is CLOSED — do not adopt semantic EOU (measured 2026-09-04, 14 calls / 126
+turns).** It was the Phase-8 plan's headline Phase-14 item and the measurement kills it three
+ways. **83% of turns never buy grace at all** and sit at 372 ms p50, which is Deepgram's 300 ms
+window plus ASR finalization — a turn-detector reads the same audio, cannot remove that, and
+*adds* ~20 ms. **The grace rule costs 5.5 s across every call ever recorded**, i.e. 47 ms
+averaged over all turns, so there is nothing there to reclaim. And it is **already 90% precise**
+— 19 of 21 windows were bought by a caller who then kept talking; the 2 misses were a trailing
+comma and an ASR error, both ambiguous to a human. The `weak` 0.7 s tier was perfect (8 held, 0
+wasted), which is the tier that exists so "December eight two thousand" is not taxed. Lowering
+Deepgram's `endpointing=300` is the only lever left on that floor and it manufactures fragments
+for the grace rule to catch — a trade, not a win. Full table: `docs/build_spec.md` → *Phase 14*.
+
 **Phase 14's exit criterion is now E2E p50 ≤ 1,200 ms / p95 ≤ 2,000 ms (decided 2026-09-04).**
 It replaces the inherited ≤ 800 ms, which was set in Phase 8 before anything was measured and is
 not reachable on this stack: steady-state TTFT on an ALREADY-CACHED prompt is 540–670 ms, most of

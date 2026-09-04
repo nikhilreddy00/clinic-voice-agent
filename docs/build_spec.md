@@ -1253,10 +1253,35 @@ Three consequences:
   caching: 4,614 ms on the same prompt). Anything below ~1,000 ms needs a different model host
   (in-region Bedrock/Vertex Haiku), not another orchestration change. Best measured: **1,385 ms
   p50** on the 2026-09-04 refill call.
-- **Endpointing is analysis-first, not adopt-first.** It is the second-largest stage (402–497 ms
-  p50) and semantic EOU is the textbook answer, but the graded grace in `core/endpointing.py` is
-  load-bearing — "December eight two thousand" is a complete answer with no punctuation. Replay
-  the traces and show a semantic model would end those specific turns sooner *without* cutting
-  the caller off before downloading one.
+### Endpointing: measured, and the answer is DO NOT adopt semantic EOU
+
+Semantic EOU was the Phase-8 plan's headline Phase-14 item. Measured across **14 recorded calls
+/ 126 caller turns**, it is the wrong purchase — not marginal, wrong:
+
+| what happened on the turn | n | p50 | p95 |
+|---|---|---|---|
+| no grace bought (**83% of turns**) | 109 | **372 ms** | 1,129 ms |
+| grace bought, caller resumed talking | 8 | 1,047 ms | 1,377 ms |
+| grace expired, caller had finished | 2 | 2,772 ms | 3,555 ms |
+
+Three things follow, and each one independently kills the case:
+
+1. **The 372 ms floor on ordinary turns is Deepgram's 300 ms endpointing window plus ASR
+   finalization.** A turn-detector model reads the same audio and cannot remove it — it *adds*
+   ~20 ms of inference. The stage that looked like the second-biggest target is almost entirely
+   somebody else's fixed cost. The only lever on it is lowering Deepgram's `endpointing=300`,
+   which manufactures more fragments for the grace rule to catch: a trade, not a win.
+2. **The grace rule costs 5.5 seconds across every call ever recorded — 47 ms averaged over all
+   turns.** There is no meaningful latency there to reclaim.
+3. **It is already 90% precise**: 19 of 21 windows were bought by a caller who then kept
+   talking. The 2 misses were a trailing comma and an ASR error ("reschedule in"), both
+   genuinely ambiguous to a human reader. A model would have to beat 90% on 21 samples to
+   justify itself, which 21 samples cannot even demonstrate.
+
+The `strong` (1.6 s) / `weak` (0.7 s) split is doing real work and the weak tier was perfect —
+8 held, 0 wasted — which is the tier that exists so "December eight two thousand" is not taxed.
+
+**Endpointing is closed. No model, no tuning.** The remaining stage worth anything is LLM TTFT,
+and that is the provider's number, not an orchestration one.
 - **Not measured on a phone yet.** Everything above is offline; the clause split changes how the
   agent sounds and no percentile will report a chopped opening.
