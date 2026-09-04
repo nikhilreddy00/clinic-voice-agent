@@ -79,6 +79,7 @@ class IntentClassifier:
         emit: EmitFn,
         *,
         timeout: float = CLASSIFY_TIMEOUT_SECS,
+        client=None,
     ) -> None:
         self._spec = spec
         self._emit = emit
@@ -98,11 +99,16 @@ class IntentClassifier:
                 or os.getenv("GROQ_API_KEY")
                 or api_key
             )
+            self._owns_client = True
             self._client = AsyncOpenAI(api_key=key, base_url=base_url)
             self._request = self._request_openai_compat
             logger.info(f"[intent] classifier via {base_url} ({spec.model})")
         else:
-            self._client = anthropic.AsyncAnthropic(api_key=api_key)
+            # Shared with the dialogue adapter unless a caller passes its own — see
+            # `llm.shared_anthropic_client`. The OpenAI-compatible path above keeps its own
+            # client: it is a different host, and it is off by default.
+            self._owns_client = client is None
+            self._client = client or anthropic.AsyncAnthropic(api_key=api_key)
             self._request = self._request_anthropic
 
     def classify(self, utterance: str) -> None:
@@ -195,4 +201,5 @@ class IntentClassifier:
         for task in list(self._tasks):
             task.cancel()
         self._tasks.clear()
-        await self._client.close()
+        if self._owns_client:
+            await self._client.close()

@@ -63,6 +63,34 @@ def to_anthropic_tools(schema: ToolsSchema) -> list[dict[str, Any]]:
     return tools
 
 
+# --- one HTTP client per process, not per call ------------------------------------------------
+#
+# Phase 14, finding 4. Every CallSession used to construct its own AsyncAnthropic (here and in
+# the classifier), so each call opened two fresh connection pools and paid two TLS handshakes.
+# Turn-1 TTFT measured 736-740 ms against a 540-670 ms steady state on the 2026-09-04 calls.
+#
+# A worker hosts N calls (Phase 11), so this is 2N pools that could be 2. Same reasoning as
+# `core/vad.shared_inference_session()`: per-call state stays per-call, but an expensive
+# stateless resource is process-wide.
+#
+# Keyed by API key so a differently-credentialed session cannot silently reuse the wrong one.
+_shared_clients: dict[str, anthropic.AsyncAnthropic] = {}
+
+
+def shared_anthropic_client(api_key: str) -> anthropic.AsyncAnthropic:
+    """The process-wide client for ``api_key``, created on first use.
+
+    Deliberately never closed: it outlives any one call, and closing it in a session teardown
+    would tear the connection pool out from under every other call in the same worker. The
+    adapters below only close a client they constructed themselves.
+    """
+    client = _shared_clients.get(api_key)
+    if client is None:
+        client = _shared_clients[api_key] = anthropic.AsyncAnthropic(api_key=api_key)
+        logger.info("[llm] opened shared Anthropic client (one per process, per key)")
+    return client
+
+
 class AnthropicLLM:
     """Streaming Claude client that turns one request into a sequence of events."""
 
@@ -77,8 +105,11 @@ class AnthropicLLM:
         max_tokens: int = MAX_TOKENS,
         router: LLMRouter | None = None,
         now=None,
+        client: anthropic.AsyncAnthropic | None = None,
     ) -> None:
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        # An injected client is shared with other calls, so this adapter must not close it.
+        self._owns_client = client is None
+        self._client = client or anthropic.AsyncAnthropic(api_key=api_key)
         self._model = model
         self._tools = to_anthropic_tools(tools)
         self._emit = emit
@@ -261,4 +292,5 @@ class AnthropicLLM:
     async def aclose(self) -> None:
         for request_id in list(self._tasks):
             self.cancel(request_id)
-        await self._client.close()
+        if self._owns_client:
+            await self._client.close()

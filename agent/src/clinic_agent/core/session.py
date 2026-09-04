@@ -23,6 +23,7 @@ for audio in, and ``TTS -> media`` for audio out. Audio never becomes an event.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -50,7 +51,7 @@ from .actions import (
     TransferToHuman,
 )
 from .adapters.classifier import IntentClassifier
-from .adapters.llm import AnthropicLLM
+from .adapters.llm import AnthropicLLM, shared_anthropic_client
 from .adapters.media import LiveKitMedia, LocalMedia, MediaAdapter
 from .adapters.stt import DeepgramSTT
 from .adapters.tools import ToolExecutor
@@ -71,6 +72,12 @@ def _livekit_join_token(settings: Settings, room_name: str, identity: str) -> st
         .with_grants(livekit_api.VideoGrants(room_join=True, room=room_name))
         .to_jwt()
     )
+
+
+# Above this, a stall is long enough to be a real cause of a gap between LLM text deltas
+# rather than ordinary scheduling jitter. Sampling itself is ~free; the logging is not, so
+# the threshold keeps a live call from writing a line 20x a second.
+_LOOP_LAG_WARN_MS = float(os.getenv("CLINIC_LOOP_LAG_WARN_MS", "50"))
 
 
 class CallSession:
@@ -106,6 +113,13 @@ class CallSession:
         self._tts = self._build_tts()
         self._stt = self._build_stt()
         self._turn = self._build_turn()
+        # Phase-14 finding 2: is the loop blocked while LLM deltas queue up, or does the
+        # wire deliver them in bursts? Off by default — it is a diagnostic, not a feature.
+        self._loop_lag = (
+            telemetry.LoopLagMonitor(warn_over_ms=_LOOP_LAG_WARN_MS)
+            if os.getenv("CLINIC_LOOP_LAG") == "1"
+            else None
+        )
 
     def _build_llm(self):
         """The system prompt is built HERE, per call, not per process.
@@ -122,6 +136,7 @@ class CallSession:
             emit=self.emit,
             router=self._router,
             now=self._now,
+            client=shared_anthropic_client(self.settings.anthropic_api_key),
         )
 
     def _build_classifier(self):
@@ -130,6 +145,7 @@ class CallSession:
             api_key=self.settings.anthropic_api_key,
             spec=self._router.classifier_spec(),
             emit=self.emit,
+            client=shared_anthropic_client(self.settings.anthropic_api_key),
         )
 
     def _build_tools(self):
@@ -208,6 +224,10 @@ class CallSession:
         # chosen against the default mode and a telephony caller would never hear the
         # call-recording consent line. That is a governance failure, not a cosmetic ordering nit.
         self.emit(ev.CallStarted(t=time.monotonic(), call_id=self.call_id, mode=self.settings.mode))
+
+        if self._loop_lag is not None:
+            self._loop_lag.start()
+            logger.info(f"[loop] lag sampling on; warning over {_LOOP_LAG_WARN_MS:.0f} ms")
 
         await self._stt.start()
         await self._tts.start()
@@ -301,6 +321,10 @@ class CallSession:
             f"intent={self.state.intent.value if self.state.intent else 'unclassified'}"
             + (f" EMERGENCY({self.state.emergency_category})" if self.state.emergency else "")
         )
+        if self._loop_lag is not None:
+            await self._loop_lag.stop()
+            if summary := self._loop_lag.summary():
+                logger.info(summary)
         self.metrics.finalize()
         self._recorder.close()  # flush the buffered tail and release the descriptor
 

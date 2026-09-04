@@ -109,3 +109,54 @@ def test_the_fallback_prompt_is_still_cached(monkeypatch):
     blocks = _llm(monkeypatch, None)._system_blocks("")
     assert blocks[0]["text"] == "fallback"
     assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+
+# --- the shared HTTP client (Phase 14, finding 4) --------------------------------------------
+
+
+class _StubClient:
+    """Stands in for AsyncAnthropic — only `close()` matters here."""
+
+    def __init__(self) -> None:
+        self.closed = 0
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+@pytest.mark.asyncio
+async def test_a_shared_client_survives_one_session_hanging_up():
+    """A worker hosts N calls in one process (Phase 11) and they now share one HTTP client.
+
+    So the dangerous direction is teardown: `aclose()` used to close the client
+    unconditionally, and with a shared client the FIRST caller to hang up would tear the
+    connection pool out from under every other call still in progress. An adapter closes only a
+    client it constructed itself.
+    """
+    shared = _StubClient()
+    first = AnthropicLLM(api_key="k", model="m", system_prompt="p",
+                         tools=build_tools_schema(), emit=lambda e: None, client=shared)
+    second = AnthropicLLM(api_key="k", model="m", system_prompt="p",
+                          tools=build_tools_schema(), emit=lambda e: None, client=shared)
+
+    await first.aclose()
+    assert shared.closed == 0, "one call hanging up closed the pool the others are using"
+    await second.aclose()
+    assert shared.closed == 0
+
+
+@pytest.mark.asyncio
+async def test_an_adapter_that_made_its_own_client_still_closes_it():
+    """The other half: no injection means no sharing, so nothing leaks."""
+    adapter = AnthropicLLM(api_key="k", model="m", system_prompt="p",
+                           tools=build_tools_schema(), emit=lambda e: None)
+    adapter._client = _StubClient()
+    await adapter.aclose()
+    assert adapter._client.closed == 1
+
+
+def test_the_process_wide_client_is_reused_across_calls():
+    from clinic_agent.core.adapters.llm import shared_anthropic_client
+
+    assert shared_anthropic_client("key-a") is shared_anthropic_client("key-a")
+    assert shared_anthropic_client("key-a") is not shared_anthropic_client("key-b")

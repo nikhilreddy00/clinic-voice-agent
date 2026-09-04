@@ -231,7 +231,10 @@ see `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md` for the full pl
     booking with a phone + DOB is what creates the patient record that makes the next call a
     returning one.
   - **The agent never approves a refill.** `request_refill` creates a `staff_tasks` row and
-    there is no code path that could do otherwise.
+    there is no code path that could do otherwise. **The failure mode is the opposite one and it
+    has happened: the agent SAYING it filed a refill without calling the tool at all** — see the
+    2026-09-04 fabrication note below. "Never approves" is enforced by the API; "never claims to
+    have filed" is enforced by `_ACTION_CLAIM`.
   - Memory is loaded **after** the greeting action and never awaited: the AI disclosure must not
     wait on a database, and a failed lookup just means a colder greeting.
 
@@ -286,6 +289,17 @@ confirmation read-back, and said "Hello?" to get the agent back.
   - `CallState.turn_had_tool` is set on any tool use (invoked OR gate-refused) and reset with
     `nudged` on each new caller turn. The rule was always per CALLER TURN; only the mechanism
     was per request.
+  - **And a reply that ENDS IN A QUESTION is never nudged (2026-09-04).** Same truncation, third
+    variant, found in trace `20260904T173146047919Z` at t=34.0. A returning caller opened with
+    "I need to reschedule"; the model said *"Good to hear from you — I'm happy to help move
+    that. Let me pull up your appointment first. What's your full name?"* and called no tool
+    **because it could not** — every PHI tool is gated behind `verify_identity`. So it did the
+    only correct thing available, which is verbatim what `_ACTION_NUDGE` demands: it asked for
+    what it needed. The nudge fired anyway, closed the live TTS context, and cut the sentence
+    off 0.8 s into ~6 s. The caller heard *"Good to hear from you — I'm happy to h—"* and said
+    "Hello?". **A reply that asks the caller a question is not silence.** The comment claiming a
+    false positive costs "one extra request" was the wrong cost model and is corrected in place;
+    that wrong model is why this shipped twice.
   - **A `ProviderDegraded` tts `Context closed` with no preceding `SpeechStarted` is the
     signature.** With a barge-in it is normal (CLAUDE.md, Phase-14 notes); without one it means
     the engine cut the agent off mid-sentence and the remaining text was dropped.
@@ -564,25 +578,119 @@ Phases 9 (Postgres + Supabase), 10 (in-house event loop), 11 (concurrency + load
 has now had its **first real runs** (partial — 3 of 19 cases) and produced the prompt-caching
 result below.
 
-**Phase 13's exit criterion is met on the API and the engine, and NOT yet on a live call.** A
-returning caller being recognised, verified, and rescheduling end to end is proven offline by
-`./run_e2e.sh` (real reducer, real tool executor, real HTTP, real Postgres) and by 90 API tests.
-Every live attempt so far has been defeated by one of the defects recorded below; the last one
-was not a defect at all but an un-restarted API serving pre-fix code.
+**Phase 13's exit criterion is MET — see *Phase 13 CLOSED* below.** It took six live attempts;
+five were defeated by the defects recorded here, and the sixth by an un-restarted API serving
+pre-fix code. Everything below the microphone was already proven offline by `./run_e2e.sh`
+(real reducer, real tool executor, real HTTP, real Postgres) and 90 API tests — which is the
+lesson: the offline suites were necessary and were never sufficient, because every defect lived
+in the seam between components or in the audio timing above them.
 
 **Before the next live call, in this order:** reset the data
 (`scheduling_api/scripts/reset_demo_data.py --yes`), **restart the scheduling API** so the
 migration runs, restart the agent, then dial. See the restart note under *Live-call hardening*.
 
-**Next: Phase 14 — latency finish.** The stage breakdown now exists (`inspect_call.py`), and it
-says LLM TTFT is ~52% of every turn while endpointing is 372 ms p50 — so the Phase-14 list is
-re-ordered by measurement: prompt caching (**done**, below), then the speech queue (~380 ms
-p50), and NOT semantic EOU, which is not currently the bottleneck.
+**Phase 13 CLOSED (2026-09-04).** Two live calls: a booking, then a callback that was
+recognised (`known=True upcoming=1`, no name spoken), verified, listed, and rescheduled —
+`verify_identity → list_appointments → check_availability → reschedule_appointment →
+get_clinic_info`, one row in Postgres, no double-book. Trace `20260904T173146047919Z`. Still
+untested on a phone: `cancel_appointment`, `request_refill`, the identity gate refusing on the
+wire, and the scripted emergency path (test that with `run_intent_eval.py --detector-only` —
+free, and it never touches a model anyway).
 
-**What is measured and what is not.** Voice-to-voice was **1,642 / 1,973 ms p50** across the two
-2026-09-03 booking calls, before prompt caching was enabled. **The post-caching number has not
-been measured on a phone** — the harness predicts TTFT 855 → ~642 ms, i.e. roughly 1.2–1.4 s
-voice-to-voice, but that is an extrapolation, not a result. Do not quote it as one.
+**Phase 14 — latency finish (in progress).** Plan:
+`/Users/uvnikhil/.claude/plans/async-napping-comet.md`. Measured 2026-09-04, 29 turns, **the
+first numbers taken after prompt caching**: endpointing 402/497 ms, dispatch 1 ms, **LLM TTFT
+627/730 ms** (was 855 — caching confirmed live), speech queue 268/340 ms, **E2E 1,556/1,625 ms**
+(was 1,642/1,973). Four findings, three of which contradict the Phase-8 plan:
+
+  - **The "speech queue" is the LLM, not TTS.** First token → first sentence-ending period is
+    205–255 ms p50; Cartesia + playback is only ~60–85 ms. The agent is waiting for a period,
+    not for audio. Sentence-boundary TTS chunking — the Phase-8 plan's item — **was already
+    built** in Phase 10.
+  - **The delta bursts are the wire, not our event loop. Measured, not assumed.** Deltas arrive
+    as one character, a 100–350 ms gap, then 50–100 characters at once. A probe that streams the
+    real 5,023-token booking prompt with the loop otherwise idle — no media, no VAD, no STT —
+    reproduces the same gaps at **loop lag p50 1.08 ms, max 29.6 ms**. Haiku's streaming is
+    coarse at the source (3–6 deltas for a whole reply). Consequences: there is no blocked loop
+    to unblock; speaking earlier only helps when a clause lands in an EARLIER BURST than the
+    period, which is why the same change is worth 115 ms on one call and 32 ms on the next; and
+    speculative LLM start is not undermined by anything on our side. Re-measure with
+    `CLINIC_LOOP_LAG=1` (`[loop] blocked N ms` lines) plus the streaming-shape table in
+    `inspect_call.py` before believing otherwise.
+  - **The FAST tier is dead in the dialogue path.** All 22 routed turns: `standard/haiku-4.5`.
+    `select_tier` only picks FAST for `Intent.EMERGENCY`, which is scripted and never reaches a
+    model. Left alone deliberately — a fast tier pays only once there is a fast model worth
+    pointing it at, and Phase 8 says there isn't one.
+  - **One Anthropic client per process, not per call** (`llm.shared_anthropic_client`). Each
+    session used to build its own for the dialogue AND the classifier: 2N pools per worker and
+    two TLS handshakes per call. Turn-1 TTFT was 736–740 ms against 540–670 steady. **An adapter
+    now closes only a client it constructed itself** — closing an injected one would tear the
+    pool out from under every other call in the worker, which is the whole risk of sharing it.
+
+**`reducer._FIRST_CLAUSE_MIN_CHARS` — the agent starts speaking at the first CLAUSE of a reply,
+not the first sentence.** Opening chunk only (`state.utterance_id is None`): mid-reply there is
+already audio playing, so an early split buys nothing and costs prosody. **The 20-character
+floor is an underrun guard, not a style rule** — the opening chunk must take longer to SPEAK
+than the next burst takes to ARRIVE (~335 ms p95), or the caller hears a stutter mid-phrase
+instead of a late start. It is a plain constant and **not an env var on purpose**: `reduce()` is
+pure so traces replay identically anywhere, and reading the environment there would make one
+trace produce different `Speak` actions on different machines.
+
+**Phase 14's exit criterion is now E2E p50 ≤ 1,200 ms / p95 ≤ 2,000 ms (decided 2026-09-04).**
+It replaces the inherited ≤ 800 ms, which was set in Phase 8 before anything was measured and is
+not reachable on this stack: steady-state TTFT on an ALREADY-CACHED prompt is 540–670 ms, most of
+an 800 ms budget before endpointing, TTS, or the network take a share. Phase 8 measured the
+obvious escape as worse (Groq, no prompt caching: 4,614 ms on the same prompt). **Going below
+~1,000 ms needs a different model host — in-region Bedrock/Vertex Haiku — not another
+orchestration change.** Say that plainly rather than re-tuning the engine against a number the
+provider decides. Best measured so far: **1,385 ms p50** (2026-09-04 refill call, 8 turns).
+
+**A refill the agent ANNOUNCED and never filed (2026-09-04).** Trace
+`20260904T183444349772Z` at t=123.5 — a live call that cancelled an appointment correctly and
+then fabricated the next task. The classifier had switched to `medication_refill` at 0.95, so
+`request_refill` **was** in the tool set (req-13 routed as "medication_refill dialogue"); the
+model called nothing, `stop_reason: end_turn`, and said *"Got it — I'll send a refill request
+for ibuprofen to our staff, and they'll review it and follow up with you."* No `staff_tasks`
+row exists. The caller thanked it and hung up believing a refill was queued.
+
+  - **`reducer._ACTION_CLAIM` is a verb list, and a verb list is always one live call behind the
+    model's vocabulary.** It had `check|look|see|pull|find|book|hold` and not `send` — and
+    *sending / filing / forwarding / passing along to staff* is the entire shape of the
+    non-scheduling tools, so those were the most consequential verbs to be missing. Now
+    included, along with **past tense** (`I've sent that over`), which is the worse case: not an
+    unkept promise but a completed action that never happened. `turn_had_tool` already excludes
+    legitimate post-tool read-backs.
+  - When adding a tool, **add its verbs here too.** The gate that stops the model inventing the
+    action is this regex, not the prompt.
+
+**A blank credential must not become an HTTP request (2026-09-04).** Same trace, t=44.8. The
+caller's opening sentence named them, so the model called `verify_identity` immediately with
+`date_of_birth: ""`. The API correctly 422'd, but a raw `Client error '422 Unprocessable'` is
+not something a model can recover from gracefully — it apologized to the caller for a mistake
+they could not perceive (*"I apologize — let me ask that differently"*) and spent a turn.
+`_MISSING_DOB_RESULT` now answers it in the reducer with the instruction, the same way the
+identity gate does, one step earlier and with no round trip.
+
+**The Tier-A load test measured NOTHING from Phase 13 until 2026-09-04, and exited 0 the whole
+time.** Phase 13 added `context_note` to `AnthropicLLM.start()`; `loadtest/fake_adapters.FakeLLM`
+was never updated, so every session raised `unexpected keyword argument 'context_note'` on its
+first turn. The harness printed a tidy table of `None`s with `*undersampled`, wrote an SVG, and
+returned success — 800 of 800 sessions dead. Both halves are fixed and both matter:
+
+  - `FakeLLM.start` now mirrors the real signature **keyword for keyword, spelled out rather
+    than swallowed by `**kwargs`** — the next drift must fail loudly at the seam, not be
+    silently accepted.
+  - `tier_a.py` collects `worker.stats.failed`, prints `*** N SESSIONS FAILED ***`, and
+    **returns 1**. Undersampling is a warning; sessions dying is a failure.
+
+  The Phase-11 numbers in this file predate the break and are still valid. Any load-test result
+  produced between Phase 13 and 2026-09-04 is not.
+
+**Replaying a trace through a CHANGED reducer diverges, and that is not a bug.** Request ids are
+derived from state counters, so a fix that changes which requests exist renumbers everything
+after it and later deltas read as stale. `20260904T173146047919Z` replays to 2 utterances
+instead of 15 for exactly this reason (the nudge no longer fires on its first turn). When using
+replay as a regression check, diff a trace whose recorded engine matches the code under test.
 
 **Billing blocker CLEARED (2026-09-03).** Credits topped up; the previous
 `credit balance is too low` failure is resolved and live calls run end to end again.
@@ -596,12 +704,6 @@ for routine runs, drop the flag and let promptfoo replay unchanged cases from ca
 call and whether it succeeded, and a verdict line. `NO TOOL CALLS AT ALL` or
 `booking committed: no` after the caller heard a confirmation is the tell for a fabricated
 booking. Console `[media]` lines say whether caller audio arrived at all.
-
-**Phase 13's exit criterion is not met yet, and it needs a phone, not code:** a returning caller
-recognized, verified, and rescheduling end to end on a live call. Everything below the
-microphone is proven — 70 API tests including the spoofed-ANI adversarial set, 299 agent tests,
-and a full book → recognise → refuse → verify → list → reschedule → refill → cancel run against
-the real API and Postgres.
 
 **Live-call hardening (post-Phase-12, effectively early Phase 14).** Five defects, all found by
 reading traces rather than by a failing test. Do not regress these:

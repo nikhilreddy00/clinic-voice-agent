@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import glob
 import json
+import re
 import os
 import sys
 
@@ -34,6 +35,10 @@ def load(arg: str | None) -> tuple[str, list[dict]]:
             sys.exit(f"no traces in {os.path.abspath(TRACES)}")
         path = max(files, key=os.path.getmtime)
     return path, [json.loads(line) for line in open(path)]
+
+
+_SENTENCE = re.compile(r"[.!?\n]")
+_CLAUSE = re.compile(r"[,;:\u2014]")
 
 
 def _pct(values: list[float], pct: float) -> float | None:
@@ -103,6 +108,69 @@ def _latency(events: list[dict]) -> None:
               f"{_pct(classify, 50):7.0f}ms {_pct(classify, 95):7.0f}ms {max(classify):7.0f}ms")
 
 
+
+def _delta_gaps(events: list[dict]) -> None:
+    """Where the time inside one LLM response goes, and how the text actually arrives.
+
+    Phase 14, finding 1: of the ~270-340 ms "speech queue" measured on the 2026-09-04 calls,
+    205-255 ms was the model still generating the FIRST SENTENCE. The agent is not waiting on
+    Cartesia, it is waiting on a period. That is what the "first clause" column is for — it is
+    how much earlier speech could start if a comma were good enough to speak on.
+
+    Finding 2: the deltas arrive in bursts (a 1-5 character delta, then a 100-350 ms gap, then
+    50-100 characters at once) and nothing in this codebase batches them. If the biggest gaps
+    line up with `[loop] blocked` warnings in the console (CLINIC_LOOP_LAG=1), the loop is the
+    cause and no amount of chunking will help. If they do not, the wire delivers in bursts and
+    speaking earlier is the only lever on this stage.
+    """
+    by_request: dict[str, list[tuple[float, str]]] = {}
+    for e in events:
+        if e.get("kind") == "LLMTextDelta":
+            by_request.setdefault(e["request_id"], []).append((e["t"], e["text"]))
+
+    gaps: list[float] = []
+    to_sentence: list[float] = []
+    to_clause: list[float] = []
+    for deltas in by_request.values():
+        first = deltas[0][0]
+        gaps += [(b[0] - a[0]) * 1000 for a, b in zip(deltas, deltas[1:])]
+        acc = ""
+        sentence_at = clause_at = None
+        for t, text in deltas:
+            acc += text
+            if clause_at is None and _CLAUSE.search(acc):
+                clause_at = (t - first) * 1000
+            if _SENTENCE.search(acc):
+                sentence_at = (t - first) * 1000
+                break
+        if sentence_at is not None:
+            to_sentence.append(sentence_at)
+            to_clause.append(clause_at if clause_at is not None else sentence_at)
+
+    if not gaps:
+        return
+    print()
+    print(f"LLM streaming shape over {len(by_request)} requests")
+    print(f"  {'measure':44s} {'n':>3s} {'p50':>8s} {'p95':>8s} {'max':>8s}")
+    for label, samples in (
+        ("gap between consecutive text deltas", gaps),
+        ("first token -> first sentence (spoken now)", to_sentence),
+        ("first token -> first clause  (split ceiling)", to_clause),
+    ):
+        if not samples:
+            continue
+        print(f"  {label:44s} {len(samples):3d} "
+              f"{_pct(samples, 50):7.0f}ms {_pct(samples, 95):7.0f}ms {max(samples):7.0f}ms")
+    if to_sentence and to_clause:
+        saving = _pct(to_sentence, 50) - _pct(to_clause, 50)
+        # The reducer ALREADY speaks at the first clause (_FIRST_CLAUSE_MIN_CHARS). This is the
+        # ceiling that rule can reach on this call, not an unclaimed win — the realised effect
+        # is inside the speech-queue stage above. It only fires when a clause boundary lands
+        # 20+ characters in AND in an earlier delta burst than the period, which measured 2 of
+        # 9 utterances per call.
+        print(f"  {'-> ceiling for the clause split (already on)':44s}     {saving:7.0f}ms  at p50")
+
+
 def main() -> None:
     path, events = load(sys.argv[1] if len(sys.argv) > 1 else None)
     print(f"{os.path.basename(path)}  ({len(events)} events)\n")
@@ -145,6 +213,7 @@ def main() -> None:
 
     print("\n" + "-" * 60)
     _latency(events)
+    _delta_gaps(events)
     print("-" * 60)
     if not tools:
         print("NO TOOL CALLS AT ALL — nothing was booked, changed, or looked up.")
