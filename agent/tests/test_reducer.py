@@ -428,3 +428,325 @@ def test_a_farewell_before_a_booking_does_not_end_the_call():
     d.send(ev.FinalTranscript(text="No. Thank you."))
     assert d.state.closing is False
     assert d.state.phase is not Phase.CLOSED
+
+
+# --- the hold_id the model must never retype (live double-round-trip fix) --------------------
+
+
+def _turn(d: Driver, text: str = "go ahead") -> str:
+    """Open a caller turn and return the request id the engine is now serving."""
+    d.send(ev.FinalTranscript(text=text))
+    assert d.state.request_id is not None
+    return d.state.request_id
+
+
+def _held(d: Driver, hold_id: str, slot_id: int = 25, tid: str | None = None) -> None:
+    """Run a successful hold_slot through the engine."""
+    tid = tid or f"t-hold-{slot_id}"
+    rid = _turn(d)
+    d.send(ev.LLMToolUse(request_id=rid, tool_call_id=tid,
+                         name="hold_slot", arguments={"slot_id": slot_id}))
+    d.send(ev.LLMCompleted(request_id=rid, stop_reason="tool_use"))
+    d.send(ev.ToolCompleted(tool_call_id=tid, name="hold_slot", ok=True,
+                            result={"ok": True, "hold_id": hold_id, "slot_id": slot_id},
+                            latency_ms=1.0, http_status=200))
+
+
+def _confirm(d: Driver, hold_id: str, tid: str = "t-c") -> InvokeTool:
+    rid = d.state.request_id or _turn(d)
+    produced = d.send(ev.LLMToolUse(
+        request_id=rid, tool_call_id=tid, name="confirm_booking",
+        arguments={"hold_id": hold_id, "patient_name": "Nick",
+                   "date_of_birth": "05/08/2003", "reason": "back pain"},
+    ))
+    return next(a for a in produced if isinstance(a, InvokeTool))
+
+
+def test_a_corrupted_hold_id_is_overwritten_with_the_one_the_api_issued():
+    """The live defect: one hex digit changed while copying a 36-char UUID.
+
+    hold_slot issued  c1154b66-3d70-4585-908c-2aa92646049f
+    the model sent    c1154b66-3d70-4585-908c-2aa92642049f   (6 -> 2)
+
+    The API refused with a 409 and the agent re-held and re-confirmed, burning 30 seconds of
+    the call. The model should never have been holding the token in the first place.
+    """
+    issued = "c1154b66-3d70-4585-908c-2aa92646049f"
+    corrupted = "c1154b66-3d70-4585-908c-2aa92642049f"
+
+    d = _greeted()
+    _held(d, issued)
+    invoke = _confirm(d, corrupted)
+
+    assert invoke.arguments["hold_id"] == issued
+    # everything else the model supplied is still its own — this is intake, not a credential
+    assert invoke.arguments["patient_name"] == "Nick"
+    assert invoke.arguments["date_of_birth"] == "05/08/2003"
+
+
+def test_a_fabricated_hold_id_is_overwritten_too():
+    d = _greeted()
+    _held(d, "aaaaaaaa-1111-2222-3333-444444444444")
+    assert _confirm(d, "totally-made-up").arguments["hold_id"] == (
+        "aaaaaaaa-1111-2222-3333-444444444444"
+    )
+
+
+def test_the_newest_hold_wins_when_a_slot_is_re_held():
+    """A caller who changes their mind mid-flow must not confirm the abandoned slot."""
+    d = _greeted()
+    _held(d, "old-hold-0000", slot_id=25)
+    _held(d, "new-hold-1111", slot_id=35)
+    assert _confirm(d, "old-hold-0000").arguments["hold_id"] == "new-hold-1111"
+
+
+def test_a_failed_hold_does_not_replace_the_live_one():
+    d = _greeted()
+    _held(d, "good-hold-0000", slot_id=25)
+    rid = d.state.request_id or _turn(d)
+    d.send(ev.LLMToolUse(request_id=rid, tool_call_id="t-bad",
+                         name="hold_slot", arguments={"slot_id": 99}))
+    d.send(ev.ToolCompleted(tool_call_id="t-bad", name="hold_slot", ok=False,
+                            result={"ok": False, "error": "slot taken"},
+                            latency_ms=1.0, http_status=409))
+    assert _confirm(d, "whatever").arguments["hold_id"] == "good-hold-0000"
+
+
+def test_a_failed_confirm_keeps_the_hold_so_the_retry_reuses_it():
+    """A 409 from something other than the id must not force a redundant re-hold."""
+    d = _greeted()
+    _held(d, "live-hold-0000")
+    _confirm(d, "live-hold-0000", tid="t-c1")
+    d.send(ev.ToolCompleted(tool_call_id="t-c1", name="confirm_booking", ok=False,
+                            result={"ok": False, "error": "nope"},
+                            latency_ms=1.0, http_status=409))
+    assert _confirm(d, "garbage", tid="t-c2").arguments["hold_id"] == "live-hold-0000"
+
+
+def test_a_successful_confirm_spends_the_hold():
+    """A second booking in the same call must not silently reuse a consumed hold."""
+    d = _greeted()
+    _held(d, "spent-hold-0000")
+    _confirm(d, "spent-hold-0000", tid="t-c1")
+    d.send(ev.ToolCompleted(tool_call_id="t-c1", name="confirm_booking", ok=True,
+                            result={"ok": True, "confirmation_id": "ABC123", "slot_id": 25},
+                            latency_ms=1.0, http_status=200))
+    assert d.state.active_hold_id == ""
+    # with no live hold the model's own value passes through and the API decides
+    assert _confirm(d, "spent-hold-0000", tid="t-c2").arguments["hold_id"] == "spent-hold-0000"
+
+
+def test_confirm_without_any_hold_passes_the_models_value_through():
+    """No live hold means no opinion — the API's existing error path still speaks."""
+    d = _greeted()
+    assert _confirm(d, "unheld-1234").arguments["hold_id"] == "unheld-1234"
+
+
+# --- the nudge must not fire on a turn whose tool already ran -------------------------------
+
+
+def test_the_follow_up_after_a_tool_call_is_not_nudged():
+    """Live dead-air bug, trace 20260903T215242896036Z at t=130.4.
+
+    The caller said "Yeah. Sure.", the model called `hold_slot`, the tool succeeded, and the
+    follow-up request narrated the read-back: "I'm holding that for you. So I have you as
+    Olivia. Your date of birth is ... Does that all sound right?"
+
+    `committed` only counts tool calls made by THIS request, and `turn_tool_uses` is cleared at
+    the end of every request — so the narration looked like "announced an action, took none"
+    and the nudge fired. Starting that extra request closed the live TTS context: Cartesia
+    reported `Context closed`, `BotStoppedSpeaking` arrived with `completed: false` 1.06 s into
+    an ~8 second sentence, and the nudge's own reply was queued to the dying context and never
+    spoken at all. The caller heard "I'm holding that for you. So I have you as Ol—" and then
+    6.5 seconds of silence, on the confirmation read-back — the single most important sentence
+    in the call. They said "Hello?" to get the agent back.
+
+    The rule was always "a turn that announces an action and calls NO TOOL", per caller turn.
+    A tool ran. The nudge must not fire.
+    """
+    d = _greeted()
+    rid = _turn(d, "Yeah. Sure.")
+
+    d.send(ev.LLMToolUse(request_id=rid, tool_call_id="tu-hold",
+                         name="hold_slot", arguments={"slot_id": 24}))
+    d.send(ev.LLMCompleted(request_id=rid, stop_reason="tool_use"))
+    d.send(ev.ToolCompleted(tool_call_id="tu-hold", name="hold_slot", ok=True,
+                            result={"ok": True, "hold_id": "h-1", "slot_id": 24},
+                            latency_ms=1.0, http_status=200))
+
+    follow_up = d.state.request_id
+    assert follow_up is not None and follow_up != rid
+    d.send(ev.LLMTextDelta(request_id=follow_up, text="I'm holding that for you. "))
+    d.send(ev.LLMTextDelta(request_id=follow_up, text="Does that all sound right?"))
+    produced = d.send(ev.LLMCompleted(request_id=follow_up, stop_reason="end_turn"))
+
+    assert not [a for a in produced if isinstance(a, StartLLM)], (
+        "nudged a turn whose tool had already run — this truncates the agent mid-sentence"
+    )
+    assert d.state.nudged is False
+
+
+def test_an_empty_promise_with_no_tool_anywhere_in_the_turn_is_still_nudged():
+    """The behaviour the nudge exists for must survive the fix."""
+    d = _greeted()
+    rid = _turn(d, "can you check Monday?")
+    d.send(ev.LLMTextDelta(request_id=rid, text="Let me check that for you."))
+    produced = d.send(ev.LLMCompleted(request_id=rid, stop_reason="end_turn"))
+
+    assert [a for a in produced if isinstance(a, StartLLM)], "the follow-through nudge stopped firing"
+    assert d.state.nudged is True
+
+
+def test_a_new_caller_turn_restores_the_nudge_after_a_tool_turn():
+    """`turn_had_tool` is per caller turn, like `nudged` — not for the rest of the call."""
+    d = _greeted()
+    rid = _turn(d, "hold that slot")
+    d.send(ev.LLMToolUse(request_id=rid, tool_call_id="tu-1", name="hold_slot",
+                         arguments={"slot_id": 1}))
+    d.send(ev.LLMCompleted(request_id=rid, stop_reason="tool_use"))
+    d.send(ev.ToolCompleted(tool_call_id="tu-1", name="hold_slot", ok=True,
+                            result={"ok": True, "hold_id": "h", "slot_id": 1},
+                            latency_ms=1.0, http_status=200))
+    follow = d.state.request_id
+    d.send(ev.LLMTextDelta(request_id=follow, text="Holding that now."))
+    d.send(ev.LLMCompleted(request_id=follow, stop_reason="end_turn"))
+
+    rid2 = _turn(d, "and what about Tuesday?")
+    assert d.state.turn_had_tool is False, "a tool from the previous turn silenced this one"
+    d.send(ev.LLMTextDelta(request_id=rid2, text="Let me check Tuesday for you."))
+    produced = d.send(ev.LLMCompleted(request_id=rid2, stop_reason="end_turn"))
+    assert [a for a in produced if isinstance(a, StartLLM)]
+
+
+def test_a_promise_that_ends_by_asking_the_caller_something_is_not_nudged():
+    """Live truncation bug, trace 20260904T173146047919Z at t=34.0.
+
+    A returning caller opened with "I need to reschedule". The model replied "Good to hear from
+    you — I'm happy to help move that. Let me pull up your appointment first. What's your full
+    name?" and called no tool, because it could not: every PHI tool is gated behind
+    `verify_identity` and the caller had not verified yet. So the model did the one correct
+    thing available to it — it asked for what it needed, which is verbatim what `_ACTION_NUDGE`
+    instructs.
+
+    The nudge fired anyway. Starting that request closed the live TTS context: `ProviderDegraded`
+    tts "Context closed" and `BotStoppedSpeaking completed: false` 0.8 s into a ~6 second
+    sentence. The caller heard "Good to hear from you — I'm happy to h—", then the replacement
+    reply, and said "Hello?" — 15 seconds lost on the first turn of the call.
+
+    A reply that asks the caller a question is not silence. It must not be nudged.
+    """
+    d = _greeted()
+    rid = _turn(d, "I need to reschedule my appointment")
+    d.send(ev.LLMTextDelta(request_id=rid, text="Let me pull up your appointment first. "))
+    d.send(ev.LLMTextDelta(request_id=rid, text="What's your full name?"))
+    produced = d.send(ev.LLMCompleted(request_id=rid, stop_reason="end_turn"))
+
+    assert not [a for a in produced if isinstance(a, StartLLM)], (
+        "nudged a reply that had already asked the caller for what it needed — "
+        "this truncates the agent mid-sentence"
+    )
+    assert d.state.nudged is False
+
+
+# --- Phase 14: speak the opening clause rather than waiting for a full sentence --------------
+
+
+def test_the_opening_clause_is_spoken_before_the_sentence_finishes():
+    """Phase 14, finding 1.
+
+    Measured across the two 2026-09-04 calls, the wait from the LLM's first token to its first
+    sentence-ending period was 205-255 ms p50 — most of the entire "speech queue" stage, and
+    none of it TTS. Cartesia and playback account for only ~60-85 ms.
+
+    This is the real opening of a live reply, cut where the model's first burst of output
+    actually ended. There is no period in it yet, so before this change the caller heard
+    nothing at all until the next burst arrived.
+    """
+    assert _split_speakable("Good to hear from you—I'm happy to h", opening=True) == (
+        ["Good to hear from you—"], "I'm happy to h",
+    )
+
+
+def test_the_clause_split_applies_only_to_the_opening_of_a_reply():
+    """Mid-reply there is already audio playing, so an early split buys silence back from
+    nobody and costs prosody. `opening=False` is the reducer saying an utterance is already
+    open (`state.utterance_id is not None`)."""
+    text = "Good to hear from you—I'm happy to h"
+    assert _split_speakable(text, opening=False) == ([], text)
+
+
+def test_a_clause_too_short_to_outlast_the_next_burst_is_not_spoken():
+    """The floor is an underrun guard, not a style rule: the opening chunk must take longer to
+    SPEAK than the next burst of model output takes to ARRIVE (79-102 ms p50, ~335 ms p95), or
+    the caller hears the reply stutter mid-phrase instead of starting late."""
+    assert _split_speakable("Perfect — I'm holding that", opening=True)[0] == []
+
+
+def test_a_complete_sentence_still_wins_over_the_clause_split():
+    """A period is a better place to breathe than a comma, so it must still take precedence —
+    the clause path is a fallback for when no sentence exists yet, not a replacement."""
+    assert _split_speakable("Thanks, Nikhil. And your date", opening=True) == (
+        ["Thanks, Nikhil."], " And your date",
+    )
+
+
+# --- live call 2026-09-04: a refill the agent announced and never filed ----------------------
+
+
+def test_a_promise_to_SEND_something_is_a_promise_like_any_other():
+    """Live fabrication, trace `20260904T183444349772Z` at t=123.5.
+
+    The caller asked for a prescription refill. The intent classifier had already switched to
+    `medication_refill` at 0.95, so `request_refill` WAS in the model's tool set (req-13 routed
+    as "medication_refill dialogue"). The model called nothing, `stop_reason: end_turn`, and
+    said: "Got it — I'll send a refill request for ibuprofen to our staff, and they'll review
+    it and follow up with you."
+
+    No `staff_tasks` row was created. The caller thanked the agent and hung up believing a
+    refill was queued. The nudge exists for exactly this and stayed silent, because
+    `_ACTION_CLAIM` listed `check|look|see|pull|find|book|hold` and not `send` — and
+    "sending / filing / passing along to staff" is the entire shape of the non-scheduling
+    tools, so those were the most consequential verbs to be missing.
+    """
+    d = _greeted()
+    rid = _turn(d, "Ibuprofen.")
+    d.send(ev.LLMTextDelta(request_id=rid, text="Got it — I'll send a refill request for "))
+    d.send(ev.LLMTextDelta(request_id=rid, text="ibuprofen to our staff, and they'll review it."))
+    produced = d.send(ev.LLMCompleted(request_id=rid, stop_reason="end_turn"))
+
+    assert [a for a in produced if isinstance(a, StartLLM)], (
+        "announced a refill request and called no tool, and the nudge did not fire"
+    )
+    assert d.state.nudged is True
+
+
+def test_claiming_something_is_already_done_is_nudged_too():
+    """Past tense is the worse case: not an unkept promise, a completed action that never
+    happened. A turn whose tool actually ran is excluded by `turn_had_tool`, so this cannot
+    fire on a legitimate read-back."""
+    d = _greeted()
+    rid = _turn(d, "did you send that?")
+    d.send(ev.LLMTextDelta(request_id=rid, text="Yes, I've sent that over to our staff."))
+    produced = d.send(ev.LLMCompleted(request_id=rid, stop_reason="end_turn"))
+    assert [a for a in produced if isinstance(a, StartLLM)]
+
+
+def test_verify_identity_with_no_date_of_birth_never_reaches_the_api():
+    """Live, same trace at t=44.8. The caller's opening sentence named them, so the model
+    called `verify_identity` straight away with `date_of_birth: ""`. The API answered 422 and
+    the caller heard "I apologize — let me ask that differently" for a mistake they could not
+    see. A blank credential is answered here, with the instruction, and costs no round trip."""
+    d = _greeted()
+    rid = _turn(d, "Hi, my name is Nikhil and I want to cancel my appointment.")
+    produced = d.send(ev.LLMToolUse(request_id=rid, tool_call_id="tu-v", name="verify_identity",
+                                    arguments={"name": "Nikhil", "date_of_birth": ""}))
+
+    assert not [a for a in produced if isinstance(a, InvokeTool)], (
+        "sent a blank date of birth to the API"
+    )
+    result = json.loads(d.state.tool_results[-1]["content"])
+    assert result["ok"] is False and "date_of_birth is empty" in result["error"]
+    assert d.state.turn_had_tool is True, (
+        "a refused tool must still count as a tool for the nudge, or the recovery turn gets "
+        "re-prompted on top of the refusal"
+    )

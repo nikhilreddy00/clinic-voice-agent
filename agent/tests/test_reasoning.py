@@ -203,6 +203,21 @@ def test_two_handoff_intents_do_not_replan_against_each_other():
         (Intent.BILLING_QUESTION, Intent.CLINICAL_QUESTION, 0.95, Intent.CLINICAL_QUESTION),
         # Agreement is a no-op at any confidence.
         (Intent.SCHEDULE_APPOINTMENT, Intent.SCHEDULE_APPOINTMENT, 0.2, Intent.SCHEDULE_APPOINTMENT),
+        # `schedule_appointment` never preempts a scheduling flow — the double-book guard.
+        (Intent.RESCHEDULE_APPOINTMENT, Intent.SCHEDULE_APPOINTMENT, 0.85, Intent.RESCHEDULE_APPOINTMENT),
+        (Intent.RESCHEDULE_APPOINTMENT, Intent.SCHEDULE_APPOINTMENT, 1.0, Intent.RESCHEDULE_APPOINTMENT),
+        (Intent.CANCEL_APPOINTMENT, Intent.SCHEDULE_APPOINTMENT, 0.99, Intent.CANCEL_APPOINTMENT),
+        # ...but it still establishes a flow from nothing, and from a non-scheduling intent.
+        (None, Intent.SCHEDULE_APPOINTMENT, 0.7, Intent.SCHEDULE_APPOINTMENT),
+        (Intent.UNKNOWN, Intent.SCHEDULE_APPOINTMENT, 0.7, Intent.SCHEDULE_APPOINTMENT),
+        (Intent.MEDICATION_REFILL, Intent.SCHEDULE_APPOINTMENT, 0.9, Intent.SCHEDULE_APPOINTMENT),
+        # The block is one-directional: distinctive task changes still preempt.
+        (Intent.RESCHEDULE_APPOINTMENT, Intent.CANCEL_APPOINTMENT, 0.9, Intent.CANCEL_APPOINTMENT),
+        (Intent.SCHEDULE_APPOINTMENT, Intent.CANCEL_APPOINTMENT, 0.9, Intent.CANCEL_APPOINTMENT),
+        (Intent.SCHEDULE_APPOINTMENT, Intent.RESCHEDULE_APPOINTMENT, 0.9, Intent.RESCHEDULE_APPOINTMENT),
+        (Intent.CANCEL_APPOINTMENT, Intent.MEDICATION_REFILL, 0.9, Intent.MEDICATION_REFILL),
+        # ...and a low-confidence distinctive switch is still rejected by the threshold.
+        (Intent.RESCHEDULE_APPOINTMENT, Intent.CANCEL_APPOINTMENT, 0.7, Intent.RESCHEDULE_APPOINTMENT),
     ],
 )
 def test_resolve_intent(current, proposed, confidence, expected):
@@ -598,3 +613,75 @@ def test_a_turn_that_actually_called_a_tool_is_never_nudged():
                          arguments={"date": "2026-09-08"}))
     produced = d.send(ev.LLMCompleted(request_id=rid, stop_reason="tool_use"))
     assert not [a for a in produced if isinstance(a, StartLLM)], "re-prompted a working turn"
+
+
+def test_reschedule_flow_never_gains_the_power_to_book_a_second_appointment():
+    """Replay of the live double-book, trace 20260903T170114545113Z.
+
+    The caller asked to reschedule, was verified, had the existing Sept 7 booking listed, and
+    then answered a slot question. That answer classified as `schedule_appointment` at 0.85 —
+    exactly INTENT_SWITCH_CONFIDENCE — and the switch traded `reschedule_appointment` for
+    `hold_slot` + `confirm_booking`. The model held and confirmed, and the caller hung up with
+    two live appointments believing he had moved one.
+
+    The assertion that actually matters is the tool set: the intent label is only harmful
+    because of what it hands the model.
+    """
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="I want to reschedule my appointment"))
+    d.send(ev.IntentClassified(intent="reschedule_appointment", confidence=0.95))
+    d.send(ev.LLMCompleted(request_id="req-1", stop_reason="end_turn"))
+
+    # The real classifier outputs from the call, in order.
+    for answer, classified, confidence in [
+        ("Nick.", "unknown", 0.95),
+        ("It's Nick, N I C K.", "unknown", 0.95),
+        ("There is no last name for me.", "unknown", 0.9),
+        ("May eight two thousand three.", "unknown", 0.95),
+        ("Tuesday.", "schedule_appointment", 0.85),
+        ("Yeah. Yeah.", "unknown", 0.95),
+        ("Yeah. Sure.", "unknown", 0.95),
+    ]:
+        produced = d.send(ev.FinalTranscript(text=answer))
+        start = next(a for a in produced if isinstance(a, StartLLM))
+        assert start.intent is Intent.RESCHEDULE_APPOINTMENT, f"lost the flow on {answer!r}"
+
+        names = {t.name for t in build_tools_schema(start.intent).standard_tools}
+        assert "reschedule_appointment" in names, f"cannot reschedule after {answer!r}"
+        assert "confirm_booking" not in names, f"can double-book after {answer!r}"
+        assert "hold_slot" not in names, f"can double-book after {answer!r}"
+
+        d.send(ev.IntentClassified(intent=classified, confidence=confidence))
+
+
+def test_a_cancellation_flow_also_cannot_be_turned_into_a_new_booking():
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="I need to cancel my appointment"))
+    d.send(ev.IntentClassified(intent="cancel_appointment", confidence=0.95))
+    d.send(ev.LLMCompleted(request_id="req-1", stop_reason="end_turn"))
+
+    produced = d.send(ev.FinalTranscript(text="the Tuesday one at five"))
+    start = next(a for a in produced if isinstance(a, StartLLM))
+    d.send(ev.IntentClassified(intent="schedule_appointment", confidence=0.95))
+
+    assert start.intent is Intent.CANCEL_APPOINTMENT
+    names = {t.name for t in build_tools_schema(start.intent).standard_tools}
+    assert "cancel_appointment" in names and "confirm_booking" not in names
+
+
+def test_a_genuine_task_change_out_of_a_reschedule_still_works():
+    """The guard must not weld the caller into the flow they opened with."""
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="I want to reschedule my appointment"))
+    d.send(ev.IntentClassified(intent="reschedule_appointment", confidence=0.95))
+    d.send(ev.LLMCompleted(request_id="req-1", stop_reason="end_turn"))
+
+    d.send(ev.FinalTranscript(text="actually just cancel it, and I need a refill"))
+    d.send(ev.IntentClassified(intent="cancel_appointment", confidence=0.95))
+
+    produced = d.send(ev.FinalTranscript(text="yes please cancel"))
+    start = next(a for a in produced if isinstance(a, StartLLM))
+    assert start.intent is Intent.CANCEL_APPOINTMENT
+    assert "cancel_appointment" in {
+        t.name for t in build_tools_schema(start.intent).standard_tools
+    }

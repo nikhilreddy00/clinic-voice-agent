@@ -193,20 +193,42 @@ CANDIDATES: dict[str, Candidate] = {
         supports_temperature=False,
         notes="Quality ceiling for the Claude line; ~5x Haiku input cost.",
     ),
-    "groq-llama": Candidate(
-        key="groq-llama",
-        label="Groq (Llama 3.3 70B)",
+    # Groq deprecated llama-3.3-70b-versatile and llama-3.1-8b-instant on 2026-06-17 and shut
+    # both down on 2026-08-16; this table pointed at the first one until it was verified dead
+    # against the live /models endpoint (2026-09-03). The served fleet is gpt-oss and qwen3.
+    "groq-gpt-oss-120b": Candidate(
+        key="groq-gpt-oss-120b",
+        label="Groq (gpt-oss 120B)",
         provider="openai_compat",
-        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        # Pinned, NOT os.getenv("GROQ_MODEL"): the candidate key names the model, and a
+        # bake-off row labelled "gpt-oss 120B" that silently ran whatever GROQ_MODEL happened
+        # to hold would be a wrong measurement rather than a missing one. (It did: a stale
+        # GROQ_MODEL=llama-3.3-70b-versatile in agent/.env pointed this row at a model Groq
+        # had already shut down.) Comparing a different model is what --models is for.
+        model="openai/gpt-oss-120b",
         base_url="https://api.groq.com/openai/v1",
         api_key_env="GROQ_API_KEY",
-        notes="Latency ceiling (~180 ms TTFT). Set GROQ_INPUT_COST/GROQ_OUTPUT_COST to price it.",
+        input_cost_per_mtok=0.15,
+        output_cost_per_mtok=0.60,
+        notes="Groq's migration target for the retired Llamas. A REASONING model: it spends "
+              "output tokens thinking before the tool call, so a tight max_tokens truncates it "
+              "mid-JSON (measured: 400 tool_use_failed at 128). Budget headroom or use qwen.",
+    ),
+    "groq-qwen": Candidate(
+        key="groq-qwen",
+        label="Groq (Qwen3.8 27B)",
+        provider="openai_compat",
+        model="qwen/qwen3.8-27b",
+        base_url="https://api.groq.com/openai/v1",
+        api_key_env="GROQ_API_KEY",
+        notes="Fastest clean forced-tool-call measured on Groq (classifier: p50 203 ms vs "
+              "Haiku's 888 ms, 13/13). Unpriced here — set GROQ_INPUT_COST/GROQ_OUTPUT_COST.",
     ),
     "cerebras-llama": Candidate(
         key="cerebras-llama",
         label="Cerebras (Llama 3.3 70B)",
         provider="openai_compat",
-        model=os.getenv("CEREBRAS_MODEL", "llama-3.3-70b"),
+        model=os.getenv("CEREBRAS_MODEL", "llama-3.3-70b"),  # verify against /models before a run
         base_url="https://api.cerebras.ai/v1",
         api_key_env="CEREBRAS_API_KEY",
         notes="Competitive TTFT with Groq, higher throughput. Requires CEREBRAS_API_KEY.",
@@ -264,6 +286,15 @@ class Backend(Protocol):
     async def close(self) -> None: ...
 
 
+# A bake-off that hangs is worse than one that reports a failed candidate: the run goes silent,
+# there is no partial table, and the natural reading is "still working". Both SDKs default to a
+# 600-second timeout with automatic retries, and a rate-limited free tier answers 429 with a
+# long Retry-After — which is exactly how a ONE-CASE Groq run sat for six minutes producing no
+# output at all. Fail fast and let the summary say the candidate was rate-limited.
+REQUEST_TIMEOUT_SECS = float(os.getenv("BAKEOFF_TIMEOUT_SECS", "60"))
+REQUEST_MAX_RETRIES = int(os.getenv("BAKEOFF_MAX_RETRIES", "1"))
+
+
 # =========================================================================================
 # Anthropic
 # =========================================================================================
@@ -283,7 +314,9 @@ class AnthropicBackend:
         self.candidate = candidate
         self.max_tokens = max_tokens
         self.use_cache = use_cache
-        self._client = AsyncAnthropic(api_key=key)
+        self._client = AsyncAnthropic(
+            api_key=key, timeout=REQUEST_TIMEOUT_SECS, max_retries=REQUEST_MAX_RETRIES
+        )
 
     def _system_param(self, system: str) -> Any:
         """System prompt, with a cache breakpoint on the last (only) block when caching is on.
@@ -398,7 +431,12 @@ class OpenAICompatBackend:
             )
         self.candidate = candidate
         self.max_tokens = max_tokens
-        self._client = AsyncOpenAI(api_key=key, base_url=candidate.base_url)
+        self._client = AsyncOpenAI(
+            api_key=key,
+            base_url=candidate.base_url,
+            timeout=REQUEST_TIMEOUT_SECS,
+            max_retries=REQUEST_MAX_RETRIES,
+        )
 
     @staticmethod
     def tools_from_anthropic(anthropic_tools: list[dict]) -> list[dict]:

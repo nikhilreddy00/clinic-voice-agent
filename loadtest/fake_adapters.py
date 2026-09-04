@@ -96,7 +96,13 @@ class FakeLLM:
         self._tasks: dict[str, asyncio.Task] = {}
         self._step = 0
 
-    def start(self, request_id: str, messages, *, tier=None, intent=None, routing_reason="") -> None:
+    # Keyword-for-keyword with AnthropicLLM.start. Spelled out rather than swallowed by
+    # **kwargs on purpose: when the real adapter grows an argument, this must fail loudly at
+    # the seam instead of quietly accepting it. Phase 13 added `context_note` and this fake was
+    # not updated, which broke every load-test session for a whole phase (see tier_a's
+    # failed-session guard).
+    def start(self, request_id: str, messages, *, tier=None, intent=None,
+              routing_reason="", context_note="") -> None:
         self._tasks[request_id] = asyncio.create_task(self._run(request_id))
 
     def cancel(self, request_id: str) -> None:
@@ -154,6 +160,18 @@ class FakeTools:
 
     def invoke(self, tool_call_id: str, name: str, arguments: dict) -> None:
         self._tasks[tool_call_id] = asyncio.create_task(self._run(tool_call_id, name))
+
+    def load_caller_memory(self, phone: str) -> None:
+        """Phase 13's pre-greeting ANI lookup, faked as an unknown caller.
+
+        The real one is fire-and-forget and swallows its own failures, so a missing method here
+        would not crash a session -- it would just silently skip a real per-call code path and
+        make the load test measure a slightly different program than the one that ships.
+        Every returning-caller session is a cold one under load until this fake grows a
+        recognised-caller variant.
+        """
+        self._emit(ev.CallerMemoryLoaded(t=time.monotonic(), known=False,
+                                         upcoming_appointments=0))
 
     async def _run(self, tool_call_id: str, name: str) -> None:
         latency = self._s.draw("tool_ms")

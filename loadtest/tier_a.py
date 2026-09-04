@@ -51,6 +51,7 @@ from clinic_agent.core import events as ev  # noqa: E402
 from clinic_agent.core.audio import INPUT_SAMPLE_RATE  # noqa: E402
 from clinic_agent.core.session import CallSession  # noqa: E402
 from clinic_agent.core.state import Phase  # noqa: E402
+from clinic_agent.core.telemetry import LoopLagMonitor  # noqa: E402
 from clinic_agent.core.worker import Worker  # noqa: E402
 from fake_adapters import (  # noqa: E402
     FakeClassifier,
@@ -125,38 +126,8 @@ class LoadSession(CallSession):
 # --- instrumentation ------------------------------------------------------------------------
 
 
-class LoopLagMonitor:
-    """Measures how late the event loop wakes a task that asked for a fixed sleep.
-
-    The most honest single number for orchestrator saturation. Latency percentiles include the
-    synthetic provider delays and so move slowly; lag is pure scheduling delay and moves first.
-    """
-
-    def __init__(self, interval: float = 0.05) -> None:
-        self.interval = interval
-        self.samples: list[float] = []
-        self._task: asyncio.Task | None = None
-        self._stop = False
-
-    async def _run(self) -> None:
-        while not self._stop:
-            start = time.monotonic()
-            await asyncio.sleep(self.interval)
-            self.samples.append((time.monotonic() - start - self.interval) * 1000)
-
-    def start(self) -> None:
-        self._stop = False
-        self.samples.clear()
-        self._task = asyncio.create_task(self._run(), name="loop-lag")
-
-    async def stop(self) -> None:
-        self._stop = True
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+# LoopLagMonitor now lives in the engine (core/telemetry.py) so a live call and this
+# harness report loop lag the same way. Imported above.
 
 
 def percentile(values: list[float], p: float) -> float | None:
@@ -184,6 +155,7 @@ class LevelResult:
     undersampled: bool = False
     sessions_started: int = 0
     sessions_completed: int = 0
+    sessions_failed: int = 0
     turns_completed: int = 0
     turns_timed_out: int = 0
     booked: int = 0
@@ -372,6 +344,7 @@ async def run_round(
 
     await worker.drain(timeout=15.0)
     result.sessions_completed += worker.stats.completed
+    result.sessions_failed += worker.stats.failed
 
 
 def find_knee(
@@ -504,6 +477,8 @@ async def main() -> int:
         )
         results.append(result)
         flag = " *undersampled" if result.undersampled else ""
+        if result.sessions_failed:
+            flag += f"  *** {result.sessions_failed} SESSIONS FAILED ***"
         print(
             f"{result.concurrency:>6} {result.repeats:>5} {result.sessions_started:>6} "
             f"{result.e2e['count']:>7} {str(result.e2e['p50']):>9} {str(result.e2e['p95']):>9} "
@@ -556,6 +531,17 @@ async def main() -> int:
     print(f"loop-lag inflection:        {lag_inflection if lag_inflection else 'none'}")
     print(f"results: {json_path}")
     print(f"chart:   {svg_path}")
+
+    # A load test that measured nothing must not exit 0. `FakeLLM.start()` drifted out of sync
+    # with the real adapter when Phase 13 added `context_note`, so every session raised on its
+    # first turn -- and this harness printed a tidy table of `None`s, wrote a chart, and exited
+    # successfully for a whole phase. Undersampling is a warning; sessions dying is a failure.
+    failed = sum(r.sessions_failed for r in results)
+    if failed:
+        print(f"\nFAILED: {failed} session(s) raised — these numbers measure nothing. "
+              f"Most likely a fake adapter in loadtest/fake_adapters.py has drifted out of "
+              f"sync with the real one in agent/src/clinic_agent/core/adapters/.")
+        return 1
     return 0
 
 

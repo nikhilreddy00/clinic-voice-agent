@@ -97,6 +97,40 @@ QUESTION_INTENTS = frozenset(
 )
 
 
+# The same structural problem, one level in: `schedule_appointment` never preempts an
+# established scheduling flow either.
+#
+# A reschedule and a cancellation both CONTAIN the act of picking (or naming) an appointment
+# time, so the caller's slot-filling answers inside those flows — "Tuesday.", "Yeah, sure.",
+# "The 5 PM one." — are word-for-word what starting a new booking sounds like. The classifier
+# sees one utterance with no history, so it cannot tell them apart; this is the QUESTION_INTENTS
+# lesson applied to the intent that shares the most vocabulary with every other scheduling task.
+#
+# Measured on a live call (trace 20260903T170114545113Z). The caller said "I want to reschedule
+# my appointment", verified identity, listed the existing Sept 7 booking, and checked
+# availability — all correct. Then a slot-fill answer classified as `schedule_appointment` at
+# 0.85, which is exactly INTENT_SWITCH_CONFIDENCE, so it switched. That swap is not cosmetic:
+# `build_tools_schema` gives RESCHEDULE_APPOINTMENT the {list, check_availability, reschedule}
+# set and SCHEDULE_APPOINTMENT the {check_availability, hold_slot, confirm_booking} set. The
+# model instantly LOST `reschedule_appointment` and GAINED the power to write a new booking.
+# It did the only thing it still could: held a slot and confirmed it. The caller heard a
+# reschedule confirmation and ended the call with TWO live appointments (104BF84D on Sept 7 and
+# 38510718 on Sept 8) — a silent double-book against a caller who believed he had moved one.
+#
+# Raising the threshold cannot fix this any more than it could fix CLINICAL_QUESTION: 0.85 was
+# already the bar and the classifier was at 0.85. The direction is what is unsafe, so the
+# direction is what is blocked.
+#
+# Deliberately one-directional. `cancel_appointment` and `reschedule_appointment` still preempt
+# at INTENT_SWITCH_CONFIDENCE, because "cancel it" and "move my appointment" are distinctive
+# phrases rather than the ambient vocabulary of every scheduling call, and because neither of
+# them can create an appointment the caller did not ask for. The cost of this rule is a caller
+# who, mid-reschedule, genuinely wants an ADDITIONAL new appointment: they will have to say so
+# after the reschedule finishes. That is a stall the caller can hear and correct. A double-book
+# is a wrong write they cannot.
+SCHEDULING_PREEMPT_BLOCKED = frozenset({Intent.SCHEDULE_APPOINTMENT})
+
+
 def needs_clarification(intent: Intent, confidence: float) -> bool:
     """Whether the agent should ask rather than commit to a flow."""
     return intent is Intent.UNKNOWN or confidence < MIN_INTENT_CONFIDENCE
@@ -141,7 +175,10 @@ def resolve_intent(
     2. Establishing the *first* intent needs ``MIN_INTENT_CONFIDENCE``.
     3. A question asked *during* a scheduling flow is not a topic shift, at any confidence —
        see ``QUESTION_INTENTS``.
-    4. Otherwise, *switching* an established intent needs ``INTENT_SWITCH_CONFIDENCE`` — a
+    4. ``schedule_appointment`` never preempts an established scheduling flow, at any
+       confidence — see ``SCHEDULING_PREEMPT_BLOCKED``. A reschedule/cancel in progress sounds
+       exactly like a new booking, and losing that coin-flip writes a second appointment.
+    5. Otherwise, *switching* an established intent needs ``INTENT_SWITCH_CONFIDENCE`` — a
        genuine change of task ("actually, I need a refill instead") is confidently a different
        thing, while an out-of-context slot-fill answer is not.
     """
@@ -154,5 +191,7 @@ def resolve_intent(
     if proposed is current:
         return current
     if current in SCHEDULING_INTENTS and proposed in QUESTION_INTENTS:
+        return current
+    if current in SCHEDULING_INTENTS and proposed in SCHEDULING_PREEMPT_BLOCKED:
         return current
     return proposed if confidence >= INTENT_SWITCH_CONFIDENCE else current

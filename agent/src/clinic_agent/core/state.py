@@ -121,11 +121,41 @@ class CallState:
     # logged, never traced, never spoken back.
     verified_dob: str = ""
     patient_name: str = ""
+    # Dates of birth submitted by in-flight verify_identity calls, keyed by tool_call_id.
+    # `verified_dob` and `patient_name` must always describe the SAME person, so the DOB that
+    # gets promoted has to be the one from the call the API actually accepted — not whatever was
+    # submitted most recently. See reducer._on_tool_completed.
+    submitted_dobs: tuple[tuple[str, str], ...] = ()
+
+    # The hold_id the API issued on the most recent successful `hold_slot`, re-sent verbatim on
+    # `confirm_booking` so the model never has to copy it. A hold_id is a 36-character random
+    # UUID with no redundancy: every character is load-bearing and none of it can be inferred,
+    # which makes it the one argument a language model cannot reliably reproduce.
+    #
+    # Measured on a live call (trace 20260903T170114545113Z). `hold_slot` returned
+    # c1154b66-3d70-4585-908c-2aa92646049f and the model sent
+    # c1154b66-3d70-4585-908c-2aa92642049f to `confirm_booking` — one hex digit changed, 6 to 2.
+    # The API correctly refused with a 409 the caller heard as a stumble, and the whole
+    # hold-and-confirm round trip ran again: 30 seconds of the call spent re-doing work that
+    # had already succeeded.
+    #
+    # Empty means no live hold, and then the model's own value is passed through untouched so
+    # the API's existing 409 still speaks for itself. Cleared on a successful confirm so a
+    # second booking in the same call cannot silently reuse a spent hold.
+    active_hold_id: str = ""
 
     # --- counters / outcome -------------------------------------------------------------
     # One follow-through nudge per caller turn — see reducer._ACTION_CLAIM. Bounded so a model
     # that keeps promising cannot loop the engine.
     nudged: bool = False
+    # Whether ANY tool was invoked during this caller turn. The nudge asks "did the model
+    # promise an action and not take one?", and that question is about the caller's turn, not
+    # about one request inside it: after a tool round trip the follow-up request narrates the
+    # result and legitimately makes no call of its own. `turn_tool_uses` cannot answer it (it is
+    # cleared at the end of every request) and neither can `committed_tool_ids` (cleared when
+    # results are flushed back), which is how a successful hold came to be treated as an empty
+    # promise. Reset alongside `nudged` on each new caller turn.
+    turn_had_tool: bool = False
 
     turn_index: int = 0
     interruptions: int = 0

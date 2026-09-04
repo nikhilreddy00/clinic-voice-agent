@@ -70,6 +70,25 @@ _ABBREVIATIONS = frozenset(
 # model that streams one long unpunctuated sentence produces total silence until it finishes.
 _MAX_UNPUNCTUATED = 120
 
+# How much of a reply must exist before a comma is good enough to start speaking on.
+#
+# The floor is set by underrun, not by taste: the opening chunk has to take LONGER TO SPEAK
+# than the next burst of model output takes to ARRIVE, or the caller hears the reply stutter
+# mid-phrase. Measured 2026-09-04, gaps between text deltas are 79-102 ms p50 and ~335 ms p95,
+# and ~20 characters is about a second of speech -- comfortably clear. Going much lower trades
+# a silence the caller notices for a gap the caller notices, which is not a trade.
+#
+# A plain constant, NOT an env var, and that is deliberate: `reduce()` is pure so that a
+# recorded trace replays identically anywhere, and reading the environment here would make the
+# same trace produce different Speak actions on a differently-configured machine. Tuning this
+# is a one-line code change and a replay diff, which is the right amount of ceremony for a
+# change to how the agent sounds. `0` disables the split.
+_FIRST_CLAUSE_MIN_CHARS = 20
+
+# A clause boundary worth breathing at. The em/en dash needs no following space: models write
+# "Good to hear from you—I'm happy to help", and that dash is exactly where a person pauses.
+_CLAUSE_BOUNDARY = re.compile(r"[,;:](?=\s)|[\u2014\u2013]")
+
 
 def _is_sentence_end(segment: str) -> bool:
     """Whether the punctuation run ending ``segment`` really terminates a sentence."""
@@ -84,8 +103,12 @@ def _is_sentence_end(segment: str) -> bool:
     return word.lower() not in _ABBREVIATIONS
 
 
-def _split_speakable(buffer: str) -> tuple[list[str], str]:
-    """Split accumulated LLM text into complete sentences plus an unfinished remainder."""
+def _split_speakable(buffer: str, *, opening: bool = False) -> tuple[list[str], str]:
+    """Split accumulated LLM text into complete sentences plus an unfinished remainder.
+
+    ``opening`` means nothing has been spoken for this reply yet, which unlocks the
+    clause-boundary split below. See :data:`_FIRST_CLAUSE_MIN_CHARS`.
+    """
     chunks: list[str] = []
     pos = 0
     for match in _BOUNDARY.finditer(buffer):
@@ -96,6 +119,21 @@ def _split_speakable(buffer: str) -> tuple[list[str], str]:
             chunks.append(chunk)
         pos = match.end()
     remainder = buffer[pos:]
+
+    # Phase 14: start speaking at the first CLAUSE of a reply rather than holding out for a
+    # full sentence. Measured on the 2026-09-04 calls, the wait for a sentence-ending period
+    # was 205-255 ms p50 -- most of the whole "speech queue" stage, and none of it TTS.
+    #
+    # Only the opening chunk, on purpose. Inside the body of a reply there is already audio
+    # playing, so splitting earlier buys nothing and costs prosody; on the opening chunk the
+    # alternative is silence. Every chunk still goes to the same Cartesia context with
+    # `continue: true`, so the caller hears one continuous utterance either way.
+    if opening and not chunks and _FIRST_CLAUSE_MIN_CHARS:
+        match = _CLAUSE_BOUNDARY.search(remainder, _FIRST_CLAUSE_MIN_CHARS - 1)
+        if match is not None:
+            chunk = remainder[: match.end()].strip()
+            if len(chunk) >= _FIRST_CLAUSE_MIN_CHARS:
+                return [chunk], remainder[match.end() :]
 
     if not chunks and len(remainder) >= _MAX_UNPUNCTUATED:
         cut = remainder.rfind(",", 0, _MAX_UNPUNCTUATED)
@@ -366,6 +404,7 @@ def _on_final_transcript(state: CallState, e: ev.FinalTranscript):
         turn_index=state.turn_index + 1,
         last_partial="",
         nudged=False,  # a fresh caller turn gets a fresh follow-through allowance
+        turn_had_tool=False,
     )
     state, start = _next_request(state)
     # Classification runs ALONGSIDE the turn, never before it. Intent is an optimization on the
@@ -430,7 +469,9 @@ def _on_llm_delta(state: CallState, e: ev.LLMTextDelta):
 
     buffer = state.speech_buffer + e.text
     speakable, held = _strip_thinking(buffer)
-    chunks, remainder = _split_speakable(speakable)
+    # `utterance_id is None` is exactly "nothing spoken for this reply yet" -- no new state
+    # needed to know we are at the opening of the turn.
+    chunks, remainder = _split_speakable(speakable, opening=state.utterance_id is None)
     # `held` follows `remainder` in the original stream, so order is preserved. turn_text keeps
     # the raw text: it becomes the assistant message, and the model's own history should say
     # what the model actually produced.
@@ -455,13 +496,36 @@ def _on_llm_delta(state: CallState, e: ev.LLMTextDelta):
 # a worked WRONG/RIGHT example — and the promptfoo suite still catches it, which is the argument
 # for enforcing it here rather than asking again more loudly.
 #
-# The nudge cannot cause a wrong action: it re-runs the same turn with one instruction added, so
-# the worst a false positive costs is one extra request. It fires at most once per caller turn.
+# It fires at most once per caller turn, never on a turn that already called a tool, and never on
+# a reply that ends in a question. That last guard is not cosmetic: a false positive is NOT free.
+# Starting the extra request closes the live TTS context, so the sentence being spoken is cut off
+# mid-word (trace 20260904T173146047919Z, t=34.0 — "let me pull up your appointment first. What's
+# your full name?" was gated behind verification, so no tool was possible and the model had
+# ALREADY asked for what it needed, which is exactly what _ACTION_NUDGE demands. The caller heard
+# 0.8s of a 6s sentence and said "Hello?"). A reply that asks the caller something is not leaving
+# them in silence -- they have something to answer.
+# The verbs are a list, and a list of verbs is always one live call behind the model's
+# vocabulary. 2026-09-04: a caller asked for a prescription refill, the model had
+# `request_refill` in its tool set, called nothing, and said "Got it — I'll SEND a refill
+# request for ibuprofen to our staff, and they'll review it and follow up with you." The
+# caller hung up believing a refill was queued. Nothing was queued, and the nudge — the exact
+# safety net for this — stayed silent because "send" was not in the list. "Filing/forwarding/
+# passing along" is the whole shape of the non-scheduling tools (`request_refill` files a
+# staff task), so those verbs were the most important ones to have and the only ones missing.
+#
+# Past tense is here too, and it is the worse case: "I've sent that over" with no tool call is
+# not a promise the model failed to keep, it is a completed action that never happened. A turn
+# whose tool actually ran is already excluded by `turn_had_tool`, so this cannot fire on a
+# legitimate read-back.
 _ACTION_CLAIM = re.compile(
     r"\b("
-    r"i'?m (holding|booking|checking|looking|pulling|scheduling|cancel[l]?ing|moving)"
-    r"|let me (check|look|see|pull|find|book|hold|get that)"
-    r"|i'?ll (check|look|see|pull|find|book|hold)"
+    r"i'?m (holding|booking|checking|looking|pulling|scheduling|cancel[l]?ing|moving"
+    r"|sending|submitting|filing|forwarding|putting|passing|requesting|ordering|adding)"
+    r"|let me (check|look|see|pull|find|book|hold|get that|send|submit|file|forward|put)"
+    r"|i'?ll (check|look|see|pull|find|book|hold|send|submit|file|forward|put|pass|request"
+    r"|order|add|note|let (?:them|the team|our staff|the staff) know|make sure)"
+    r"|i'?(?:ve| have) (sent|submitted|filed|forwarded|booked|cancel[l]?ed|scheduled|added"
+    r"|put (?:that|it|this) (?:in|through)|passed (?:that|it|this) (?:on|along))"
     r"|one moment|hold on|bear with me|give me (a|one) (second|moment)"
     r")\b",
     re.IGNORECASE,
@@ -477,6 +541,21 @@ _ACTION_NUDGE = (
 # What the reducer tells the model when it refuses a PHI tool. Phrased as an instruction the
 # model can act on, not an error: the recovery is to ask for the date of birth, and a bare
 # "denied" invites it to apologize and stall instead.
+# A credential the model has not collected yet must not become an HTTP request. Live
+# 2026-09-04: the caller's opening sentence named them ("My name is Nikhil, and I want to
+# cancel my appointment"), so the model called `verify_identity` immediately with
+# `date_of_birth: ""`. The API correctly rejected it, but a raw `Client error '422
+# Unprocessable...'` is not something a model can act on gracefully — it apologized to the
+# caller for a mistake they could not see ("I apologize — let me ask that differently") and
+# burned a turn. Answering with the instruction instead keeps the recovery invisible.
+_MISSING_DOB_RESULT = {
+    "ok": False,
+    "error": (
+        "date_of_birth is empty — ask the caller for their date of birth, then call "
+        "verify_identity again with it. Do not apologize; you have not told them anything yet."
+    ),
+}
+
 _UNVERIFIED_RESULT = {
     "ok": False,
     "error": (
@@ -511,6 +590,12 @@ def _scoped_arguments(state: CallState, name: str, arguments: dict[str, Any]) ->
         # refused, so a caller with a valid appointment could never get in.
         return scoped
 
+    if name == "confirm_booking" and state.active_hold_id:
+        # See CallState.active_hold_id: the engine remembers the token, the model does not
+        # retype it. Overwrite rather than merge, exactly like phone and date_of_birth — a
+        # value the model got wrong is not more trustworthy than the one the API just issued.
+        scoped["hold_id"] = state.active_hold_id
+
     if name != "confirm_booking":
         # confirm_booking collects the DOB from the caller as intake for a NEW appointment,
         # so the model's value is the right one there; everywhere else it is the verified one.
@@ -536,10 +621,23 @@ def _on_tool_use(state: CallState, e: ev.LLMToolUse):
     # an HTTP request until this caller has matched a date of birth on file. The refusal is
     # synthesized here, so the tool never runs at all — there is no request to intercept, no
     # response to leak, and the whole decision is visible in a replayed trace.
+    # Same mechanism as the gate below, one step earlier: synthesize the answer rather than
+    # spend a round trip discovering the argument was blank.
+    if e.name == "verify_identity" and not str(e.arguments.get("date_of_birth") or "").strip():
+        state = replace(
+            state,
+            turn_tool_uses=state.turn_tool_uses + (block,),
+            turn_had_tool=True,
+            tool_results=state.tool_results
+            + (_tool_result_block(e.tool_call_id, _MISSING_DOB_RESULT),),
+        )
+        return state, []
+
     if e.name in VERIFICATION_REQUIRED_TOOLS and not state.identity_verified:
         state = replace(
             state,
             turn_tool_uses=state.turn_tool_uses + (block,),
+            turn_had_tool=True,
             tool_results=state.tool_results
             + (_tool_result_block(e.tool_call_id, _UNVERIFIED_RESULT),),
         )
@@ -547,19 +645,31 @@ def _on_tool_use(state: CallState, e: ev.LLMToolUse):
 
     arguments = _scoped_arguments(state, e.name, dict(e.arguments))
 
-    # Stash the date of birth being submitted so a successful result can promote it. Only
-    # while unverified: a second verify_identity later in the call (a caller volunteering a
-    # different date, or a model retry) must not replace a DOB the API has already matched.
-    # It is inert until a ToolCompleted says the API matched it.
-    verified_dob = state.verified_dob
-    if e.name == "verify_identity" and not state.identity_verified:
-        verified_dob = str(arguments.get("date_of_birth") or "")
+    # Stash the date of birth being submitted, TAGGED WITH THIS CALL. Nothing is promoted here:
+    # only the API can say a date matched, so this is inert until a ToolCompleted says so.
+    #
+    # It used to stash into `verified_dob` directly, and only while unverified — an
+    # anti-tampering rule that stopped a later attempt from overwriting a matched DOB. The rule
+    # was right and the mechanism was wrong: a SUCCESSFUL second verification still updated
+    # `patient_name` (that happens on the result), so the two fields ended up describing
+    # different people. On a shared handset that is a cross-person disclosure. Measured: verify
+    # as Joe, then verify as Nick, and the engine reports the caller as Nick while every PHI
+    # call still carries Joe's date of birth and reads Joe's chart.
+    #
+    # Keying by tool_call_id keeps the protection (a FAILED attempt promotes nothing) without
+    # the inconsistency (a SUCCEEDED one promotes name and date together).
+    submitted = state.submitted_dobs
+    if e.name == "verify_identity":
+        submitted = submitted + (
+            (e.tool_call_id, str(arguments.get("date_of_birth") or "")),
+        )
 
     state = replace(
         state,
         turn_tool_uses=state.turn_tool_uses + (block,),
+        turn_had_tool=True,
         pending_tools=state.pending_tools + (e.tool_call_id,),
-        verified_dob=verified_dob,
+        submitted_dobs=submitted,
     )
     return state, [InvokeTool(tool_call_id=e.tool_call_id, name=e.name, arguments=arguments)]
 
@@ -605,10 +715,13 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
     if state.pending_tools:
         return replace(state, phase=Phase.TOOL_WAIT), actions
 
+    reply = spoken or e.text or ""
     if (
         not committed
+        and not state.turn_had_tool
         and not state.nudged
-        and _ACTION_CLAIM.search(spoken or e.text or "")
+        and not reply.rstrip().endswith("?")
+        and _ACTION_CLAIM.search(reply)
     ):
         # Announced an action, took none. Give the model exactly one chance to follow through
         # before the caller is left waiting on a promise nothing is going to keep.
@@ -652,17 +765,35 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
 
     booked = state.booked or (e.name == "confirm_booking" and e.ok)
 
+    # Track the live hold so `_scoped_arguments` can re-send it verbatim. A successful confirm
+    # spends it; a failed one does not, so the model can retry the same hold rather than
+    # re-holding a slot it already owns.
+    active_hold_id = state.active_hold_id
+    if e.name == "hold_slot" and e.ok:
+        active_hold_id = str(e.result.get("hold_id") or "")
+    elif e.name == "confirm_booking" and e.ok:
+        active_hold_id = ""
+
     # The gate opens HERE and nowhere else: only the API can say a date of birth matched, and
     # the DOB it matched is kept so every later PHI call re-sends it for server-side re-checks.
     # `verified_dob` never leaves this process and is not written to the trace or the logs.
     verified = state.identity_verified
     verified_dob = state.verified_dob
     patient_name = state.patient_name
+    submitted_dobs = tuple(pair for pair in state.submitted_dobs if pair[0] != e.tool_call_id)
     if e.name == "verify_identity" and e.ok:
-        # `verified_dob` was stashed when the call was made (the API does not echo a DOB back —
-        # nothing should return the verification secret). It is inert until this line runs.
+        # Promote the name and the date of birth from the SAME call — the one the API just
+        # accepted. The API does not echo a DOB back (nothing should return the verification
+        # secret), so it comes from what was submitted with this tool_call_id.
+        #
+        # Both together or neither: a caller on a shared handset may legitimately verify as a
+        # second person mid-call, and when they do, every later PHI call must read that
+        # person's chart, not the previous one's. A FAILED attempt still promotes nothing.
         verified = True
         patient_name = str(e.result.get("name") or "")
+        matched = next((dob for tid, dob in state.submitted_dobs if tid == e.tool_call_id), "")
+        if matched:
+            verified_dob = matched
     # An empty availability window is the escalation trigger (a later successful booking
     # overrides it — see CallState.outcome).
     escalated = state.escalated or (
@@ -679,6 +810,8 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
         identity_verified=verified,
         verified_dob=verified_dob,
         patient_name=patient_name,
+        submitted_dobs=submitted_dobs,
+        active_hold_id=active_hold_id,
     )
     if pending:
         return state, []

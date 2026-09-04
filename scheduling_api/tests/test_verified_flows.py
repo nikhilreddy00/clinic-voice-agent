@@ -349,3 +349,220 @@ def test_a_caller_with_no_ani_can_still_verify(client):
     assert client.post("/appointments", json={
         "phone": "", "date_of_birth": DOB, "name": "Dana Reyes",
     }).status_code == 200
+
+
+# --- a phone number is a household, not a person ------------------------------------------
+#
+# The live defect these cover (2026-09-03): "Joe" (DOB 03/05/2001) booked from a number already
+# enrolled to "Nick" (DOB 05/08/2003), was given confirmation E938C8F6, called back, and was
+# refused twice on the exact date of birth he had just booked with. `patients` was
+# UNIQUE (clinic_id, phone), so the first caller from a number owned it permanently.
+#
+# These are the edge cases that must hold WITHOUT placing a phone call.
+
+SECOND_PERSON_DOB = "05/08/2003"
+
+
+def test_a_second_person_on_a_shared_phone_can_verify_with_their_own_dob(client):
+    """The exact live failure. Book as one person, book as another, both must verify."""
+    _book(client, name="Nick", dob=DOB)
+    _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=1)
+
+    for name, dob in [("Nick", DOB), ("Joe", SECOND_PERSON_DOB)]:
+        resp = client.post("/verify-identity",
+                           json={"phone": CALLER, "date_of_birth": dob, "name": name})
+        assert resp.status_code == 200, f"{name} could not verify: {resp.text}"
+        assert resp.json()["name"] == name
+
+
+def test_a_second_booking_does_not_overwrite_the_first_persons_name(client):
+    """The row used to be a MERGE of two people — named Joe, carrying Nick's DOB.
+
+    That is worse than the lockout it caused: verifying with Nick's date of birth would have
+    returned Joe's name, and Nick's appointments with it.
+    """
+    _book(client, name="Nick", dob=DOB)
+    _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=1)
+
+    body = client.post("/verify-identity",
+                       json={"phone": CALLER, "date_of_birth": DOB, "name": "Nick"}).json()
+    assert body["name"] == "Nick"
+
+
+def test_each_person_on_a_shared_phone_sees_only_their_own_appointments(client):
+    """The disclosure the merged row would have caused, asserted directly."""
+    nick = _book(client, name="Nick", dob=DOB)
+    joe = _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=1)
+
+    nicks = client.post("/appointments",
+                        json={"phone": CALLER, "date_of_birth": DOB, "name": "Nick"}).json()
+    ids = {a["confirmation_id"] for a in nicks["appointments"]}
+    assert nick["confirmation_id"] in ids
+    assert joe["confirmation_id"] not in ids, "Nick can see Joe's appointment"
+
+    joes = client.post("/appointments",
+                       json={"phone": CALLER, "date_of_birth": SECOND_PERSON_DOB,
+                             "name": "Joe"}).json()
+    ids = {a["confirmation_id"] for a in joes["appointments"]}
+    assert joe["confirmation_id"] in ids
+    assert nick["confirmation_id"] not in ids, "Joe can see Nick's appointment"
+
+
+def test_a_third_dob_on_an_enrolled_phone_is_still_refused(client):
+    """Widening the key must not widen who gets in. This is the anti-hijack rule."""
+    _book(client, name="Nick", dob=DOB)
+    _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=1)
+
+    resp = client.post("/verify-identity",
+                       json={"phone": CALLER, "date_of_birth": "01/01/1970", "name": "Nick"})
+    assert resp.status_code == 403
+
+
+def test_a_shared_phone_cannot_be_used_to_reach_a_stranger_by_name(client):
+    """The reason _verify stops dead instead of falling through to the name+DOB search.
+
+    Someone holding an enrolled handset must not be able to name a patient enrolled elsewhere
+    and be handed their chart — even though that name and DOB would match on their own.
+    """
+    _book(client, name="Nick", dob=DOB)
+    stranger = _book(client, phone=OTHER_CALLER, name="Priya Raman",
+                     dob="11/22/1985", slot_index=1)
+
+    resp = client.post("/verify-identity",
+                       json={"phone": CALLER, "date_of_birth": "11/22/1985",
+                             "name": "Priya Raman"})
+    assert resp.status_code == 403, "an enrolled handset reached a stranger's record"
+
+    appts = client.post("/appointments",
+                        json={"phone": CALLER, "date_of_birth": "11/22/1985",
+                              "name": "Priya Raman"})
+    assert appts.status_code == 403
+    assert stranger["confirmation_id"] not in appts.text
+
+
+def test_the_same_birthday_spoken_differently_is_still_one_person(client):
+    """The DOB is part of the key now, so a key made of raw speech would file one person twice.
+
+    "3/5/2001" and "03/05/2001" are the same birthday; the agent's transcription of a spoken
+    date is not stable enough to be a primary key without normalization.
+    """
+    _book(client, name="Joe", dob="03/05/2001")
+    _book(client, name="Joe", dob="3/5/2001", slot_index=1)
+
+    body = client.post("/appointments",
+                       json={"phone": CALLER, "date_of_birth": "3-5-2001",
+                             "name": "Joe"}).json()
+    assert len(body["appointments"]) == 2, "one person was filed as two"
+
+
+def test_a_second_person_can_reschedule_their_own_appointment(client):
+    """End to end: the flow the live call was actually trying to complete."""
+    _book(client, name="Nick", dob=DOB)
+    joe = _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=1)
+
+    slots = client.get("/availability").json()["slots"]
+    target = next(s["slot_id"] for s in slots if s["slot_id"] != joe["slot_id"])
+
+    resp = client.post("/reschedule", json={
+        "confirmation_id": joe["confirmation_id"], "new_slot_id": target,
+        "phone": CALLER, "date_of_birth": SECOND_PERSON_DOB, "name": "Joe",
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["slot_id"] == target
+
+
+def test_a_second_person_cannot_cancel_the_first_persons_appointment(client):
+    nick = _book(client, name="Nick", dob=DOB)
+    _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=1)
+
+    resp = client.post("/cancel", json={
+        "confirmation_id": nick["confirmation_id"],
+        "phone": CALLER, "date_of_birth": SECOND_PERSON_DOB, "name": "Joe",
+    })
+    assert resp.status_code == 404, "Joe cancelled Nick's appointment"
+
+
+def test_caller_memory_counts_the_whole_household_not_one_member(client):
+    """It used to GROUP BY patient id and take the first row — one arbitrary person's count.
+
+    Measured: three confirmed appointments on a number, reported as two, and which two depended
+    on row order. The number is the right unit here because this runs BEFORE verification —
+    nobody has said who they are yet — and it still returns nothing identifying.
+    """
+    _book(client, name="Nick", dob=DOB, slot_index=0)
+    _book(client, name="Nick", dob=DOB, slot_index=1)
+    _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=2)
+
+    for _ in range(5):  # the old bug was non-deterministic; one pass could get lucky
+        body = client.get("/caller-memory", params={"phone": CALLER}).json()
+        assert body == {"known": True, "upcoming_appointments": 3}
+
+
+def test_caller_memory_still_discloses_nothing_identifying(client):
+    """The count is a household fact; a name would be a disclosure to whoever holds the phone."""
+    _book(client, name="Nick", dob=DOB)
+    _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=1)
+
+    body = client.get("/caller-memory", params={"phone": CALLER}).json()
+    assert set(body) == {"known", "upcoming_appointments"}
+    assert "Nick" not in str(body) and "Joe" not in str(body)
+
+
+def test_two_people_sharing_a_phone_AND_a_birthday_collapse_into_one_record(client):
+    """A KNOWN, DELIBERATE limitation — pinned here so it stays a decision, not an accident.
+
+    `patients` is keyed (clinic, phone, date_of_birth). Two people on one handset who share a
+    birthday — twins — therefore land on one row: the later booking renames it, and verifying
+    as either returns that name and BOTH sets of appointments.
+
+    Adding `name` to the key would fix twins and break something commoner: a caller who says
+    "Nick" on one call and "Nicholas Kumar" on the next is one person, and a name-keyed record
+    would file them as two, locking each out of the other's bookings. Spoken names are not
+    stable enough to key on; birthdays are. The trade is deliberate.
+
+    If twins ever need supporting, the fix is a real patient identifier the caller states — not
+    a fuzzier name match, which weakens a credential to solve a data-modelling problem.
+    """
+    alex = _book(client, name="Alex", dob="07/07/2000", slot_index=0)
+    sam = _book(client, name="Sam", dob="07/07/2000", slot_index=1)
+
+    body = client.post("/verify-identity",
+                       json={"phone": CALLER, "date_of_birth": "07/07/2000",
+                             "name": "Alex"}).json()
+    assert body["name"] == "Sam"  # the later booking's name won
+
+    appts = client.post("/appointments",
+                        json={"phone": CALLER, "date_of_birth": "07/07/2000",
+                              "name": "Alex"}).json()
+    ids = {a["confirmation_id"] for a in appts["appointments"]}
+    assert ids == {alex["confirmation_id"], sam["confirmation_id"]}
+
+
+def test_the_same_person_giving_a_fuller_name_stays_one_record(client):
+    """The case the twins trade-off protects: "Nick" and "Nicholas Kumar" are one patient."""
+    first = _book(client, name="Nick", dob=DOB, slot_index=0)
+    second = _book(client, name="Nicholas Kumar", dob=DOB, slot_index=1)
+
+    appts = client.post("/appointments",
+                        json={"phone": CALLER, "date_of_birth": DOB}).json()
+    ids = {a["confirmation_id"] for a in appts["appointments"]}
+    assert ids == {first["confirmation_id"], second["confirmation_id"]}
+
+
+def test_a_parent_can_book_for_a_child_from_the_same_phone(client):
+    """The commonest real shared-handset case, and it must work without verification."""
+    parent = _book(client, name="Joe", dob=SECOND_PERSON_DOB, slot_index=0)
+    child = _book(client, name="Sarah", dob="01/01/2015", slot_index=1)
+
+    for name, dob, mine, theirs in [
+        ("Joe", SECOND_PERSON_DOB, parent, child),
+        ("Sarah", "01/01/2015", child, parent),
+    ]:
+        body = client.post("/verify-identity",
+                           json={"phone": CALLER, "date_of_birth": dob, "name": name}).json()
+        assert body["name"] == name
+        appts = client.post("/appointments",
+                            json={"phone": CALLER, "date_of_birth": dob, "name": name}).json()
+        ids = {a["confirmation_id"] for a in appts["appointments"]}
+        assert mine["confirmation_id"] in ids
+        assert theirs["confirmation_id"] not in ids

@@ -182,7 +182,82 @@ async def init_db() -> None:
     p = await open_pool()
     async with p.connection() as conn:
         await conn.execute(_SCHEMA_PATH.read_text())
+        await migrate_patient_identity(conn)
         await _seed(conn)
+
+
+async def migrate_patient_identity(conn: AsyncConnection) -> dict[str, int]:
+    """Re-key `patients` from (clinic, phone) to (clinic, phone, DOB). Idempotent.
+
+    `CREATE TABLE IF NOT EXISTS` cannot change a constraint on a table that already exists, so
+    a database created before this change keeps the old one-person-per-phone key and every
+    `ON CONFLICT (clinic_id, phone, date_of_birth)` fails outright. This runs on every boot and
+    does nothing once applied.
+
+    Order matters and is the reason this is Python rather than SQL in schema.sql: the stored
+    dates have to be canonicalized BEFORE the new key exists (normalizing afterwards could
+    collide two rows the constraint had already accepted), and canonicalizing can itself create
+    duplicates that must be merged before the key can be added at all.
+    """
+    counts = {"normalized": 0, "merged": 0}
+
+    existing = await (await conn.execute(
+        """
+        SELECT conname FROM pg_constraint
+         WHERE conrelid = 'patients'::regclass AND contype = 'u'
+        """
+    )).fetchall()
+    names = {r["conname"] for r in existing}
+    if "patients_clinic_id_phone_date_of_birth_key" in names:
+        return counts  # already migrated
+
+    await conn.execute(
+        "ALTER TABLE patients DROP CONSTRAINT IF EXISTS patients_clinic_id_phone_key"
+    )
+
+    rows = await (await conn.execute(
+        "SELECT id, date_of_birth FROM patients WHERE date_of_birth IS NOT NULL"
+    )).fetchall()
+    for row in rows:
+        canonical = normalize_dob(row["date_of_birth"])
+        if canonical != row["date_of_birth"]:
+            await conn.execute(
+                "UPDATE patients SET date_of_birth = %s WHERE id = %s", (canonical, row["id"])
+            )
+            counts["normalized"] += 1
+
+    # Canonicalization can turn "3/5/2001" and "03/05/2001" into two rows for one person.
+    # Keep the oldest (its id is referenced elsewhere) and repoint the rest onto it.
+    dupes = await (await conn.execute(
+        """
+        SELECT min(id) AS keep, array_agg(id) AS ids
+          FROM patients
+         WHERE date_of_birth IS NOT NULL
+         GROUP BY clinic_id, phone, date_of_birth
+        HAVING count(*) > 1
+        """
+    )).fetchall()
+    for group in dupes:
+        drop = [i for i in group["ids"] if i != group["keep"]]
+        await conn.execute(
+            "UPDATE bookings SET patient_id = %s WHERE patient_id = ANY(%s)",
+            (group["keep"], drop),
+        )
+        await conn.execute(
+            "UPDATE caller_memory SET patient_id = %s WHERE patient_id = ANY(%s)",
+            (group["keep"], drop),
+        )
+        await conn.execute("DELETE FROM patients WHERE id = ANY(%s)", (drop,))
+        counts["merged"] += len(drop)
+
+    await conn.execute(
+        """
+        ALTER TABLE patients
+          ADD CONSTRAINT patients_clinic_id_phone_date_of_birth_key
+          UNIQUE (clinic_id, phone, date_of_birth)
+        """
+    )
+    return counts
 
 
 async def _clinic_id(conn: AsyncConnection, slug: str = DEFAULT_CLINIC_SLUG) -> int:
@@ -664,19 +739,43 @@ def normalize_dob(value: str | None) -> str:
 async def _upsert_patient(
     conn: AsyncConnection, clinic_id: int, phone: str | None, name: str, date_of_birth: str
 ) -> int:
-    """Create or refresh the patient record for a phone number. Returns patients.id."""
+    """Create or refresh the patient record for ONE PERSON on a phone. Returns patients.id.
+
+    Keyed on ``(clinic_id, phone, date_of_birth)``. Keying on the phone alone was a live
+    defect, and the two rules that produced it were each individually right:
+
+      * this function refused to overwrite a date of birth already on file, because the DOB is
+        the verification secret and a later booking that mistyped it would lock the real
+        patient out; and
+      * ``_verify`` stops dead when an enrolled number presents a wrong DOB, because falling
+        through to a name+DOB search would let anyone holding an enrolled patient's handset
+        reach a stranger's chart.
+
+    Together they meant the FIRST person to book from a number owned it permanently. A second
+    household member booking from the same handset overwrote ``name`` — the row was not
+    protected — but kept the first person's DOB, so they could book and could never verify.
+    Measured 2026-09-03: "Joe" (DOB 03/05/2001) booked from a number already enrolled to
+    "Nick" (DOB 05/08/2003), got confirmation E938C8F6, called back, and was refused twice on
+    the very date of birth he had just booked with. Worse than the lockout, the row was then a
+    merge of two people — named Joe, carrying Nick's DOB, owning Nick's bookings — so anyone
+    verifying with Nick's DOB would have been greeted as Joe and shown Nick's appointments.
+
+    With the DOB in the key, a different person on the same number is simply a different row,
+    and no COALESCE is needed: nothing can reach another person's record to overwrite.
+
+    The stored DOB is NORMALIZED (``normalize_dob``). The column used to hold whatever the
+    caller said, with normalization applied on every comparison; that is fine for comparing and
+    useless for a key, where "3/5/2001" and "03/05/2001" would file one person twice.
+    """
     row = await (await conn.execute(
         """
         INSERT INTO patients (clinic_id, phone, name, date_of_birth)
         VALUES (%s, %s, %s, %s)
-        ON CONFLICT (clinic_id, phone) DO UPDATE
-            SET name = EXCLUDED.name,
-                -- Never overwrite a DOB already on file: it is the verification secret, and a
-                -- later booking that mistyped it would otherwise lock the real patient out.
-                date_of_birth = COALESCE(patients.date_of_birth, EXCLUDED.date_of_birth)
+        ON CONFLICT (clinic_id, phone, date_of_birth) DO UPDATE
+            SET name = EXCLUDED.name
         RETURNING id
         """,
-        (clinic_id, phone, name, date_of_birth),
+        (clinic_id, phone, name, normalize_dob(date_of_birth)),
     )).fetchone()
     return row["id"]
 
@@ -719,13 +818,20 @@ async def _verify(
         raise NotVerified("Identity not verified")
 
     if phone:
-        row = await (await conn.execute(
+        # EVERY person enrolled on this number, not just one. A shared handset holds a whole
+        # household, and fetching a single row here is what let the first caller own the number
+        # forever — see _upsert_patient. The DOB still decides WHICH of them is calling.
+        rows = await (await conn.execute(
             "SELECT id, name, date_of_birth FROM patients WHERE phone = %s", (phone,)
-        )).fetchone()
-        if row is not None:
-            if normalize_dob(row["date_of_birth"]) == normalize_dob(date_of_birth):
-                return row
-            raise NotVerified("Identity not verified")  # enrolled number, wrong DOB — stop here
+        )).fetchall()
+        if rows:
+            for row in rows:
+                if normalize_dob(row["date_of_birth"]) == normalize_dob(date_of_birth):
+                    return row
+            # An enrolled number presenting a DOB that matches NOBODY on it. Still a hard stop,
+            # and still for the original reason: falling through to the name+DOB search below
+            # would let anyone holding this handset reach a stranger's chart by naming them.
+            raise NotVerified("Identity not verified")
 
     if not name:
         raise NotVerified("Identity not verified")
@@ -786,21 +892,29 @@ async def caller_memory(phone: str) -> dict[str, Any]:
     if not phone:
         return {"known": False, "upcoming_appointments": 0}
     async with pool().connection() as conn:
+        # Aggregated across EVERY patient on the number, deliberately. A phone is a household:
+        # since `patients` became (clinic, phone, DOB)-keyed, one number can hold several
+        # people, and this used to `GROUP BY p.id` and take the first row — reporting one
+        # arbitrary household member's count, non-deterministically. Measured: three confirmed
+        # appointments on a number reported as two.
+        #
+        # The number, not the person, is the right unit here: this runs BEFORE verification and
+        # the caller has not said who they are yet. It still discloses nothing identifying —
+        # no name, no times, no confirmation ids — which is the property that matters.
         row = await (await conn.execute(
             """
-            SELECT p.id,
-                   COUNT(b.confirmation_id) FILTER (
+            SELECT COUNT(*) FILTER (
                        WHERE b.status = 'confirmed' AND s.start_time >= now()
-                   ) AS upcoming
+                   ) AS upcoming,
+                   COUNT(DISTINCT p.id) AS people
               FROM patients p
               LEFT JOIN bookings b ON b.patient_id = p.id
               LEFT JOIN slots s ON s.id = b.slot_id
              WHERE p.phone = %s
-             GROUP BY p.id
             """,
             (phone,),
         )).fetchone()
-    if row is None:
+    if row is None or not row["people"]:
         return {"known": False, "upcoming_appointments": 0}
     return {"known": True, "upcoming_appointments": int(row["upcoming"] or 0)}
 

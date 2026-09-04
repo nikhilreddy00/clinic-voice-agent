@@ -146,6 +146,30 @@ class LLMRouter:
 
         This is what makes the Phase-8 bake-off runnable against the live agent: point a tier at
         a candidate, run the eval, compare. Without it, every comparison is a commit.
+
+        A model name alone does not change the *transport*. Pointing a tier at a non-Anthropic
+        model also needs ``CLINIC_FAST_BASE_URL`` (see ``core.adapters.classifier``), which
+        switches the classifier to the OpenAI wire format that Groq and Cerebras speak:
+
+            CLINIC_MODEL_FAST=qwen/qwen3.8-27b
+            CLINIC_FAST_BASE_URL=https://api.groq.com/openai/v1
+            GROQ_API_KEY=...
+
+        Measured 2026-09-03, 13 real caller utterances from the live traces, sequential:
+
+            claude-haiku-4-5   p50 888 ms   p95 1268 ms   13/13 clean
+            qwen/qwen3.8-27b   p50 203 ms   p95  399 ms   13/13 clean
+            openai/gpt-oss-20b p50 439 ms   p95  590 ms   2 x 400 tool_use_failed
+
+        gpt-oss is a *reasoning* model: it spends ``max_tokens`` thinking before it emits the
+        forced tool call, so at the classifier's 128-token ceiling it gets truncated mid-JSON.
+        Raising the ceiling fixes the errors and gives back the latency. qwen needs no such
+        allowance, which is why it is the recommended fast-tier candidate.
+
+        NOT the default, on purpose: Groq's free tier rate-limited this classifier at ~12
+        concurrent requests and exhausted its daily budget inside two benchmark runs. A 429
+        mid-call is survivable (the reducer falls back to the unscoped prompt) but it means no
+        intent scoping at all, so this switch is worth making only on a paid tier.
         """
         for tier in Tier:
             override = os.getenv(f"CLINIC_MODEL_{tier.value.upper()}")

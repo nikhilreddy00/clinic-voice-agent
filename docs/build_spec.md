@@ -1162,5 +1162,101 @@ set, and an eval written from a different angle still found gaps in both directi
 action ("I'm booking you now") and calls no tool gets one re-prompt, once per caller turn. The
 prompt has forbidden that since the live call where it cost 100 seconds of silence, with a
 worked example, and the suite still caught it — which is the whole argument for enforcing it in
-the reducer instead of asking again more loudly. A false positive costs one extra request; it
-cannot produce a wrong action.
+the reducer instead of asking again more loudly.
+
+**A false positive is not free, and believing it was is why this shipped three times.** The
+nudge starts another request, and starting a request closes the live TTS context — so a wrong
+nudge does not cost "one extra request", it cuts the agent off mid-word and drops the rest of
+the sentence. Three guards, each added after a live call: not when a tool already ran this
+caller turn (`turn_had_tool`), not twice in one turn (`nudged`), and not when the reply already
+ends in a question — a reply that asks the caller something is not leaving them in silence, and
+on the gated PHI tools asking is the only correct move available to the model.
+
+
+---
+
+## Phase 14 — Latency finish (in progress)
+
+Plan: `~/.claude/plans/async-napping-comet.md`. The Phase-8 version of this list was written
+before anything was measured; three of its five items turned out to be wrong or already done.
+What follows is the list re-derived from traces.
+
+### The baseline it starts from
+
+Measured 2026-09-04 across two live calls (29 turns) — **the first numbers taken after prompt
+caching was enabled**, and the reason the earlier extrapolation in CLAUDE.md can now be retired.
+
+| stage | call 1 p50 | call 2 p50 | vs 2026-09-03 |
+|---|---|---|---|
+| endpointing (speech stop → transcript) | 497 ms | 402 ms | ~unchanged (graded grace) |
+| dispatch | 1 ms | 1 ms | — |
+| **LLM TTFT** | **627 ms** | **730 ms** | **855 ms → caching confirmed live** |
+| speech queue (first token → speaking) | 268 ms | 340 ms | ~unchanged |
+| **E2E voice-to-voice** | **1,556 ms** | **1,625 ms** | 1,642 / 1,973 ms |
+
+### Finding 1 — the "speech queue" is the LLM, not TTS
+
+First token → first sentence-ending period is **205–255 ms p50**. Cartesia synthesis plus
+playback start is only ~60–85 ms of the stage. The agent is not waiting for audio, it is waiting
+for a period. Sentence-boundary TTS chunking — the Phase-8 plan's item for this stage — was
+already built in Phase 10 and was never the constraint.
+
+### Finding 2 — the delta bursts are the wire, and this was measured rather than assumed
+
+Text deltas arrive as a 1–5 character delta, a 100–350 ms gap, then 50–100 characters at once.
+Nothing in this codebase batches them (`adapters/llm.py` emits one event per SDK `text_delta`;
+the recorder does not coalesce), so the two candidate causes were the wire and a blocked event
+loop — with completely different fixes.
+
+A probe streaming the real 5,023-token booking prompt with the loop **otherwise idle** — no
+media, no VAD, no STT — reproduced the same gaps (267–388 ms max) at **loop lag p50 1.08 ms,
+max 29.6 ms**. Haiku's streaming is coarse at the source: 3–6 deltas for an entire reply, and on
+two of three runs the first burst already contained a complete sentence (first sentence at 10 ms
+and 33 ms; 391 ms on the third).
+
+Three consequences:
+
+1. There is no blocked loop to unblock. That work is not needed.
+2. Speaking earlier only helps when a clause lands in an **earlier burst** than the period,
+   which is why the same change measures 115 ms on one call and 32 ms on the next.
+3. Speculative LLM start is not undermined by anything on our side — it stays viable, and is
+   deliberately not built yet.
+
+`CLINIC_LOOP_LAG=1` turns on the live sampler (`[loop] blocked N ms` lines);
+`inspect_call.py` prints the streaming-shape table. Re-measure before revisiting this.
+
+### What shipped
+
+- **`reducer._FIRST_CLAUSE_MIN_CHARS` (20)** — the agent starts speaking at the first clause of
+  a reply instead of the first sentence. Opening chunk only, keyed off `state.utterance_id is
+  None`, so no new state and mid-reply prosody is untouched. **The floor is an underrun guard:**
+  the opening chunk must take longer to speak than the next burst takes to arrive (~335 ms p95),
+  or the caller hears a stutter instead of a late start. A plain constant, not an env var, so
+  `reduce()` stays pure and traces replay identically anywhere.
+- **`llm.shared_anthropic_client`** — one HTTP client per process per key, injected into both
+  the dialogue adapter and the classifier. Was two per call, i.e. 2N connection pools in a
+  worker and two TLS handshakes per call (turn-1 TTFT 736–740 ms against 540–670 steady). **An
+  adapter closes only a client it constructed itself** — closing an injected one would tear the
+  pool out from under every other call in the worker.
+- **`telemetry.LoopLagMonitor`** — moved out of `loadtest/tier_a.py` so a live call and the load
+  harness report loop lag the same way, plus a `warn_over_ms` that timestamps the outliers. A
+  percentile cannot be lined up against a gap in a trace; a log line can.
+- **`inspect_call.py` streaming-shape table** — delta gaps, first-sentence wait, first-clause
+  wait, and what speaking on the clause would save.
+
+### Open
+
+- **Exit criterion, decided 2026-09-04: E2E p50 ≤ 1,200 ms, p95 ≤ 2,000 ms.** It replaces the
+  inherited ≤ 800 ms, set in Phase 8 before anything was measured. Steady-state TTFT on an
+  *already-cached* prompt is 540–670 ms — most of an 800 ms budget before endpointing, TTS, or
+  the network take a share — and Phase 8 measured the obvious escape as worse (Groq, no prompt
+  caching: 4,614 ms on the same prompt). Anything below ~1,000 ms needs a different model host
+  (in-region Bedrock/Vertex Haiku), not another orchestration change. Best measured: **1,385 ms
+  p50** on the 2026-09-04 refill call.
+- **Endpointing is analysis-first, not adopt-first.** It is the second-largest stage (402–497 ms
+  p50) and semantic EOU is the textbook answer, but the graded grace in `core/endpointing.py` is
+  load-bearing — "December eight two thousand" is a complete answer with no punctuation. Replay
+  the traces and show a semantic model would end those specific turns sooner *without* cutting
+  the caller off before downloading one.
+- **Not measured on a phone yet.** Everything above is offline; the clause split changes how the
+  agent sounds and no percentile will report a chopped opening.

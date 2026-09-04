@@ -63,6 +63,34 @@ def to_anthropic_tools(schema: ToolsSchema) -> list[dict[str, Any]]:
     return tools
 
 
+# --- one HTTP client per process, not per call ------------------------------------------------
+#
+# Phase 14, finding 4. Every CallSession used to construct its own AsyncAnthropic (here and in
+# the classifier), so each call opened two fresh connection pools and paid two TLS handshakes.
+# Turn-1 TTFT measured 736-740 ms against a 540-670 ms steady state on the 2026-09-04 calls.
+#
+# A worker hosts N calls (Phase 11), so this is 2N pools that could be 2. Same reasoning as
+# `core/vad.shared_inference_session()`: per-call state stays per-call, but an expensive
+# stateless resource is process-wide.
+#
+# Keyed by API key so a differently-credentialed session cannot silently reuse the wrong one.
+_shared_clients: dict[str, anthropic.AsyncAnthropic] = {}
+
+
+def shared_anthropic_client(api_key: str) -> anthropic.AsyncAnthropic:
+    """The process-wide client for ``api_key``, created on first use.
+
+    Deliberately never closed: it outlives any one call, and closing it in a session teardown
+    would tear the connection pool out from under every other call in the same worker. The
+    adapters below only close a client they constructed themselves.
+    """
+    client = _shared_clients.get(api_key)
+    if client is None:
+        client = _shared_clients[api_key] = anthropic.AsyncAnthropic(api_key=api_key)
+        logger.info("[llm] opened shared Anthropic client (one per process, per key)")
+    return client
+
+
 class AnthropicLLM:
     """Streaming Claude client that turns one request into a sequence of events."""
 
@@ -77,8 +105,11 @@ class AnthropicLLM:
         max_tokens: int = MAX_TOKENS,
         router: LLMRouter | None = None,
         now=None,
+        client: anthropic.AsyncAnthropic | None = None,
     ) -> None:
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        # An injected client is shared with other calls, so this adapter must not close it.
+        self._owns_client = client is None
+        self._client = client or anthropic.AsyncAnthropic(api_key=api_key)
         self._model = model
         self._tools = to_anthropic_tools(tools)
         self._emit = emit
@@ -96,13 +127,34 @@ class AnthropicLLM:
         # held as one blob; `system_prompt` remains the fallback for callers that construct this
         # adapter directly (the Pipecat-era signature).
         self._fallback_prompt = system_prompt
-        # Caching is opt-in because Phase 8 measured the cacheable prefix at 3,811 tokens
-        # against Haiku 4.5's 4,096 minimum: Anthropic ACCEPTS the breakpoint there and then
-        # silently caches nothing (cache_creation_input_tokens: 0). Enabling it by default
-        # would look like a working optimization while doing nothing. Note Phase 12's
-        # intent-scoped prompts push non-scheduling turns FURTHER below that floor — the
-        # resolution is a model whose minimum the prompt clears, not a smaller prompt.
-        self._cache_enabled = os.getenv("CLINIC_PROMPT_CACHE", "").strip() == "1"
+        # ON by default since 2026-09-03. It was opt-in because Phase 8 measured the cacheable
+        # prefix at 3,811 tokens against Haiku 4.5's 4,096 minimum, where Anthropic ACCEPTS the
+        # breakpoint and then silently caches nothing — an optimization that looks live and
+        # does nothing. Phase 13's six new tools ended that: the booking prefix is now 5,023
+        # tokens and clears the floor.
+        #
+        # Cacheable prefix per intent (counted with messages.count_tokens against
+        # claude-haiku-4-5, 2026-09-03). Caching is a per-intent property, not a global one:
+        #
+        #     None (turn one)          5,023   CACHES
+        #     schedule_appointment     5,023   CACHES
+        #     reschedule_appointment   3,366   below floor
+        #     cancel_appointment       2,778   below floor
+        #     medication_refill        2,293   below floor
+        #     insurance_verification   1,621   below floor
+        #     hours_location           1,610   below floor
+        #     everything else         <1,000   below floor
+        #
+        # So this pays on turn one and on every turn of a new booking — the bulk of a
+        # scheduling call — and is inert everywhere else. Measured on the Phase-8 harness over
+        # three cases: TTFT p50 830 -> 642 ms, p95 1,927 -> 988 ms, $0.0705 -> $0.0195 a call,
+        # 145,700 tokens served from cache.
+        #
+        # A below-floor breakpoint still costs nothing (no cache write happens), which is what
+        # makes defaulting this on safe rather than a gamble. `CLINIC_PROMPT_CACHE=0` opts out.
+        # Do NOT shrink the booking prompt to "tidy" it: 5,023 has only 927 tokens of headroom
+        # over the floor, and dropping back under it would silently switch this off again.
+        self._cache_enabled = os.getenv("CLINIC_PROMPT_CACHE", "1").strip() != "0"
         if self._cache_enabled:
             logger.info("[llm] prompt caching breakpoint enabled on the system block")
 
@@ -240,4 +292,5 @@ class AnthropicLLM:
     async def aclose(self) -> None:
         for request_id in list(self._tasks):
             self.cancel(request_id)
-        await self._client.close()
+        if self._owns_client:
+            await self._client.close()

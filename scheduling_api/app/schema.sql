@@ -145,7 +145,14 @@ CREATE TABLE IF NOT EXISTS patients (
     date_of_birth  TEXT,       -- PHI
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    UNIQUE (clinic_id, phone)
+    -- Keyed on (phone, DOB), NOT on phone alone. A phone number is a household, not a person:
+    -- spouses, children, and parents share one handset, and a clinic must be able to hold all
+    -- of them. `UNIQUE (clinic_id, phone)` meant the FIRST caller from a number owned it
+    -- forever — see db._upsert_patient and db._verify for the live failure that produced.
+    --
+    -- `date_of_birth` here is always the NORMALIZED form (db.normalize_dob), because a key
+    -- made of free text would file "3/5/2001" and "03/05/2001" as two different people.
+    UNIQUE (clinic_id, phone, date_of_birth)
 );
 
 CREATE TABLE IF NOT EXISTS caller_memory (
