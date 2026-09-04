@@ -572,11 +572,36 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 13 of 17.**
+**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 14 of 17.**
 Phases 9 (Postgres + Supabase), 10 (in-house event loop), 11 (concurrency + load proof), 12
-(reasoning layer), and 13 (memory + verified tool surface) are done. Phase 8's bake-off harness
-has now had its **first real runs** (partial — 3 of 19 cases) and produced the prompt-caching
-result below.
+(reasoning layer), 13 (memory + verified tool surface) and **14 (latency finish)** are done.
+Phase 8's bake-off harness has had its **first real runs** (partial — 3 of 19 cases) and
+produced the prompt-caching result below.
+
+### START HERE — next session
+
+**Next: Phase 15 (reliability: failover + warm human transfer), then 16 (observability + eval at
+market bar), then 17 (BAA-readiness + multi-tenancy).** Full definitions:
+`/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md`. All three are buildable and
+testable **offline** — which matters, because:
+
+**LIVE CALLS COST REAL CREDIT AND THE AUTHOR IS CONSERVING IT.** Cartesia + Deepgram + LiveKit
+bill per call and there is one test handset. Do not propose "just place a call to check" as a
+verification step. Everything below the microphone is provable offline: `./run_e2e.sh` (real
+reducer, real tool executor, real HTTP, real Postgres), `core.recorder.replay` over the 14
+traces in `logs/traces/`, `eval/run_intent_eval.py --detector-only` (free), and
+`loadtest/tier_a.py` (no keys, no network). Reserve a live call for something that genuinely
+cannot be answered any other way, and say so explicitly when asking for one.
+
+**Phase 14 closed with three of its five planned items cancelled by measurement, not built.**
+That is the pattern worth repeating: instrument first, then decide. Sentence-boundary TTS
+chunking already existed; semantic EOU is a provider floor and was rejected outright; the
+delta-burst "blocked loop" theory was disproved with a probe. What remains — LLM TTFT at
+~50% of every turn — is Anthropic's number, not an orchestration one. Do not reopen it without
+a new measurement.
+
+**Phase 14 exit is p50 ≤ 1,200 ms and the best measured is 1,385 ms** (one 8-turn call), so it
+is close but NOT formally met. Do not record it as met without more turns.
 
 **Phase 13's exit criterion is MET — see *Phase 13 CLOSED* below.** It took six live attempts;
 five were defeated by the defects recorded here, and the sixth by an un-restarted API serving
