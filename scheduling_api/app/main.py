@@ -5,7 +5,8 @@ Endpoints:
   GET  /availability       list open appointment slots (optional filters)
   POST /hold-slot          place a short-lived hold on a slot
   POST /confirm-booking    turn a valid hold into a confirmed booking
-  GET  /metrics            aggregate the agent's call log for the dashboard
+  GET  /metrics            aggregate recent calls' metrics for the dashboard
+  POST /call-metrics       the agent posts one call's metrics at teardown
 
 Storage is Postgres (see app/db.py and app/schema.sql). All data is synthetic — no real PHI.
 
@@ -39,6 +40,8 @@ from .models import (
     AppointmentOut,
     AppointmentsResponse,
     AvailabilityResponse,
+    CallMetricsRequest,
+    CallMetricsResponse,
     CallerMemoryResponse,
     CancelRequest,
     CancelResponse,
@@ -133,8 +136,27 @@ async def health() -> dict:
 
 @app.get("/metrics")
 async def metrics() -> dict:
-    """Aggregate the agent's call log (logs/calls.jsonl) for the dashboard (Phase 6)."""
-    return aggregate_metrics()
+    """Aggregate recent calls' metrics for the dashboard.
+
+    Phase 16: the source is Postgres, not `logs/calls.jsonl`. The old reader re-read the whole
+    file per request and, on Railway, read a file the agent's container had never written to.
+    Bounded to the most recent `CLINIC_METRICS_WINDOW` calls.
+    """
+    return aggregate_metrics(await db.fetch_call_events())
+
+
+@app.post("/call-metrics", response_model=CallMetricsResponse,
+          dependencies=[Depends(require_token)])
+async def post_call_metrics(req: CallMetricsRequest) -> CallMetricsResponse:
+    """One call's operational metrics, posted by the agent at teardown.
+
+    Idempotent on call_id: a re-post replaces the call's rows. The request model forbids extra
+    fields, so PHI cannot be attached to an operational record even by accident.
+    """
+    result = await db.record_call_metrics(req.model_dump(mode="json"))
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "bad request"))
+    return CallMetricsResponse(**result)
 
 
 # Serve the observability dashboard same-origin with /metrics so the page needs no CORS and no

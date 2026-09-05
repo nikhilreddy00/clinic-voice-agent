@@ -348,6 +348,23 @@ class SchedulingClient:
             return {"ok": False, "error": f"could not reach the scheduling system ({exc})"}
         return {"ok": True, **resp.json()}
 
+    async def post_call_metrics(self, payload: dict) -> dict:
+        """Ship one call's operational metrics at teardown (Phase 16).
+
+        `safe=True` because the endpoint is idempotent on `call_id` — a replay replaces the
+        call's rows rather than adding a second copy of the call, so a retry cannot double-count
+        it in the dashboard's percentiles.
+
+        Never raises. This runs during teardown of a call that has already ended: the caller has
+        hung up, nothing is waiting on it, and a metrics sink that can take down a session is
+        worse than no metrics sink. The local JSONL still holds the same records either way.
+        """
+        try:
+            resp = await self._send("POST", "/call-metrics", json=payload, safe=True)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            return {"ok": False, "error": f"could not post call metrics ({exc})"}
+        return {"ok": True, **resp.json()}
 
 
 # --- Pipecat function handlers ----------------------------------------------------------

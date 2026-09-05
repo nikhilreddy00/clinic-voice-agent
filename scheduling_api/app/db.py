@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import uuid
@@ -323,6 +324,9 @@ authoritative list. A table added to schema.sql and forgotten here would silentl
 reset and leak rows between test cases.
 """
 TABLES_IN_DEPENDENCY_ORDER = (
+    "call_tool_metrics",
+    "call_turn_metrics",
+    "call_metrics",
     "audit_log",
     "staff_tasks",
     "clinic_facts",
@@ -1116,3 +1120,182 @@ async def clinic_info(topic: str | None = None) -> dict[str, Any]:
     if topic and topic in facts:
         return {"topic": topic, "content": facts[topic], "topics": sorted(facts)}
     return {"topic": topic, "content": None, "topics": sorted(facts)}
+
+
+# =========================================================================================
+# CALL METRICS (Phase 16)
+# =========================================================================================
+#
+# `logs/calls.jsonl` was a shared-filesystem bus between two services. On Railway they are
+# separate containers with no shared volume, so the dashboard was empty in the only deployment
+# that counts. The agent now POSTs one batch per call here at teardown.
+#
+# Nothing in these rows is clinical: no name, no date of birth, no transcript. That is a
+# property of what the agent sends, and `main.py` is where it is enforced.
+
+# How many recent calls /metrics aggregates over. Unbounded was the old behaviour and it meant
+# one page load re-read all of history; a fixed window keeps the endpoint O(window).
+METRICS_WINDOW_CALLS = int(os.getenv("CLINIC_METRICS_WINDOW", "200"))
+
+
+async def record_call_metrics(payload: dict[str, Any]) -> dict[str, Any]:
+    """Store one call's operational metrics. Idempotent on (clinic, call_id).
+
+    A re-post REPLACES the call's rows rather than appending a second copy: the agent posts once
+    at teardown, but "once" is a property of a network nobody controls, and a duplicated call
+    would double-count in every percentile on the dashboard.
+    """
+    call_id = str(payload.get("call_id") or "").strip()
+    if not call_id:
+        return {"ok": False, "error": "call_id is required"}
+
+    turns = payload.get("turns") or []
+    tools = payload.get("tools") or []
+
+    async with pool().connection() as conn:
+        async with conn.transaction():
+            clinic_id = await _clinic_id(conn)
+            row = await (await conn.execute(
+                """
+                INSERT INTO call_metrics
+                    (clinic_id, call_id, mode, outcome, turns, tool_total, tool_success,
+                     started_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (clinic_id, call_id) DO UPDATE SET
+                    mode = EXCLUDED.mode,
+                    outcome = EXCLUDED.outcome,
+                    turns = EXCLUDED.turns,
+                    tool_total = EXCLUDED.tool_total,
+                    tool_success = EXCLUDED.tool_success,
+                    started_at = EXCLUDED.started_at,
+                    created_at = now()
+                RETURNING id
+                """,
+                (
+                    clinic_id,
+                    call_id,
+                    payload.get("mode"),
+                    payload.get("outcome"),
+                    len(turns),
+                    int(payload.get("tool_total") or 0),
+                    int(payload.get("tool_success") or 0),
+                    payload.get("started_at"),
+                ),
+            )).fetchone()
+            metrics_id = row["id"]
+
+            # Children are replaced wholesale. ON CONFLICT cannot express "this call's turns are
+            # now exactly these" — a shorter re-post would leave the old tail behind.
+            await conn.execute(
+                "DELETE FROM call_turn_metrics WHERE call_metrics_id = %s", (metrics_id,)
+            )
+            await conn.execute(
+                "DELETE FROM call_tool_metrics WHERE call_metrics_id = %s", (metrics_id,)
+            )
+            for i, turn in enumerate(turns):
+                await conn.execute(
+                    """
+                    INSERT INTO call_turn_metrics
+                        (call_metrics_id, turn_index, asr_ms, llm_ms, tts_ms, e2e_ms,
+                         asr_confidence, had_tool_call)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (metrics_id, i, turn.get("asr_ms"), turn.get("llm_ms"), turn.get("tts_ms"),
+                     turn.get("e2e_ms"), turn.get("asr_confidence"),
+                     bool(turn.get("had_tool_call"))),
+                )
+            for tool in tools:
+                await conn.execute(
+                    """
+                    INSERT INTO call_tool_metrics
+                        (call_metrics_id, endpoint, http_status, latency_ms, success)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (metrics_id, str(tool.get("endpoint") or "unknown"), tool.get("http_status"),
+                     tool.get("latency_ms"), bool(tool.get("success"))),
+                )
+
+    return {"ok": True, "call_id": call_id, "turns": len(turns), "tools": len(tools)}
+
+
+async def fetch_call_events(limit_calls: int | None = None) -> list[dict[str, Any]]:
+    """The most recent calls' metrics, in the event shape `metrics.aggregate_metrics` expects.
+
+    Returning events rather than a finished aggregate is deliberate: the aggregation logic and
+    its tests predate this change and are unaffected by where the rows come from. Only the
+    transport moved.
+    """
+    limit = limit_calls or METRICS_WINDOW_CALLS
+    async with pool().connection() as conn:
+        calls = await (await conn.execute(
+            """
+            SELECT id, call_id, mode, outcome, turns, created_at
+            FROM call_metrics
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )).fetchall()
+        if not calls:
+            return []
+        ids = [c["id"] for c in calls]
+        turn_rows = await (await conn.execute(
+            """
+            SELECT call_metrics_id, asr_ms, llm_ms, tts_ms, e2e_ms, asr_confidence, had_tool_call
+            FROM call_turn_metrics WHERE call_metrics_id = ANY(%s) ORDER BY turn_index
+            """,
+            (ids,),
+        )).fetchall()
+        tool_rows = await (await conn.execute(
+            """
+            SELECT call_metrics_id, endpoint, http_status, latency_ms, success
+            FROM call_tool_metrics WHERE call_metrics_id = ANY(%s) ORDER BY id
+            """,
+            (ids,),
+        )).fetchall()
+
+    by_id = {c["id"]: c for c in calls}
+    events: list[dict[str, Any]] = []
+    for row in turn_rows:
+        call = by_id[row["call_metrics_id"]]
+        events.append({
+            "event": "turn",
+            "call_id": call["call_id"],
+            "asr_ms": row["asr_ms"],
+            "llm_ms": row["llm_ms"],
+            "tts_ms": row["tts_ms"],
+            "e2e_ms": row["e2e_ms"],
+            "asr_confidence": row["asr_confidence"],
+            "had_tool_call": row["had_tool_call"],
+        })
+    for row in tool_rows:
+        call = by_id[row["call_metrics_id"]]
+        events.append({
+            "event": "tool",
+            "call_id": call["call_id"],
+            "endpoint": row["endpoint"],
+            "http_status": row["http_status"],
+            "latency_ms": row["latency_ms"],
+            "success": row["success"],
+        })
+    for call in calls:
+        e2e = [r["e2e_ms"] for r in turn_rows
+               if r["call_metrics_id"] == call["id"] and r["e2e_ms"] is not None]
+        events.append({
+            "event": "call_summary",
+            "call_id": call["call_id"],
+            "ts": call["created_at"].isoformat(),
+            "mode": call["mode"],
+            "outcome": call["outcome"],
+            "turns": call["turns"],
+            "latency_ms": {"e2e": {"p50": _p50(e2e)}},
+        })
+    return events
+
+
+def _p50(values: list[float]) -> int | None:
+    """Nearest-rank median, matching the agent-side collector and app/metrics.py."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return round(ordered[max(0, math.ceil(0.5 * len(ordered)) - 1)])

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SlotOut(BaseModel):
@@ -147,3 +149,51 @@ class ClinicInfoResponse(BaseModel):
     topic: str | None = None
     content: str | None = None
     topics: list[str]
+
+
+# --- call metrics (Phase 16) ---------------------------------------------------------------
+#
+# OPERATIONAL rows, not clinical ones. There is no field here for a name, a date of birth, a
+# transcript, or symptom notes, and that is the enforcement: with `extra="forbid"` a future
+# agent that tries to attach one gets a 422 rather than quietly writing PHI into a table whose
+# retention policy assumes there is none.
+
+
+class TurnMetric(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asr_ms: float | None = None
+    llm_ms: float | None = None
+    tts_ms: float | None = None
+    e2e_ms: float | None = None
+    asr_confidence: float | None = None
+    had_tool_call: bool = False
+
+
+class ToolMetric(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str
+    http_status: int | None = None
+    latency_ms: float | None = None
+    success: bool = False
+
+
+class CallMetricsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    call_id: str = Field(..., min_length=1)
+    mode: str | None = None
+    outcome: str | None = None
+    tool_total: int = 0
+    tool_success: int = 0
+    started_at: datetime | None = None
+    turns: list[TurnMetric] = Field(default_factory=list)
+    tools: list[ToolMetric] = Field(default_factory=list)
+
+
+class CallMetricsResponse(BaseModel):
+    ok: bool
+    call_id: str
+    turns: int
+    tools: int

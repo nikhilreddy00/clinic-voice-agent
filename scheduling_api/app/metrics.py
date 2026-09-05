@@ -1,34 +1,23 @@
-"""Phase 6 — read the agent's structured call log and aggregate it for the dashboard.
+"""Aggregate per-call metrics into the dashboard payload.
 
-The voice agent writes newline-delimited JSON to `logs/calls.jsonl` (one object per event:
-`turn`, `tool`, `call_summary`). This module reads that file and produces the aggregate the
-`GET /metrics` endpoint serves. The two services are decoupled (separate packages), so the tiny
-percentile/log-dir helpers are duplicated here rather than shared — deliberately, per the project
-convention that the agent and API don't import each other.
+Phase 6 wrote this against `logs/calls.jsonl`, a file the agent appended to and this service
+re-read IN FULL on every request. Phase 16 retired that bus — the agent POSTs a batch per call
+to `/call-metrics` and the rows live in Postgres — but the aggregation itself did not need to
+change, so it did not. `aggregate_metrics` is now a PURE function over the same event shape,
+and `db.fetch_call_events` produces that shape from SQL. Only the transport moved.
 
-A missing or empty log yields a well-formed zeroed aggregate (never an error), so the dashboard
-renders cleanly before the first call.
+Keeping it pure is what makes it testable without a database, which is why the events are
+passed in rather than fetched here.
+
+No events yields a well-formed zeroed aggregate (never an error), so the dashboard renders
+cleanly before the first call.
 """
 
 from __future__ import annotations
 
-import json
 import math
-import os
-from pathlib import Path
 
 STAGES = ("asr", "llm", "tts", "e2e")
-
-
-def resolve_log_path() -> Path:
-    """Path to calls.jsonl, matching the agent's writer (CLINIC_LOG_DIR override, else repo/logs).
-
-    Default resolves to the repo-root `logs/` regardless of cwd so the API (run from
-    scheduling_api/) reads the same file the agent (run from agent/) writes.
-    """
-    env = os.getenv("CLINIC_LOG_DIR")
-    base = Path(env) if env else Path(__file__).resolve().parents[2] / "logs"
-    return base / "calls.jsonl"
 
 
 def _percentiles(values: list[float]) -> dict:
@@ -66,25 +55,8 @@ def _empty_metrics() -> dict:
     }
 
 
-def _read_events(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    events: list[dict] = []
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue  # skip a torn/partial line rather than 500 the endpoint
-    return events
-
-
-def aggregate_metrics() -> dict:
-    """Aggregate calls.jsonl into the dashboard payload (see _empty_metrics for the shape)."""
-    events = _read_events(resolve_log_path())
+def aggregate_metrics(events: list[dict]) -> dict:
+    """Aggregate call-metric events into the dashboard payload (shape: see _empty_metrics)."""
     if not events:
         return _empty_metrics()
 

@@ -5,8 +5,13 @@
 #
 # The agent reaches the API by its compose service name (scheduling_api), never localhost.
 # Secrets live only in the git-ignored agent/.env (loaded via env_file) — none are baked into
-# an image. logs/ is a shared bind mount: the agent writes calls.jsonl, the API reads it for the
-# dashboard.
+# an image.
+#
+# Phase 16: the API no longer mounts logs/. It used to, because the dashboard read the agent's
+# calls.jsonl off a shared bind mount — which worked here and nowhere else, since on Railway the
+# two services are separate containers with no shared volume. Call metrics now travel over HTTP
+# (POST /call-metrics) like everything else between these two services. The agent still writes
+# logs/ for its own traces and debug log; nothing else reads it.
 
 # DATABASE: Supabase by default. Set CLINIC_DATABASE_URL in your shell or a root .env to the
 # project's SESSION POOLER string (port 5432 on aws-<region>.pooler.supabase.com) — the direct
@@ -41,13 +46,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      CLINIC_LOG_DIR: /logs
       CLINIC_DASHBOARD_DIR: /app/dashboard
       # Required. Supabase session-pooler URL, or the local-db profile's URL.
       CLINIC_DATABASE_URL: ${CLINIC_DATABASE_URL:?set CLINIC_DATABASE_URL (Supabase session pooler)}
       CLINIC_API_TOKEN: ${CLINIC_API_TOKEN:-}
     volumes:
-      - ./logs:/logs                 # read the agent's calls.jsonl
       - ./dashboard:/app/dashboard:ro # serve the static dashboard at /dashboard
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]

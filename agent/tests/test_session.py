@@ -83,7 +83,19 @@ class FakeTools:
         self._emit = emit
         self._results = results
         self.invoked: list[str] = []
+        self.shipped: list[dict] = []
+        self.ship_error: Exception | None = None
         self.closed = False
+
+    async def post_call_metrics(self, payload):
+        """Phase 16's teardown POST. Recorded rather than ignored, so a session test can assert
+        the metrics actually left — `_ship_metrics` swallows every failure by design, which is
+        also how a missing method here would go unnoticed."""
+        if self.ship_error is not None:
+            raise self.ship_error
+        self.shipped.append(payload)
+        return {"ok": True, "call_id": payload["call_id"], "turns": len(payload["turns"]),
+                "tools": len(payload["tools"])}
 
     def invoke(self, tool_call_id, name, arguments):
         self.invoked.append(name)

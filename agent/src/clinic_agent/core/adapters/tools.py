@@ -150,6 +150,10 @@ class ToolExecutor:
             )
         )
 
+    async def post_call_metrics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Ship this call's metrics to the scheduling API (Phase 16). Never raises."""
+        return await self._client.post_call_metrics(payload)
+
     async def aclose(self) -> None:
         if self._memory_task is not None and not self._memory_task.done():
             self._memory_task.cancel()

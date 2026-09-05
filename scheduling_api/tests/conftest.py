@@ -33,6 +33,9 @@ from app.main import app  # noqa: E402
 
 # Order matters: children before parents, so FK references are gone before the referenced rows.
 _TABLES = (
+    "call_tool_metrics",
+    "call_turn_metrics",
+    "call_metrics",
     "audit_log",
     "staff_tasks",
     "clinic_facts",

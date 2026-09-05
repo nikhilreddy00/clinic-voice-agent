@@ -173,6 +173,16 @@ class FakeTools:
         self._emit(ev.CallerMemoryLoaded(t=time.monotonic(), known=False,
                                          upcoming_appointments=0))
 
+    async def post_call_metrics(self, payload: dict) -> dict:
+        """Phase 16's teardown POST, faked as an instant success.
+
+        It costs a real HTTP round trip per session at teardown, so the load test has to have
+        SOMETHING here or it measures a cheaper program than the one that ships. Zero latency is
+        the deliberate simplification: teardown is off the critical path and already bounded by
+        `CallSession.METRICS_POST_TIMEOUT_S`.
+        """
+        return {"ok": True, "call_id": payload.get("call_id"), "turns": 0, "tools": 0}
+
     async def _run(self, tool_call_id: str, name: str) -> None:
         latency = self._s.draw("tool_ms")
         try:

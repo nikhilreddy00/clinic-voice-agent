@@ -208,6 +208,67 @@ CREATE TABLE IF NOT EXISTS staff_tasks (
 
 CREATE INDEX IF NOT EXISTS staff_tasks_open_idx ON staff_tasks (clinic_id, status, created_at);
 
+-- =========================================================================================
+-- CALL METRICS (Phase 16) -- replaces logs/calls.jsonl as the cross-service bus
+-- =========================================================================================
+--
+-- The agent used to append every turn, tool call, and call summary to a file that this service
+-- re-read IN FULL on every /metrics request. Three things wrong with that, in order of how
+-- badly they bite: the two services are separate containers on Railway with no shared volume,
+-- so the dashboard was simply empty in the only deployment that matters; the file is unbounded;
+-- and a full re-read per request is O(all history) for one page load.
+--
+-- The agent now POSTs one batch per call to /call-metrics at teardown. These are OPERATIONAL
+-- rows, not clinical ones: no name, no date of birth, no transcript, no symptom notes. Keeping
+-- them separate from `call_summaries` (which is conversational memory and IS PHI-shaped) is
+-- deliberate -- they have different retention and, in Phase 17, different encryption.
+
+CREATE TABLE IF NOT EXISTS call_metrics (
+    id            BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    clinic_id     BIGINT      NOT NULL REFERENCES clinics(id) ON DELETE CASCADE,
+    call_id       TEXT        NOT NULL,
+    mode          TEXT,
+    outcome       TEXT,
+    turns         INTEGER     NOT NULL DEFAULT 0,
+    tool_total    INTEGER     NOT NULL DEFAULT 0,
+    tool_success  INTEGER     NOT NULL DEFAULT 0,
+    started_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- A retried POST replaces the call's rows rather than adding a second copy of the call.
+    -- The agent posts once at teardown, but "once" is a property of a network nobody controls.
+    UNIQUE (clinic_id, call_id)
+);
+
+CREATE INDEX IF NOT EXISTS call_metrics_recent_idx ON call_metrics (clinic_id, created_at DESC);
+
+-- One row per turn. Percentiles are computed across CALLS, so the raw samples have to survive
+-- the trip: percentiles of per-call percentiles are not percentiles.
+CREATE TABLE IF NOT EXISTS call_turn_metrics (
+    id              BIGINT  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    call_metrics_id BIGINT  NOT NULL REFERENCES call_metrics(id) ON DELETE CASCADE,
+    turn_index      INTEGER NOT NULL,
+    asr_ms          DOUBLE PRECISION,
+    llm_ms          DOUBLE PRECISION,
+    tts_ms          DOUBLE PRECISION,
+    e2e_ms          DOUBLE PRECISION,
+    asr_confidence  DOUBLE PRECISION,
+    had_tool_call   BOOLEAN NOT NULL DEFAULT false
+);
+
+CREATE INDEX IF NOT EXISTS call_turn_metrics_call_idx ON call_turn_metrics (call_metrics_id);
+
+CREATE TABLE IF NOT EXISTS call_tool_metrics (
+    id              BIGINT  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    call_metrics_id BIGINT  NOT NULL REFERENCES call_metrics(id) ON DELETE CASCADE,
+    endpoint        TEXT    NOT NULL,
+    http_status     INTEGER,
+    latency_ms      DOUBLE PRECISION,
+    success         BOOLEAN NOT NULL DEFAULT false
+);
+
+CREATE INDEX IF NOT EXISTS call_tool_metrics_call_idx ON call_tool_metrics (call_metrics_id);
+
 -- Append-only. Every PHI read/write gets a row (Phase 17). No UPDATE/DELETE path by design.
 CREATE TABLE IF NOT EXISTS audit_log (
     id           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -263,7 +324,8 @@ BEGIN
     FOREACH t IN ARRAY ARRAY[
         'clinics', 'providers', 'slots', 'bookings', 'idempotency_keys',
         'patients', 'caller_memory', 'call_summaries', 'clinic_facts',
-        'staff_tasks', 'audit_log'
+        'staff_tasks', 'audit_log',
+        'call_metrics', 'call_turn_metrics', 'call_tool_metrics'
     ] LOOP
         IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = t) THEN
             EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);

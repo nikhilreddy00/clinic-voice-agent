@@ -1,9 +1,16 @@
-"""Phase 6 — per-turn latency + call-outcome observability (structured JSON sink).
+"""Phase 6 — per-turn latency + call-outcome observability.
 
 This module captures the four voice-to-voice latencies the README reports, plus per-turn ASR
-confidence, per-call tool outcomes, and the call outcome at hangup. It writes a newline-delimited
-JSON log (`logs/calls.jsonl`, one object per event) that the scheduling API's `/metrics` endpoint
-aggregates for the dashboard. It runs ALONGSIDE the existing human-readable console logs
+confidence, per-call tool outcomes, and the call outcome at hangup.
+
+PHASE 16 CHANGED WHERE THOSE NUMBERS GO. `logs/calls.jsonl` used to be the bus: this module
+appended to it and the scheduling API re-read the whole file on every `/metrics` request. That
+only ever worked on one host — on Railway the two services are separate containers with no
+shared volume, so the dashboard was empty in the deployment that matters. `payload()` now
+produces a batch that `CallSession._ship_metrics` POSTs to `/call-metrics` at teardown.
+
+The JSONL file is still written, and is now purely a LOCAL DEBUG ARTIFACT: nothing reads it
+across a process boundary. It runs ALONGSIDE the existing human-readable console logs
 (`ASR ▶ / LLM ▶ / TOOL ▶ / TTS ▶`) — it never replaces or mutates them, and the taps never drop
 or change a frame.
 
@@ -54,11 +61,10 @@ STAGES = ("asr", "llm", "tts", "e2e")
 
 
 def resolve_log_dir() -> Path:
-    """Directory holding calls.jsonl, shared between the agent (writer) and API (reader).
+    """Directory holding the agent's local logs — calls.jsonl and traces/.
 
-    `CLINIC_LOG_DIR` overrides (set to a shared volume path under Docker). Default resolves to
-    the repo-root `logs/` regardless of the process's cwd, so the agent (run from agent/) and the
-    scheduling API (run from scheduling_api/) both land on the same file in local dev.
+    `CLINIC_LOG_DIR` overrides. Default resolves to the repo-root `logs/` regardless of the
+    process's cwd, so it is the same directory wherever the agent is started from.
     """
     env = os.getenv("CLINIC_LOG_DIR")
     if env:
@@ -112,6 +118,8 @@ class LatencyCollector:
     this process writes (one agent process per voice session), so there is no write contention.
     """
 
+    MAX_RECORDS = 500
+
     def __init__(self, *, mode: str, call_id: str | None = None) -> None:
         self.mode = mode
         self.call_id = call_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -130,6 +138,17 @@ class LatencyCollector:
         self._booked = False
         self._escalated = False
         self._finalized = False
+        self._started_at = _iso_now()
+
+        # Phase 16. The rows POSTed to the scheduling API at teardown, replacing calls.jsonl as
+        # the cross-service bus. Kept here rather than re-read from the file because the file
+        # is now a local debug artifact and nothing else reads it.
+        #
+        # Bounded: a healthy call is ~15 turns, and a call that produces 500 is already broken
+        # in a way no dashboard row is going to explain. The cap stops a runaway session from
+        # building an unbounded payload in memory and then trying to POST it.
+        self._turn_records: list[dict] = []
+        self._tool_records: list[dict] = []
 
     # --- per-turn state -----------------------------------------------------------------
     def _reset_turn(self) -> None:
@@ -188,6 +207,16 @@ class LatencyCollector:
             self._confidences.append(self._confidence)
         self._turn_count += 1
 
+        if len(self._turn_records) < self.MAX_RECORDS:
+            self._turn_records.append({
+                "asr_ms": _round_or_none(asr_ms),
+                "llm_ms": _round_or_none(llm_ms),
+                "tts_ms": _round_or_none(tts_ms),
+                "e2e_ms": _round_or_none(e2e_ms),
+                "asr_confidence": self._confidence,
+                "had_tool_call": self._had_tool_call,
+            })
+
         self._write(
             {
                 "event": "turn",
@@ -221,6 +250,13 @@ class LatencyCollector:
             self._tool_success += 1
         if endpoint == "/confirm-booking" and success:
             self._booked = True  # booked overrides escalated at outcome resolution
+        if len(self._tool_records) < self.MAX_RECORDS:
+            self._tool_records.append({
+                "endpoint": endpoint,
+                "http_status": http_status,
+                "latency_ms": round(latency_ms),
+                "success": success,
+            })
         self._write(
             {
                 "event": "tool",
@@ -286,6 +322,25 @@ class LatencyCollector:
             f"{stage('ASR', 'asr')} | {stage('LLM', 'llm')} | "
             f"{stage('TTS', 'tts')} | {stage('E2E', 'e2e')}"
         )
+
+    def payload(self) -> dict:
+        """This call's metrics, in the shape `POST /call-metrics` accepts.
+
+        Operational only. There is deliberately no field here for a name, a date of birth, a
+        transcript, or symptom notes — and the API's request model forbids extra keys, so
+        adding one here fails loudly at the boundary instead of writing clinical content into a
+        table whose retention policy assumes there is none.
+        """
+        return {
+            "call_id": self.call_id,
+            "mode": self.mode,
+            "outcome": self._outcome(),
+            "tool_total": self._tool_total,
+            "tool_success": self._tool_success,
+            "started_at": self._started_at,
+            "turns": list(self._turn_records),
+            "tools": list(self._tool_records),
+        }
 
     def _write(self, obj: dict) -> None:
         # Phase 11: goes through the process-wide writer for this path, so a worker hosting N

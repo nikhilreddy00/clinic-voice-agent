@@ -341,6 +341,7 @@ class CallSession:
             if summary := self._loop_lag.summary():
                 logger.info(summary)
         self.metrics.finalize()
+        await self._ship_metrics()
         self._recorder.close()  # flush the buffered tail and release the descriptor
 
         for closer in (self._stt.aclose, self._tts.aclose, self.media.aclose,
@@ -349,3 +350,35 @@ class CallSession:
                 await closer()
             except Exception as exc:  # noqa: BLE001 - one failed close must not skip the rest
                 logger.warning(f"[session] teardown error in {closer.__qualname__}: {exc}")
+
+    # Teardown budget for the metrics POST. The client's own timeout is 5 s plus one retry,
+    # which is the right budget for a tool call inside a live turn and far too long here: the
+    # caller has already hung up and this is the last thing between the session and its
+    # descriptors being released. A worker draining 800 sessions cannot spend ten seconds each
+    # waiting on a sick dashboard.
+    METRICS_POST_TIMEOUT_S = 3.0
+
+    async def _ship_metrics(self) -> None:
+        """POST this call's metrics to the scheduling API. Best-effort, by design.
+
+        Phase 16 retired `logs/calls.jsonl` as the bus between the agent and the API — on
+        Railway they are separate containers with no shared volume, so the dashboard was empty
+        in the only deployment that counts.
+
+        Every failure here is swallowed and logged once. The call is already over, nothing is
+        waiting on the result, and the same records are still in the local JSONL for debugging.
+        An observability sink that can fail a session is worse than no sink.
+        """
+        try:
+            result = await asyncio.wait_for(
+                self._tools.post_call_metrics(self.metrics.payload()),
+                timeout=self.METRICS_POST_TIMEOUT_S,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.warning("[metrics] call metrics not shipped: timed out")
+            return
+        except Exception as exc:  # noqa: BLE001 - teardown must complete regardless
+            logger.warning(f"[metrics] call metrics not shipped: {exc}")
+            return
+        if not result.get("ok"):
+            logger.warning(f"[metrics] call metrics not shipped: {result.get('error')}")
