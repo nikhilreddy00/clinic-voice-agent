@@ -1,0 +1,192 @@
+{"kind": "CallStarted", "seq": 1, "t": 406186.139321083, "call_id": "20260903T205341764653Z", "mode": "telephony"}
+{"kind": "CallerPresent", "seq": 2, "t": 406213.731676416, "participant_id": "sip_+17039066508", "phone": "+17039066508"}
+{"kind": "BotStartedSpeaking", "seq": 3, "t": 406213.871043333, "utterance_id": "utt-1"}
+{"kind": "CallerMemoryLoaded", "seq": 4, "t": 406214.038515458, "known": true, "upcoming_appointments": 2}
+{"kind": "BotStoppedSpeaking", "seq": 5, "t": 406224.911481125, "utterance_id": "utt-1", "completed": true}
+{"kind": "PartialTranscript", "seq": 6, "t": 406226.805568458, "text": "Hey,"}
+{"kind": "SpeechStarted", "seq": 7, "t": 406226.917473666}
+{"kind": "SpeechStopped", "seq": 8, "t": 406227.167253291}
+{"kind": "PartialTranscript", "seq": 9, "t": 406227.250532208, "text": "Hey."}
+{"kind": "SpeechStarted", "seq": 10, "t": 406227.455901166}
+{"kind": "SpeechStarted", "seq": 11, "t": 406228.037331458}
+{"kind": "PartialTranscript", "seq": 12, "t": 406228.257727, "text": "Hey. My name is Joe."}
+{"kind": "SpeechStarted", "seq": 13, "t": 406228.487502583}
+{"kind": "PartialTranscript", "seq": 14, "t": 406229.282456833, "text": "Hey. My name is Joe, and I would"}
+{"kind": "SpeechStarted", "seq": 15, "t": 406229.447112166}
+{"kind": "PartialTranscript", "seq": 16, "t": 406229.825267041, "text": "Joe, and I would like to book"}
+{"kind": "SpeechStarted", "seq": 17, "t": 406230.016722}
+{"kind": "SpeechStarted", "seq": 18, "t": 406230.56733025}
+{"kind": "PartialTranscript", "seq": 19, "t": 406230.838321708, "text": "Joe, and I would like to book an appointment today"}
+{"kind": "SpeechStopped", "seq": 20, "t": 406231.077437708}
+{"kind": "SpeechStarted", "seq": 21, "t": 406231.487513333}
+{"kind": "PartialTranscript", "seq": 22, "t": 406231.830544541, "text": "Joe, and I would like to book an appointment today or tomorrow."}
+{"kind": "SpeechStopped", "seq": 23, "t": 406231.937387583}
+{"kind": "FinalTranscript", "seq": 24, "t": 406232.239555791, "text": "Hey. My name is Joe, and I would like to book an appointment today or tomorrow.", "confidence": 1.0}
+{"kind": "ModelRouted", "seq": 25, "t": 406232.2411655, "request_id": "req-1", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "intent not yet known"}
+{"kind": "LLMStarted", "seq": 26, "t": 406232.241401166, "request_id": "req-1"}
+{"kind": "LLMTextDelta", "seq": 27, "t": 406233.040254291, "request_id": "req-1", "text": "Hi"}
+{"kind": "IntentClassified", "seq": 28, "t": 406233.278413916, "intent": "schedule_appointment", "confidence": 0.95, "latency_ms": 1026.3419999973848}
+{"kind": "LLMTextDelta", "seq": 29, "t": 406233.316143916, "request_id": "req-1", "text": " Joe! I'd be happy to help you book an appointment. Before I check what's available, can you tell me what you need to"}
+{"kind": "LLMTextDelta", "seq": 30, "t": 406233.43813025, "request_id": "req-1", "text": " be seen for?"}
+{"kind": "BotStartedSpeaking", "seq": 31, "t": 406233.458341875, "utterance_id": "utt-2"}
+{"kind": "LLMCompleted", "seq": 32, "t": 406233.459174958, "request_id": "req-1", "text": "Hi Joe! I'd be happy to help you book an appointment. Before I check what's available, can you tell me what you need to be seen for?", "stop_reason": "end_turn"}
+{"kind": "BotStoppedSpeaking", "seq": 33, "t": 406240.498617, "utterance_id": "utt-2", "completed": true}
+{"kind": "SpeechStarted", "seq": 34, "t": 406242.277414625}
+{"kind": "SpeechStarted", "seq": 35, "t": 406242.507286666}
+{"kind": "SpeechStarted", "seq": 36, "t": 406243.01683475}
+{"kind": "PartialTranscript", "seq": 37, "t": 406243.089064625, "text": "Well, I"}
+{"kind": "SpeechStopped", "seq": 38, "t": 406244.037806458}
+{"kind": "TurnHeld", "seq": 39, "t": 406244.348137083, "tail": "Well, I got a", "seconds": 1.6, "window": 1, "windows_max": 3, "released": false}
+{"kind": "SpeechStarted", "seq": 40, "t": 406245.736906666}
+{"kind": "TurnHeld", "seq": 41, "t": 406245.949270208, "tail": "Well, I got a", "seconds": 1.6, "window": 2, "windows_max": 3, "released": false}
+{"kind": "SpeechStarted", "seq": 42, "t": 406246.117399583}
+{"kind": "PartialTranscript", "seq": 43, "t": 406246.388725708, "text": "leg fracture"}
+{"kind": "SpeechStopped", "seq": 44, "t": 406246.667290625}
+{"kind": "PartialTranscript", "seq": 45, "t": 406246.69535425, "text": "leg fracture"}
+{"kind": "SpeechStarted", "seq": 46, "t": 406246.887342333}
+{"kind": "PartialTranscript", "seq": 47, "t": 406247.699862541, "text": "leg fracture and so what"}
+{"kind": "PartialTranscript", "seq": 48, "t": 406248.695013333, "text": "leg fracture and, so while playing pickleball,"}
+{"kind": "SpeechStopped", "seq": 49, "t": 406248.907310333}
+{"kind": "TurnHeld", "seq": 50, "t": 406249.209529791, "tail": " a leg fracture and so while playing pickleball,", "seconds": 1.6, "window": 3, "windows_max": 3, "released": false}
+{"kind": "TurnHeld", "seq": 51, "t": 406250.810702208, "tail": " a leg fracture and so while playing pickleball,", "seconds": 0.0, "window": 3, "windows_max": 3, "released": true}
+{"kind": "FinalTranscript", "seq": 52, "t": 406250.810702208, "text": "Well, I got a leg fracture and so while playing pickleball,", "confidence": 0.988525385}
+{"kind": "ModelRouted", "seq": 53, "t": 406250.812582208, "request_id": "req-2", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 54, "t": 406250.812779583, "request_id": "req-2"}
+{"kind": "LLMTextDelta", "seq": 55, "t": 406251.422556416, "request_id": "req-2", "text": "I'm"}
+{"kind": "LLMTextDelta", "seq": 56, "t": 406251.710970416, "request_id": "req-2", "text": " sorry to hear that \u2014 that sounds painful. So we're looking at a leg fracture from pickleball. Are"}
+{"kind": "IntentClassified", "seq": 57, "t": 406251.730142166, "intent": "emergency", "confidence": 0.85, "latency_ms": 907.5991659774445}
+{"kind": "BotStartedSpeaking", "seq": 58, "t": 406251.841441833, "utterance_id": "utt-3"}
+{"kind": "LLMTextDelta", "seq": 59, "t": 406251.850625666, "request_id": "req-2", "text": " you a new patient, or have you visited us before?"}
+{"kind": "LLMCompleted", "seq": 60, "t": 406251.861081375, "request_id": "req-2", "text": "I'm sorry to hear that \u2014 that sounds painful. So we're looking at a leg fracture from pickleball. Are you a new patient, or have you visited us before?", "stop_reason": "end_turn"}
+{"kind": "BotStoppedSpeaking", "seq": 61, "t": 406259.842153625, "utterance_id": "utt-3", "completed": true}
+{"kind": "SpeechStarted", "seq": 62, "t": 406261.107346375}
+{"kind": "PartialTranscript", "seq": 63, "t": 406261.597839875, "text": "New patient."}
+{"kind": "SpeechStopped", "seq": 64, "t": 406261.656792541}
+{"kind": "FinalTranscript", "seq": 65, "t": 406262.081068125, "text": "New patient.", "confidence": 0.9980469}
+{"kind": "ModelRouted", "seq": 66, "t": 406262.082335708, "request_id": "req-3", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 67, "t": 406262.082520666, "request_id": "req-3"}
+{"kind": "LLMTextDelta", "seq": 68, "t": 406262.739597541, "request_id": "req-3", "text": "Got"}
+{"kind": "LLMTextDelta", "seq": 69, "t": 406262.749906708, "request_id": "req-3", "text": " it."}
+{"kind": "LLMTextDelta", "seq": 70, "t": 406262.881311708, "request_id": "req-3", "text": " And what's your date of birth?"}
+{"kind": "LLMCompleted", "seq": 71, "t": 406262.89687525, "request_id": "req-3", "text": "Got it. And what's your date of birth?", "stop_reason": "end_turn"}
+{"kind": "IntentClassified", "seq": 72, "t": 406263.007827041, "intent": "schedule_appointment", "confidence": 0.85, "latency_ms": 918.3361660107039}
+{"kind": "BotStartedSpeaking", "seq": 73, "t": 406263.012611416, "utterance_id": "utt-4"}
+{"kind": "BotStoppedSpeaking", "seq": 74, "t": 406264.853474541, "utterance_id": "utt-4", "completed": true}
+{"kind": "SpeechStarted", "seq": 75, "t": 406268.376767666}
+{"kind": "PartialTranscript", "seq": 76, "t": 406268.405508041, "text": "Mark"}
+{"kind": "SpeechStarted", "seq": 77, "t": 406268.666900166}
+{"kind": "SpeechStopped", "seq": 78, "t": 406269.047083916}
+{"kind": "PartialTranscript", "seq": 79, "t": 406269.330146625, "text": "March fifth"}
+{"kind": "SpeechStarted", "seq": 80, "t": 406269.497130791}
+{"kind": "SpeechStopped", "seq": 81, "t": 406270.227431}
+{"kind": "FinalTranscript", "seq": 82, "t": 406270.540699958, "text": "March fifth two thousand one.", "confidence": 0.9589844}
+{"kind": "ModelRouted", "seq": 83, "t": 406270.542024458, "request_id": "req-4", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 84, "t": 406270.542213625, "request_id": "req-4"}
+{"kind": "LLMTextDelta", "seq": 85, "t": 406271.179280833, "request_id": "req-4", "text": "Thanks"}
+{"kind": "LLMTextDelta", "seq": 86, "t": 406271.196577583, "request_id": "req-4", "text": ", Joe. And"}
+{"kind": "IntentClassified", "seq": 87, "t": 406271.226411125, "intent": "unknown", "confidence": 0.95, "latency_ms": 676.9729999941774}
+{"kind": "BotStartedSpeaking", "seq": 88, "t": 406271.328593583, "utterance_id": "utt-5"}
+{"kind": "LLMTextDelta", "seq": 89, "t": 406271.425443666, "request_id": "req-4", "text": " just to clarify \u2014 you're looking to come in today (Thursday) or tomorrow (Friday)?"}
+{"kind": "LLMCompleted", "seq": 90, "t": 406271.520965166, "request_id": "req-4", "text": "Thanks, Joe. And just to clarify \u2014 you're looking to come in today (Thursday) or tomorrow (Friday)?", "stop_reason": "end_turn"}
+{"kind": "BotStoppedSpeaking", "seq": 91, "t": 406277.169129041, "utterance_id": "utt-5", "completed": true}
+{"kind": "SpeechStarted", "seq": 92, "t": 406278.707370958}
+{"kind": "PartialTranscript", "seq": 93, "t": 406278.860101375, "text": "Friday"}
+{"kind": "SpeechStopped", "seq": 94, "t": 406279.06609}
+{"kind": "PartialTranscript", "seq": 95, "t": 406279.271192291, "text": "Friday."}
+{"kind": "SpeechStarted", "seq": 96, "t": 406279.507120375}
+{"kind": "SpeechStopped", "seq": 97, "t": 406279.827341041}
+{"kind": "FinalTranscript", "seq": 98, "t": 406280.1200595, "text": "Friday, tomorrow.", "confidence": 0.88720703}
+{"kind": "ModelRouted", "seq": 99, "t": 406280.120894208, "request_id": "req-5", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 100, "t": 406280.121026458, "request_id": "req-5"}
+{"kind": "IntentClassified", "seq": 101, "t": 406281.026342083, "intent": "unknown", "confidence": 0.3, "latency_ms": 896.8435419956222}
+{"kind": "LLMToolUse", "seq": 102, "t": 406281.521630875, "request_id": "req-5", "tool_call_id": "toolu_014APfCggMpAE55XNfLRBak6", "name": "check_availability", "arguments": {"date": "2026-09-04", "reason_category": "sick-visit"}}
+{"kind": "LLMCompleted", "seq": 103, "t": 406281.5221305, "request_id": "req-5", "text": "", "stop_reason": "tool_use"}
+{"kind": "ToolCompleted", "seq": 104, "t": 406281.580027666, "tool_call_id": "toolu_014APfCggMpAE55XNfLRBak6", "name": "check_availability", "result": {"ok": true, "count": 0, "slots": []}, "ok": true, "latency_ms": 56.23733397806063, "http_status": 200}
+{"kind": "ModelRouted", "seq": 105, "t": 406281.580429583, "request_id": "req-6", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 106, "t": 406281.580524416, "request_id": "req-6"}
+{"kind": "LLMTextDelta", "seq": 107, "t": 406282.148848916, "request_id": "req-6", "text": "Let"}
+{"kind": "LLMTextDelta", "seq": 108, "t": 406282.533200833, "request_id": "req-6", "text": " me check what else is available soonest across the next few days for you."}
+{"kind": "LLMToolUse", "seq": 109, "t": 406282.809479125, "request_id": "req-6", "tool_call_id": "toolu_01ToH4fBcwMVNubjUKVPjbYq", "name": "check_availability", "arguments": {"reason_category": "sick-visit"}}
+{"kind": "LLMCompleted", "seq": 110, "t": 406282.809631333, "request_id": "req-6", "text": "Let me check what else is available soonest across the next few days for you.", "stop_reason": "tool_use"}
+{"kind": "ToolCompleted", "seq": 111, "t": 406282.850479708, "tool_call_id": "toolu_01ToH4fBcwMVNubjUKVPjbYq", "name": "check_availability", "result": {"ok": true, "count": 5, "slots": [{"slot_id": 14, "provider_name": "Dr. Elena Rivera", "specialty": "Family Medicine", "reason_category": "sick-visit", "start_time": "2026-09-07T14:30:00+00:00", "display_time": "Monday, September 7 at 2:30 PM"}, {"slot_id": 24, "provider_name": "Dr. Aisha Patel", "specialty": "Internal Medicine", "reason_category": "sick-visit", "start_time": "2026-09-07T18:30:00+00:00", "display_time": "Monday, September 7 at 6:30 PM"}, {"slot_id": 29, "provider_name": "Dr. Marcus Chen", "specialty": "Pediatrics", "reason_category": "sick-visit", "start_time": "2026-09-08T13:00:00+00:00", "display_time": "Tuesday, September 8 at 1:00 PM"}, {"slot_id": 26, "provider_name": "Dr. Elena Rivera", "specialty": "Family Medicine", "reason_category": "sick-visit", "start_time": "2026-09-08T14:30:00+00:00", "display_time": "Tuesday, September 8 at 2:30 PM"}, {"slot_id": 36, "provider_name": "Dr. Aisha Patel", "specialty": "Internal Medicine", "reason_category": "sick-visit", "start_time": "2026-09-08T18:30:00+00:00", "display_time": "Tuesday, September 8 at 6:30 PM"}]}, "ok": true, "latency_ms": 39.47270900243893, "http_status": 200}
+{"kind": "ModelRouted", "seq": 112, "t": 406282.850838541, "request_id": "req-7", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 113, "t": 406282.85092325, "request_id": "req-7"}
+{"kind": "BotStartedSpeaking", "seq": 114, "t": 406282.936693333, "utterance_id": "utt-6"}
+{"kind": "LLMTextDelta", "seq": 115, "t": 406283.581869208, "request_id": "req-7", "text": "Unfortunately"}
+{"kind": "LLMTextDelta", "seq": 116, "t": 406283.80316475, "request_id": "req-7", "text": " there's nothing available tomorrow, but I do have openings early next week. The s"}
+{"kind": "LLMTextDelta", "seq": 117, "t": 406284.115732041, "request_id": "req-7", "text": "oonest is Monday, September 7th at 2:30 PM with Dr. Elena Rivera \u2014 does that work for you, or would you prefer Tuesday"}
+{"kind": "LLMTextDelta", "seq": 118, "t": 406284.153837875, "request_id": "req-7", "text": "?"}
+{"kind": "LLMCompleted", "seq": 119, "t": 406284.174726333, "request_id": "req-7", "text": "Unfortunately there's nothing available tomorrow, but I do have openings early next week. The soonest is Monday, September 7th at 2:30 PM with Dr. Elena Rivera \u2014 does that work for you, or would you prefer Tuesday?", "stop_reason": "end_turn"}
+{"kind": "BotStoppedSpeaking", "seq": 120, "t": 406298.776930125, "utterance_id": "utt-6", "completed": true}
+{"kind": "SpeechStarted", "seq": 121, "t": 406299.727686166}
+{"kind": "PartialTranscript", "seq": 122, "t": 406300.440043416, "text": "Yeah. That works for"}
+{"kind": "SpeechStopped", "seq": 123, "t": 406300.68743675}
+{"kind": "SpeechStarted", "seq": 124, "t": 406300.875895083}
+{"kind": "SpeechStopped", "seq": 125, "t": 406301.427542916}
+{"kind": "PartialTranscript", "seq": 126, "t": 406301.457451416, "text": "That works for me on Monday."}
+{"kind": "FinalTranscript", "seq": 127, "t": 406301.743889958, "text": "That works for me on Monday.", "confidence": 0.9980469}
+{"kind": "ModelRouted", "seq": 128, "t": 406301.745106625, "request_id": "req-8", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 129, "t": 406301.745307083, "request_id": "req-8"}
+{"kind": "IntentClassified", "seq": 130, "t": 406302.643838416, "intent": "unknown", "confidence": 0.3, "latency_ms": 885.343833011575}
+{"kind": "LLMToolUse", "seq": 131, "t": 406302.821634625, "request_id": "req-8", "tool_call_id": "toolu_011ckE5jYGeFSRuxcvR23FHf", "name": "hold_slot", "arguments": {"slot_id": 14}}
+{"kind": "LLMCompleted", "seq": 132, "t": 406302.82205075, "request_id": "req-8", "text": "", "stop_reason": "tool_use"}
+{"kind": "ToolCompleted", "seq": 133, "t": 406303.039442916, "tool_call_id": "toolu_011ckE5jYGeFSRuxcvR23FHf", "name": "hold_slot", "result": {"ok": true, "hold_id": "7e3dcc02-2a7b-483c-b63a-2f23037d7422", "slot_id": 14, "expires_at": "2026-09-03T20:57:38.641494+00:00"}, "ok": true, "latency_ms": 215.96991695696488, "http_status": 200}
+{"kind": "ModelRouted", "seq": 134, "t": 406303.039838791, "request_id": "req-9", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 135, "t": 406303.039911708, "request_id": "req-9"}
+{"kind": "LLMTextDelta", "seq": 136, "t": 406303.703083375, "request_id": "req-9", "text": "Perfect"}
+{"kind": "LLMTextDelta", "seq": 137, "t": 406304.02687875, "request_id": "req-9", "text": ". I'm holding that for you. So to confirm: you're Joe. Your date of birth is March 5th"}
+{"kind": "BotStartedSpeaking", "seq": 138, "t": 406304.160209833, "utterance_id": "utt-7"}
+{"kind": "LLMTextDelta", "seq": 139, "t": 406304.315477583, "request_id": "req-9", "text": ", 2001. You're coming in Monday, September 7th at 2:30 PM with Dr. Elena Rivera for your leg fracture \u2014 is that all"}
+{"kind": "LLMTextDelta", "seq": 140, "t": 406304.33984575, "request_id": "req-9", "text": " correct?"}
+{"kind": "LLMCompleted", "seq": 141, "t": 406304.35143075, "request_id": "req-9", "text": "Perfect. I'm holding that for you. So to confirm: you're Joe. Your date of birth is March 5th, 2001. You're coming in Monday, September 7th at 2:30 PM with Dr. Elena Rivera for your leg fracture \u2014 is that all correct?", "stop_reason": "end_turn"}
+{"kind": "ModelRouted", "seq": 142, "t": 406304.352310625, "request_id": "req-10", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 143, "t": 406304.352491041, "request_id": "req-10"}
+{"kind": "LLMTextDelta", "seq": 144, "t": 406304.970089875, "request_id": "req-10", "text": "I"}
+{"kind": "LLMTextDelta", "seq": 145, "t": 406305.276793916, "request_id": "req-10", "text": " apologize for the confusion. Let me just confirm \u2014 you're all set for Monday, September 7th at 2:30 PM with Dr. Elena Rivera for your"}
+{"kind": "LLMTextDelta", "seq": 146, "t": 406305.355116291, "request_id": "req-10", "text": " leg fracture. Is that correct?"}
+{"kind": "ProviderDegraded", "seq": 147, "t": 406305.35695425, "provider": "tts", "reason": "Context closed"}
+{"kind": "BotStoppedSpeaking", "seq": 148, "t": 406305.357373833, "utterance_id": "utt-7", "completed": false}
+{"kind": "LLMCompleted", "seq": 149, "t": 406305.361443458, "request_id": "req-10", "text": "I apologize for the confusion. Let me just confirm \u2014 you're all set for Monday, September 7th at 2:30 PM with Dr. Elena Rivera for your leg fracture. Is that correct?", "stop_reason": "end_turn"}
+{"kind": "BotStartedSpeaking", "seq": 150, "t": 406305.388128875, "utterance_id": "utt-7"}
+{"kind": "ProviderDegraded", "seq": 151, "t": 406305.435918333, "provider": "tts", "reason": "Context closed"}
+{"kind": "BotStoppedSpeaking", "seq": 152, "t": 406305.436260333, "utterance_id": "utt-7", "completed": false}
+{"kind": "BotStoppedSpeaking", "seq": 153, "t": 406306.122658833, "utterance_id": "utt-7", "completed": true}
+{"kind": "FinalTranscript", "seq": 154, "t": 406312.042173916, "text": "Hello?", "confidence": 0.94311523}
+{"kind": "ModelRouted", "seq": 155, "t": 406312.043343375, "request_id": "req-11", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 156, "t": 406312.043501875, "request_id": "req-11"}
+{"kind": "LLMTextDelta", "seq": 157, "t": 406312.713103583, "request_id": "req-11", "text": "I"}
+{"kind": "IntentClassified", "seq": 158, "t": 406312.969128083, "intent": "unknown", "confidence": 0.95, "latency_ms": 910.456207988318}
+{"kind": "LLMTextDelta", "seq": 159, "t": 406313.018385083, "request_id": "req-11", "text": "'m sorry about that, Joe. Let me confirm your appointment: Monday, September 7th at 2:30 PM"}
+{"kind": "LLMTextDelta", "seq": 160, "t": 406313.169982583, "request_id": "req-11", "text": " with Dr. Elena Rivera for your leg fracture \u2014 does that sound right?"}
+{"kind": "BotStartedSpeaking", "seq": 161, "t": 406313.171295833, "utterance_id": "utt-8"}
+{"kind": "LLMCompleted", "seq": 162, "t": 406313.183076583, "request_id": "req-11", "text": "I'm sorry about that, Joe. Let me confirm your appointment: Monday, September 7th at 2:30 PM with Dr. Elena Rivera for your leg fracture \u2014 does that sound right?", "stop_reason": "end_turn"}
+{"kind": "BotStoppedSpeaking", "seq": 163, "t": 406323.332013125, "utterance_id": "utt-8", "completed": true}
+{"kind": "PartialTranscript", "seq": 164, "t": 406324.588120208, "text": "Yeah."}
+{"kind": "FinalTranscript", "seq": 165, "t": 406325.079147875, "text": "Yeah.", "confidence": 0.9941406}
+{"kind": "ModelRouted", "seq": 166, "t": 406325.079804375, "request_id": "req-12", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 167, "t": 406325.079946291, "request_id": "req-12"}
+{"kind": "IntentClassified", "seq": 168, "t": 406326.049369625, "intent": "unknown", "confidence": 0.95, "latency_ms": 951.2542079901323}
+{"kind": "LLMToolUse", "seq": 169, "t": 406327.29485825, "request_id": "req-12", "tool_call_id": "toolu_01JMKshpGbVQG6mggPi7MvpY", "name": "confirm_booking", "arguments": {"hold_id": "7e3dcc02-2a7b-483c-b63a-2f23037d7422", "patient_name": "Joe", "reason": "leg fracture", "date_of_birth": "03/05/2001", "new_patient": true, "symptom_notes": "Leg fracture sustained while playing pickleball."}}
+{"kind": "LLMCompleted", "seq": 170, "t": 406327.295369791, "request_id": "req-12", "text": "", "stop_reason": "tool_use"}
+{"kind": "ToolCompleted", "seq": 171, "t": 406327.456316541, "tool_call_id": "toolu_01JMKshpGbVQG6mggPi7MvpY", "name": "confirm_booking", "result": {"ok": true, "confirmation_id": "E938C8F6", "slot_id": 14, "provider_name": "Dr. Elena Rivera", "start_time": "2026-09-07T14:30:00+00:00", "patient_name": "Joe", "date_of_birth": "03/05/2001", "new_patient": true, "symptom_notes": "Leg fracture sustained while playing pickleball.", "display_time": "Monday, September 7 at 2:30 PM"}, "ok": true, "latency_ms": 159.10970797995105, "http_status": 200}
+{"kind": "ModelRouted", "seq": 172, "t": 406327.456762041, "request_id": "req-13", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 173, "t": 406327.456863875, "request_id": "req-13"}
+{"kind": "LLMTextDelta", "seq": 174, "t": 406328.281414125, "request_id": "req-13", "text": "You"}
+{"kind": "LLMTextDelta", "seq": 175, "t": 406328.570987833, "request_id": "req-13", "text": "'re all set, Joe. Your appointment is Monday, September 7th at 2:30 PM with Dr. Elena Rivera. Your confirmation number is E938C8F6."}
+{"kind": "BotStartedSpeaking", "seq": 176, "t": 406328.723053916, "utterance_id": "utt-9"}
+{"kind": "LLMTextDelta", "seq": 177, "t": 406328.822167833, "request_id": "req-13", "text": " Please arrive 15 minutes early to complete paperwork. Is there anything else I can help you with?"}
+{"kind": "LLMCompleted", "seq": 178, "t": 406328.83339425, "request_id": "req-13", "text": "You're all set, Joe. Your appointment is Monday, September 7th at 2:30 PM with Dr. Elena Rivera. Your confirmation number is E938C8F6. Please arrive 15 minutes early to complete paperwork. Is there anything else I can help you with?", "stop_reason": "end_turn"}
+{"kind": "BotStoppedSpeaking", "seq": 179, "t": 406345.284005083, "utterance_id": "utt-9", "completed": true}
+{"kind": "SpeechStarted", "seq": 180, "t": 406346.987493166}
+{"kind": "PartialTranscript", "seq": 181, "t": 406347.056935625, "text": "No. Thank you."}
+{"kind": "SpeechStopped", "seq": 182, "t": 406347.366982833}
+{"kind": "FinalTranscript", "seq": 183, "t": 406347.695194625, "text": "No. Thank you.", "confidence": 0.9980469}
+{"kind": "ModelRouted", "seq": 184, "t": 406347.696356958, "request_id": "req-14", "tier": "standard", "model": "claude-haiku-4-5-20251001", "reason": "schedule_appointment dialogue"}
+{"kind": "LLMStarted", "seq": 185, "t": 406347.696569083, "request_id": "req-14"}
+{"kind": "LLMTextDelta", "seq": 186, "t": 406348.413148083, "request_id": "req-14", "text": "You"}
+{"kind": "IntentClassified", "seq": 187, "t": 406348.45337925, "intent": "unknown", "confidence": 0.95, "latency_ms": 736.8083749897778}
+{"kind": "LLMTextDelta", "seq": 188, "t": 406348.716436708, "request_id": "req-14", "text": "'re all set, Joe \u2014 Monday, September 7th at 2:30 PM, confirmation E938 - C"}
+{"kind": "LLMTextDelta", "seq": 189, "t": 406348.967206375, "request_id": "req-14", "text": "8F6. Wishing you a smooth visit and a quick recovery."}
+{"kind": "LLMCompleted", "seq": 190, "t": 406348.978889916, "request_id": "req-14", "text": "You're all set, Joe \u2014 Monday, September 7th at 2:30 PM, confirmation E938 - C8F6. Wishing you a smooth visit and a quick recovery.", "stop_reason": "end_turn"}
+{"kind": "BotStartedSpeaking", "seq": 191, "t": 406349.147331833, "utterance_id": "utt-10"}
+{"kind": "BotStoppedSpeaking", "seq": 192, "t": 406361.707612541, "utterance_id": "utt-10", "completed": true}
