@@ -579,6 +579,9 @@ Phases 9 (Postgres + Supabase), 10 (in-house event loop), 11 (concurrency + load
 **first real runs** (partial — 3 of 19 cases) and produced the prompt-caching result below.
 
 **Phase 15 — reliability (2026-09-05). ✅ Built and verified entirely offline; no call placed.**
+Shipped on branch `phase15-reliability` (commit `6ee2d1a`) — **check whether it has been merged
+into `main` before assuming the code is there**; if `git log main --oneline -1` does not show it,
+`git merge phase15-reliability` first.
 Plan: `/Users/uvnikhil/.claude/plans/vast-dancing-scott.md`. Full detail: `docs/build_spec.md` →
 *Phase 15*. The rules that are easy to break:
 
