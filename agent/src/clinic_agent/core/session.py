@@ -55,6 +55,7 @@ from .adapters.llm import AnthropicLLM, shared_anthropic_client
 from .adapters.media import LiveKitMedia, LocalMedia, MediaAdapter
 from .adapters.stt import DeepgramSTT
 from .adapters.tools import ToolExecutor
+from .otel import OtelExporter, otel_enabled
 from .adapters.tts import CartesiaTTS
 from .adapters.turn import TurnEngine
 from .llm_router import LLMRouter
@@ -94,6 +95,10 @@ class CallSession:
         self.metrics = LatencyCollector(mode=settings.mode, call_id=call_id)
         self.call_id = self.metrics.call_id
         self._recorder = TraceRecorder(self.call_id, enabled=record)
+        # Phase 16. One OTel trace per call, built from the same event stream at teardown.
+        # `None` unless CLINIC_OTEL_ENDPOINT is set, so the SDK is never imported on a machine
+        # that is not exporting anywhere.
+        self._otel = OtelExporter(self.call_id) if otel_enabled() else None
 
         # --- adapters -------------------------------------------------------------------
         # Built through overridable factories rather than inline, so a subclass can swap any
@@ -247,6 +252,8 @@ class CallSession:
         while True:
             event = await self._queue.get()
             self._recorder.record(event)
+            if self._otel is not None:
+                self._otel.record(event)
             telemetry.record_event(self.metrics, event)
             self._notify_turn_engine(event)
 
@@ -343,6 +350,8 @@ class CallSession:
         self.metrics.finalize()
         await self._ship_metrics()
         self._recorder.close()  # flush the buffered tail and release the descriptor
+        if self._otel is not None:
+            self._otel.close()  # builds the span tree and ships it; swallows its own failures
 
         for closer in (self._stt.aclose, self._tts.aclose, self.media.aclose,
                        self._tools.aclose, self._llm.aclose, self._classifier.aclose):
