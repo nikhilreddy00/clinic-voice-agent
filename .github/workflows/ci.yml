@@ -1,0 +1,145 @@
+# Phase 16 — the gate.
+#
+# Until this file existed, every defect in CLAUDE.md was found by a human reading
+# logs/traces/*.jsonl after a live call. The suites were all there; nothing ran them.
+#
+# TWO JOBS, AND THE SPLIT IS ABOUT MONEY, NOT SPEED
+# -------------------------------------------------
+# `offline` runs on every push and pull request. It needs no API key, places no call, and costs
+# nothing, so it can block merge. It is the whole of ./run_e2e.sh — real reducer, real tool
+# executor, real HTTP, real Postgres — plus the Tier-1 replay and the landing-page claims.
+#
+# `evals` drives real models: 81 promptfoo cases and the full intent suite. That bills per run,
+# so it is opt-in — add the `run-evals` label to a pull request, or launch it by hand. It is a
+# release check, not a per-commit one, and CLAUDE.md's credit-conservation rule is why.
+#
+# WHAT THIS CANNOT CATCH: a prompt rule that is reworded rather than removed. `offline` asserts
+# the rules are PRESENT (agent/tests/test_prompt_contract.py); only `evals` can tell you whether
+# the model still obeys them. Do not read a green `offline` as "the prompt is fine".
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    name: offline gate (no keys, no cost)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Phase 9 moved the data layer to Postgres; every state transition is a
+        # compare-and-swap, so a SQLite stand-in would not exercise the thing under test.
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          # run_e2e.sh defaults to 55432, matching the throwaway cluster CLAUDE.md sets up
+          # locally. Same port in both places means one command with no CI-only flags.
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install postgresql-client
+        # run_e2e.sh uses pg_isready and createdb to bring up its scratch databases.
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Sync dependencies
+        run: |
+          (cd scheduling_api && uv sync --extra dev)
+          (cd agent && uv sync --extra dev)
+          (cd session_router && uv sync --extra dev)
+
+      - name: run_e2e.sh — every offline suite, the seam included
+        # scheduling_api (90) + agent unit and end-to-end + session_router (26) + Tier-1 replay
+        # + the emergency detector. The e2e suite refuses to run unless the API reports the
+        # scratch database by name, so a misconfigured runner is a skip, never a false pass.
+        run: ./run_e2e.sh
+
+      - name: Landing-page claims still match the code
+        run: python3 site/check_page.py
+
+  evals:
+    name: model evals (billed — label `run-evals` or dispatch)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-evals')
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install postgresql-client
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Sync dependencies
+        run: |
+          (cd scheduling_api && uv sync --extra dev)
+          (cd agent && uv sync --extra dev)
+
+      - name: Fail fast without a key
+        # Better than 81 cases erroring one at a time with an auth message each.
+        run: test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY secret is not set"; exit 1; }
+
+      - name: Intent eval — emergency recall must be 100%
+        run: agent/.venv/bin/python eval/run_intent_eval.py
+
+      - name: Per-intent behavioural evals (promptfoo)
+        # WITH cache, unlike run.sh's manual --no-cache: unchanged cases replay instead of
+        # re-billing. The no-cache run is for when the prompt itself is being iterated on.
+        working-directory: eval/promptfoo
+        run: npx --yes promptfoo@latest eval --no-progress-bar

@@ -619,6 +619,42 @@ def test_a_new_caller_turn_restores_the_nudge_after_a_tool_turn():
     assert [a for a in produced if isinstance(a, StartLLM)]
 
 
+def test_a_read_back_after_a_successful_tool_is_never_nudged():
+    """The 2026-09-03 truncation, and until Phase 16 nothing asserted it.
+
+    `hold_slot` succeeded; the follow-up request narrates the result — "I'm holding that for
+    you. So I have you as Olivia..." — and makes no tool call of its own, because there is
+    nothing left to call. `turn_tool_uses` is cleared at the end of every request and
+    `committed_tool_ids` when results are flushed, so without `turn_had_tool` that read-back
+    looks exactly like an empty promise.
+
+    What the nudge costs here is not "one extra request": starting it closes the live TTS
+    context. Trace 20260903T215242896036Z at t=130.4 — Cartesia reported `Context closed`,
+    `BotStoppedSpeaking` arrived with `completed: false` 1.06 s into an ~8 second sentence, and
+    the nudge's own reply was queued to the dying context and never spoken. The caller heard
+    "...So I have you as Ol—", then 6.5 s of silence, on the confirmation read-back.
+    """
+    d = _greeted()
+    rid = _turn(d, "Yeah. Sure.")
+    d.send(ev.LLMToolUse(request_id=rid, tool_call_id="tu-1", name="hold_slot",
+                         arguments={"slot_id": 5}))
+    d.send(ev.LLMCompleted(request_id=rid, stop_reason="tool_use"))
+    d.send(ev.ToolCompleted(tool_call_id="tu-1", name="hold_slot", ok=True,
+                            result={"ok": True, "hold_id": "h-1", "slot_id": 5},
+                            latency_ms=120.0, http_status=200))
+
+    follow = d.state.request_id
+    d.send(ev.LLMTextDelta(request_id=follow, text="I'm holding that for you. "))
+    d.send(ev.LLMTextDelta(request_id=follow, text="So I have you as Olivia."))
+    produced = d.send(ev.LLMCompleted(request_id=follow, stop_reason="end_turn"))
+
+    assert not [a for a in produced if isinstance(a, StartLLM)], (
+        "nudged a read-back whose tool had already succeeded — this closes the live TTS "
+        "context and truncates the sentence the caller is listening to"
+    )
+    assert d.state.nudged is False
+
+
 def test_a_promise_that_ends_by_asking_the_caller_something_is_not_nudged():
     """Live truncation bug, trace 20260904T173146047919Z at t=34.0.
 

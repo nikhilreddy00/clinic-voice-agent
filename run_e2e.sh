@@ -19,7 +19,10 @@ if ! pg_isready -h 127.0.0.1 -p "$PGPORT" >/dev/null 2>&1; then
     echo "No Postgres on 127.0.0.1:${PGPORT}. Start one (see CLAUDE.md → Running the services)." >&2
     exit 1
 fi
+# clinic_test is the scheduling_api suite's own database. Created here too so a fresh machine
+# (or a CI runner) needs no manual setup step that a developer would have done months ago.
 createdb -h 127.0.0.1 -p "$PGPORT" -U postgres "$DB" 2>/dev/null || true
+createdb -h 127.0.0.1 -p "$PGPORT" -U postgres clinic_test 2>/dev/null || true
 
 echo "==> scheduling API on :${PORT} (database ${DB})"
 ( cd "$ROOT/scheduling_api" && CLINIC_DATABASE_URL="$URL" \
@@ -44,6 +47,9 @@ echo "==> agent (unit + end-to-end through the real API)"
 
 echo "==> session_router"
 ( cd "$ROOT/session_router" && uv run pytest -q )
+
+echo "==> tier 1 — recorded calls replayed through the reducer (no API calls, no cost)"
+"$ROOT/agent/.venv/bin/python" "$ROOT/eval/tier1_replay.py"
 
 echo "==> emergency detector (no API calls, no cost)"
 "$ROOT/agent/.venv/bin/python" "$ROOT/eval/run_intent_eval.py" --detector-only
