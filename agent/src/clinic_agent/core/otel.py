@@ -159,7 +159,7 @@ def spans_from_events(events: list[ev.Event]) -> SpanSpec | None:
     # assume. Adding a TransferSucceeded event is the honest fix if this is ever needed.
     transfer_failed_reason = ""
     degraded: list[str] = []
-    intent = ""
+    intent_counts: dict[str, int] = {}
 
     # Open stage windows, keyed by what closes them.
     stt_open: float | None = None
@@ -187,8 +187,17 @@ def spans_from_events(events: list[ev.Event]) -> SpanSpec | None:
             # the call and dominating every percentile.
             if current is not None and current.end <= current.start:
                 current.end = t
-            current = SpanSpec(name="turn", start=t, end=t,
-                               attributes=_attrs(turn__index=len(turns)))
+            current = SpanSpec(name="turn", start=t, end=t, attributes=_attrs(
+                turn__index=len(turns),
+                # Always present, never omitted-when-false. TraceQL's `span.turn.held != true`
+                # does NOT match a span that lacks the attribute, so an optional flag excludes
+                # every ordinary turn from the panel meant to show ordinary turns.
+                turn__held=False,
+                turn__interrupted=False,
+                # Denormalized from the call so a per-TURN query can filter by mode. The
+                # alternative is a structural TraceQL join for something that is one short enum.
+                call__mode=mode,
+            ))
             turns.append(current)
             root.children.append(current)
             stt_open = t
@@ -246,7 +255,7 @@ def spans_from_events(events: list[ev.Event]) -> SpanSpec | None:
                             )))
 
         elif isinstance(event, ev.IntentClassified):
-            intent = event.intent
+            intent_counts[event.intent] = intent_counts.get(event.intent, 0) + 1
             if current is not None:
                 current.attributes["turn.intent"] = event.intent
             attach(SpanSpec(name="classifier", start=t - event.latency_ms / 1000, end=t,
@@ -292,11 +301,23 @@ def spans_from_events(events: list[ev.Event]) -> SpanSpec | None:
         call__booked=booked or None,
         call__transfer_failed_reason=transfer_failed_reason or None,
         call__degraded=",".join(sorted(set(degraded))) or None,
-        # The last intent the classifier settled on. Intent is sticky (`intents.resolve_intent`),
-        # so on a call that stayed on one task this is that task.
-        call__intent=intent or None,
+        # What the call was ABOUT: the intent classified on the most turns, ignoring
+        # `unknown`. Taking the LAST classification instead labelled every recorded call
+        # "unknown", because the last thing a caller says is "thanks, bye" — the panel was
+        # a single flat series and looked like a query bug rather than a labelling one.
+        # The reducer's sticky intent (`intents.resolve_intent`) is the real answer and this
+        # mapper is pure over events, so it cannot see it; the mode is the closest honest
+        # approximation the stream itself supports.
+        call__intent=_dominant_intent(intent_counts),
     )
     return root
+
+
+def _dominant_intent(counts: dict[str, int]) -> str | None:
+    """The most-classified real intent. `unknown` only wins if it is all there ever was."""
+    real = {k: v for k, v in counts.items() if k and k != "unknown"}
+    pool = real or counts
+    return max(pool, key=lambda k: pool[k]) if pool else None
 
 
 def _error_class(message: str) -> str:

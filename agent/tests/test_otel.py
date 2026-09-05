@@ -374,3 +374,64 @@ def test_the_credential_is_read_in_either_form(raw, expected):
     from clinic_agent.core.otel import _parse_headers
 
     assert _parse_headers(raw) == expected
+
+
+# --- attributes a dashboard query can actually rely on --------------------------------------
+
+
+def test_turn_flags_are_always_present_never_omitted_when_false():
+    """TraceQL does not match a span that LACKS an attribute.
+
+    `span.turn.held != true` therefore excludes every ordinary turn, not just the held ones —
+    which rendered the voice-to-voice latency panel as "No data" and read like a query bug.
+    Emitting the flag on every turn is the fix, and it belongs here rather than in the query.
+    """
+    for turn in _by_name(spans_from_events(_booking_turn()), "turn"):
+        assert turn.attributes["turn.held"] is False
+        assert turn.attributes["turn.interrupted"] is False
+
+
+def test_a_turn_carries_the_call_mode_so_per_turn_queries_can_filter_by_it():
+    """Denormalized deliberately: the alternative is a structural TraceQL join for one short
+    enum, on the panel most likely to be looked at."""
+    for turn in _by_name(spans_from_events(_booking_turn()), "turn"):
+        assert turn.attributes["call.mode"] == "telephony"
+
+
+def test_call_intent_is_what_the_call_was_about_not_the_last_thing_said():
+    """The last utterance of a call is "thanks, bye", which classifies as `unknown`.
+
+    Taking the last classification labelled all seven recorded calls "unknown" — the "calls by
+    intent" panel was one flat series and looked like a broken query rather than a broken
+    label. The dominant real intent is the closest honest answer a pure mapper can give; the
+    reducer's sticky intent is the true one and is not in the event stream.
+    """
+    stream = _stream(
+        ev.CallStarted(t=0.0, call_id="C", mode="telephony"),
+        ev.SpeechStopped(t=1.0),
+        ev.IntentClassified(t=1.5, intent="cancel_appointment", confidence=0.94, latency_ms=800),
+        ev.SpeechStopped(t=3.0),
+        ev.IntentClassified(t=3.5, intent="cancel_appointment", confidence=0.91, latency_ms=800),
+        ev.SpeechStopped(t=5.0),
+        ev.IntentClassified(t=5.5, intent="unknown", confidence=0.95, latency_ms=800),
+        ev.Hangup(t=6.0),
+    )
+    assert spans_from_events(stream).attributes["call.intent"] == "cancel_appointment"
+
+
+def test_a_call_that_was_only_ever_unknown_says_so():
+    stream = _stream(
+        ev.CallStarted(t=0.0, call_id="C", mode="local"),
+        ev.SpeechStopped(t=1.0),
+        ev.IntentClassified(t=1.5, intent="unknown", confidence=0.95, latency_ms=800),
+        ev.Hangup(t=2.0),
+    )
+    assert spans_from_events(stream).attributes["call.intent"] == "unknown"
+
+
+def test_a_call_with_no_classifier_has_no_intent_rather_than_a_guess():
+    root = spans_from_events(_stream(
+        ev.CallStarted(t=0.0, call_id="C", mode="local"),
+        ev.Hangup(t=1.0),
+    ))
+    assert "call.intent" not in root.attributes

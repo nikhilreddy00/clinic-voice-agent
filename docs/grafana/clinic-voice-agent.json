@@ -1,5 +1,5 @@
 {
-  "__comment": "Phase 16 — Grafana dashboard over the OTel traces core/otel.py exports. Import: Grafana -> Dashboards -> New -> Import -> Upload JSON, then pick your Tempo datasource. Every panel is a TraceQL metrics query; there is no Prometheus side to configure. NOTE: turn-latency panels exclude span.turn.held, because a HELD turn (the caller paused mid-sentence and core/endpointing.py bought them grace) has no reply and its span runs until they speak again — including those measures how long callers think, not how fast the agent is.",
+  "__comment": "Phase 16 — Grafana dashboard over the OTel traces core/otel.py exports. Import: Grafana -> Dashboards -> New -> Import -> Upload JSON, then pick your Tempo datasource. Every panel is a TraceQL metrics query; there is no Prometheus side to configure. TWO THINGS THAT LOOK LIKE QUERY BUGS AND ARE NOT: turn-latency panels filter span.turn.held = false, because a HELD turn (the caller paused mid-sentence and core/endpointing.py bought them grace) has no reply and its span runs until they speak again — including those measures how long callers think, not how fast the agent is; and the filter is written = false rather than != true because TraceQL does not match a span that LACKS the attribute, which is why otel.py emits turn.held on every turn instead of only when set.",
   "title": "Clinic Voice Agent",
   "uid": "clinic-voice-agent",
   "tags": ["voice", "otel", "clinic"],
@@ -46,7 +46,7 @@
         {
           "refId": "A",
           "queryType": "traceql",
-          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held != true && span.call.mode =~ \"$mode\"} | quantile_over_time(duration, .5, .95, .99)"
+          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held = false && span.call.mode =~ \"$mode\"} | quantile_over_time(duration, .5, .95, .99)"
         }
       ],
       "fieldConfig": {
@@ -136,7 +136,7 @@
     {
       "type": "timeseries",
       "title": "Calls by intent",
-      "description": "Intent is sticky (intents.resolve_intent), so this is the task the call settled on rather than whatever the first utterance sounded like.",
+      "description": "The intent classified on the MOST turns of the call, ignoring `unknown`. Taking the last classification instead labelled every call `unknown`, because the last thing a caller says is \"thanks, bye\". The reducer's sticky intent is the true answer and is not in the event stream, so this is the closest a pure mapper can get.",
       "datasource": { "type": "tempo", "uid": "${tempo}" },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "targets": [
