@@ -351,3 +351,26 @@ def test_the_exporter_is_bounded():
         exporter.record(ev.LLMTextDelta(seq=i, t=float(i), request_id="r", text="x"))
     assert len(exporter._events) == OtelExporter.MAX_EVENTS
     assert exporter._dropped == 100
+
+
+# --- the credential, in the shape Grafana actually hands you --------------------------------
+
+
+@pytest.mark.parametrize("raw, expected", [
+    # OTLP's documented header spec.
+    ("Authorization=Basic abc123", {"Authorization": "Basic abc123"}),
+    ("Authorization=Bearer tok, X-Scope-OrgID=42",
+     {"Authorization": "Bearer tok", "X-Scope-OrgID": "42"}),
+    # What Grafana Cloud's connection-details page gives you: base64(instanceID:token), on its
+    # own. Requiring the header to be hand-assembled around it is a papercut that gets got wrong
+    # once and then debugged as "the exporter is broken".
+    ("MTgxOTUxNTpnbGNfZXlKdklqb2lNVGt3TU==", {"Authorization": "Basic MTgxOTUxNTpnbGNfZXlKdklqb2lNVGt3TU=="}),
+    ("Basic MTgxOTUxNTpnbGNf", {"Authorization": "Basic MTgxOTUxNTpnbGNf"}),
+    # dotenv strips quotes; a shell `export` does not.
+    ('"Authorization=Basic abc"', {"Authorization": "Basic abc"}),
+    ("", {}),
+])
+def test_the_credential_is_read_in_either_form(raw, expected):
+    from clinic_agent.core.otel import _parse_headers
+
+    assert _parse_headers(raw) == expected

@@ -1,0 +1,219 @@
+{
+  "__comment": "Phase 16 — Grafana dashboard over the OTel traces core/otel.py exports. Import: Grafana -> Dashboards -> New -> Import -> Upload JSON, then pick your Tempo datasource. Every panel is a TraceQL metrics query; there is no Prometheus side to configure. NOTE: turn-latency panels exclude span.turn.held, because a HELD turn (the caller paused mid-sentence and core/endpointing.py bought them grace) has no reply and its span runs until they speak again — including those measures how long callers think, not how fast the agent is.",
+  "title": "Clinic Voice Agent",
+  "uid": "clinic-voice-agent",
+  "tags": ["voice", "otel", "clinic"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "tempo",
+        "label": "Tempo datasource",
+        "type": "datasource",
+        "query": "tempo",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "mode",
+        "label": "Call mode",
+        "type": "custom",
+        "query": "telephony,local",
+        "current": { "text": "telephony", "value": "telephony" },
+        "includeAll": true,
+        "allValue": ".*",
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Latency — the number a caller actually feels",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Voice-to-voice per turn (p50 / p95 / p99)",
+      "description": "SpeechStopped -> BotStartedSpeaking, the same boundary every latency number in this project uses. Held turns are excluded: they have no reply and their span runs until the caller speaks again. Phase-14 exit criterion is p50 <= 1200 ms / p95 <= 2000 ms.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held != true && span.call.mode =~ \"$mode\"} | quantile_over_time(duration, .5, .95, .99)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1.2 },
+              { "color": "red", "value": 2.0 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per stage, p95 — which stage is the slow one",
+      "description": "The whole point of splitting the turn. A single voice-to-voice number cannot say whether a slow call is the model, the endpointer, or the speech queue, and those have completely different fixes. Measured 2026-09-04, LLM TTFT was ~50% of every turn.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && (name=\"stt\" || name=\"llm\" || name=\"classifier\" || name=\"tts\")} | quantile_over_time(duration, .95) by (name)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2 } } }
+    },
+    {
+      "type": "row",
+      "title": "Tools — did the thing the agent said it did actually happen",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 10 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tool calls by endpoint",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 11 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && span.tool.name != nil} | rate() by (span.tool.name)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tool failures",
+      "description": "A 403, 404 or 409 is an ANSWER, not a failure — wrong DOB, no such appointment, slot just taken — and the model handles all three in dialogue. What matters here is tool.ok=false, and a sustained rise in it is what the Phase-15 degradation ladder reacts to.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 11 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && span.tool.ok = false} | rate() by (span.tool.name)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "fixed", "fixedColor": "red" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tool latency p95 by endpoint",
+      "description": "Anchored backwards from ToolCompleted's measured latency_ms — there is no ToolStarted event, and inventing one would mean a second source of truth for the same number.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 11 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && span.tool.name != nil} | quantile_over_time(duration, .95) by (span.tool.name)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "type": "row",
+      "title": "Calls — volume, intent, and what went wrong",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Calls by intent",
+      "description": "Intent is sticky (intents.resolve_intent), so this is the task the call settled on rather than whatever the first utterance sounded like.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"call\"} | rate() by (span.call.intent)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Bookings completed",
+      "description": "call.booked is set only by a confirm_booking tool call the API accepted. It is deliberately NOT set by anything the model said: the worst failure this system can have is a caller hanging up believing they have an appointment, and a booking counter sourced from speech would count exactly those.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && span.call.booked = true} | rate()"
+        }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Provider degradation + failed transfers",
+      "description": "ProviderDegraded with fatal=false is one socket blipping while the adapter reconnects; fatal=true means it is not coming back and the call goes to a person. A failed transfer is the worst of both — the caller was promised a human and the hand-off did not happen.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"provider.degraded\"} | rate() by (span.provider.name, span.provider.fatal)"
+        },
+        {
+          "refId": "B",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && span.call.transfer_failed_reason != nil} | rate()"
+        }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" } } }
+    },
+    {
+      "type": "row",
+      "title": "Speech recognition",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 28 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Endpointing grace held",
+      "description": "core/endpointing.py holds the turn when the caller pauses mid-sentence. Measured across 14 calls it is 90% precise and costs 5.5 s total; a sustained rise here means Deepgram's 300 ms window is cutting people off more often, which is a change in caller behaviour or in the audio path, not in this code.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 29 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && span.turn.held = true} | rate()"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Barge-ins per call",
+      "description": "The caller interrupting the agent. Some of this is healthy; a spike is usually the agent being too wordy or the endpointer answering a fragment.",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 29 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"clinic-voice-agent\" && span.turn.interrupted = true} | rate()"
+        }
+      ]
+    }
+  ]
+}

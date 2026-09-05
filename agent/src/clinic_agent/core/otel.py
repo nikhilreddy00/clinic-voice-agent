@@ -53,6 +53,7 @@ part of it that is free today.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -314,15 +315,37 @@ def otel_enabled() -> bool:
     return bool(os.getenv("CLINIC_OTEL_ENDPOINT"))
 
 
+# A header NAME is a short token. A base64 credential is long, and its only "=" is the padding
+# at the very end — so the left-hand side of its first split is the whole blob and the right-hand
+# side is empty. That is what separates the two forms below.
+_HEADER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,39}")
+
+
 def _parse_headers(raw: str) -> dict[str, str]:
-    """`"k=v,k2=v2"` — the OTEL_EXPORTER_OTLP_HEADERS convention, so a Grafana Cloud snippet
-    pastes in unchanged."""
-    out = {}
-    for pair in raw.split(","):
-        if "=" in pair:
-            key, _, value = pair.partition("=")
-            out[key.strip()] = value.strip()
-    return out
+    """Accept either OTLP's `"k=v,k2=v2"` header spec or a bare Grafana Cloud credential.
+
+    Grafana's connection-details page hands you `base64(instanceID:token)` and nothing else, so
+    requiring `Authorization=Basic <blob>` means hand-assembling a header — a papercut that gets
+    got wrong once and then debugged as "the exporter is broken". Both forms work.
+    """
+    raw = raw.strip().strip('"').strip("'")
+    if not raw:
+        return {}
+
+    pairs: dict[str, str] = {}
+    for part in raw.split(","):
+        name, sep, value = part.partition("=")
+        # `value.strip("=")` is the discriminator: a base64 blob's only "=" is its trailing
+        # padding, so splitting one yields a value made entirely of "=" — never a real header.
+        if not (sep and value.strip().strip("=") and _HEADER_NAME.fullmatch(name.strip())):
+            pairs = {}
+            break
+        pairs[name.strip()] = value.strip()
+    if pairs:
+        return pairs
+
+    scheme = "" if raw.lower().startswith(("basic ", "bearer ")) else "Basic "
+    return {"Authorization": f"{scheme}{raw}"}
 
 
 class OtelExporter:
@@ -368,13 +391,19 @@ class OtelExporter:
                 return
             if self._dropped:
                 logger.warning(f"[otel] {self._dropped} events over the cap were not traced")
-            export_spans(root, self._to_ns, service_name=self.service_name)
+            if not export_spans(root, self._to_ns, service_name=self.service_name):
+                logger.warning("[otel] span export did not flush — the backend rejected it")
         except Exception as exc:  # noqa: BLE001 - telemetry must never fail a call
             logger.warning(f"[otel] export failed: {exc}")
 
 
-def export_spans(root: SpanSpec, to_ns, *, service_name: str = "clinic-voice-agent") -> None:
-    """Emit one span tree through OTLP/HTTP. Imports the SDK lazily, on first use."""
+def export_spans(root: SpanSpec, to_ns, *, service_name: str = "clinic-voice-agent") -> bool:
+    """Emit one span tree through OTLP/HTTP. Imports the SDK lazily, on first use.
+
+    Returns whether the flush completed. The SDK reports a rejected batch by logging and
+    returning False, never by raising — so ignoring this return is how "exported 7 traces"
+    gets printed for seven traces that went nowhere.
+    """
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -383,13 +412,14 @@ def export_spans(root: SpanSpec, to_ns, *, service_name: str = "clinic-voice-age
     global _PROVIDER
     if _PROVIDER is None:
         exporter = OTLPSpanExporter(
-            endpoint=os.getenv("CLINIC_OTEL_ENDPOINT", "").rstrip("/") + "/v1/traces",
+            endpoint=os.getenv("CLINIC_OTEL_ENDPOINT", "").strip().strip('"').rstrip("/")
+            + "/v1/traces",
             headers=_parse_headers(os.getenv("CLINIC_OTEL_HEADERS", "")),
         )
         _PROVIDER = TracerProvider(resource=Resource.create({"service.name": service_name}))
         _PROVIDER.add_span_processor(BatchSpanProcessor(exporter))
     emit_tree(_PROVIDER.get_tracer("clinic_agent"), root, to_ns)
-    _PROVIDER.force_flush(timeout_millis=3000)
+    return bool(_PROVIDER.force_flush(timeout_millis=5000))
 
 
 # One provider per process, not per call. Each one owns a batch processor and an HTTP session;
