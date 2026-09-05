@@ -132,11 +132,18 @@ class TransferToHuman(Action):
     """Hand the caller to a person, with a reason and enough context for the handoff.
 
     A first-class action rather than only a failure path — an agent that knows what it cannot
-    do is more useful than one that improvises. **There is no live transfer in this build**:
-    Phase 15 implements the warm transfer over LiveKit SIP. Until then the session logs it
-    loudly and the call closes after the spoken hand-off, which is what already happened for
-    no-availability escalations; making it an action means the intent is recorded in the trace
-    rather than being implied by a log line.
+    do is more useful than one that improvises.
+
+    Phase 15 made it real: ``core/transfer.SIPTransfer`` moves the caller's SIP leg with
+    LiveKit's ``TransferSIPParticipant``. Two properties of WHEN it is emitted are load-bearing
+    and easy to undo:
+
+    * the reducer emits it from ``_on_bot_stopped``, once the hand-off line has actually been
+      heard — firing it at the moment the decision is made cuts the caller off mid-sentence,
+      and on the emergency path that sentence is the 911 instruction;
+    * if the transfer cannot happen (no ``CLINIC_TRANSFER_NUMBER``, the local path, a refusal),
+      the adapter emits ``TransferFailed`` and the caller still hears a callback promise. A
+      hand-off that ends in a click is worse than never having offered one.
     """
 
     reason: str

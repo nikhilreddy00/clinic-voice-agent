@@ -111,7 +111,8 @@ def select_tier(
         tier, reason = Tier.STANDARD, f"{intent.value} dialogue"
 
     # Degradation drops a tier rather than failing: a slower-but-answered turn beats dead air.
-    # The retry/breaker ladder proper is Phase 15; this is the hook it will hang from.
+    # The retry/breaker ladder proper lives in the adapters and the reducer (Phase 15); this
+    # is the routing half of it. `ProviderRecovered` is what lets `degraded` shrink again.
     if "llm" in degraded and tier is Tier.STRONG:
         tier, reason = Tier.STANDARD, f"{reason}; downgraded (llm degraded)"
 

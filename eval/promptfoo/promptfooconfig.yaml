@@ -35,3 +35,4 @@ tests:
   - file://tests/info.yaml
   - file://tests/handoff.yaml
   - file://tests/safety.yaml
+  - file://tests/degraded.yaml

@@ -46,7 +46,7 @@ from clinic_agent.core.intent import (  # noqa: E402
     classifier_messages,
     detect_emergency,
 )
-from clinic_agent.core.reducer import _ACTION_CLAIM, _ACTION_NUDGE  # noqa: E402
+from clinic_agent.core.reducer import _ACTION_CLAIM, _ACTION_NUDGE, _has_tools  # noqa: E402
 from clinic_agent.intents import Intent, resolve_intent  # noqa: E402
 from clinic_agent.prompts import build_system_prompt, caller_context_note  # noqa: E402
 from clinic_agent.scheduling_tools import build_tools_schema  # noqa: E402
@@ -189,12 +189,14 @@ def _respond(v: dict):
     usage = [response.usage.input_tokens, response.usage.output_tokens]
     nudged = False
 
-    # The engine's follow-through nudge, mirrored (reducer._ACTION_CLAIM). A turn that announces
+    # The engine's follow-through nudge, mirrored (reducer._ACTION_CLAIM), INCLUDING its
+    # Phase-15 guard: an intent with no tools is never nudged, because the answer to "why did
+    # you not call one" is "there is none". A turn that announces
     # an action and calls nothing gets exactly one more chance in production, so an eval that
     # scored the first reply alone would be measuring something no caller ever hears — and
     # would report a failure the live system recovers from. The flag is in the output so a test
     # can still assert on the difference.
-    if not calls and _ACTION_CLAIM.search(text or ""):
+    if not calls and _has_tools(intent) and _ACTION_CLAIM.search(text or ""):
         nudged = True
         try:
             follow_up = _client.messages.create(

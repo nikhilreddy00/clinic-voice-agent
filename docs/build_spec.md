@@ -1285,3 +1285,126 @@ The `strong` (1.6 s) / `weak` (0.7 s) split is doing real work and the weak tier
 and that is the provider's number, not an orchestration one.
 - **Not measured on a phone yet.** Everything above is offline; the clause split changes how the
   agent sounds and no percentile will report a chopped opening.
+
+---
+
+## Phase 15 — Reliability: failover + warm human transfer
+
+Plan: `~/.claude/plans/vast-dancing-scott.md`. This is the phase a clinic buyer asks about
+first, and the one the codebase was most obviously missing: through Phase 14 there was no
+retry anywhere, no circuit breaker, nothing that reconnected a dropped socket, and
+`TransferToHuman` was a log line reading `NOT IMPLEMENTED`.
+
+### What was actually broken (all of it observable in the code, not hypothetical)
+
+| Failure | Behaviour before Phase 15 |
+|---|---|
+| Deepgram socket closes mid-call | `ProviderDegraded` emitted, nothing reconnects — the agent runs the rest of the call **deaf**, with healthy-looking logs |
+| Cartesia socket closes mid-utterance | the reply is sent into a closed connection and dropped — the agent goes **mute** for the rest of the call |
+| Anthropic 429/529, or a stalled stream | one error = one lost turn: scripted apology, caller asked to repeat themselves, no retry and no deadline |
+| Scheduling API slow | up to **10 s of dead air** — the HTTP timeout sat inside the voice turn |
+| Scheduling API / Postgres unreachable | the model apologizes forever; no rung above "try again" |
+| Any escalation (emergency, "I want a human", no availability) | caller told help is coming, reaches **nobody** |
+| A provider recovered | impossible to express — `state.degraded` could only ever grow |
+
+### The ladder
+
+**primary → retry / hedge → scripted line → a person.** Each rung is one place in the code:
+
+1. **Retry** (`core/reliability.is_retryable`, one definition shared by the LLM adapter and the
+   scheduling client). One extra attempt, on transient failures only.
+2. **Hedge** (`adapters/llm.py`, `CLINIC_LLM_TTFT_MS`, default 1,800 ms). No first token by the
+   deadline → a second identical request; the first to produce output claims the turn and the
+   loser is cancelled. Exactly one attempt may emit — a hedge that lets both replies speak is
+   worse than the stall it fixes.
+3. **Reconnect** (`adapters/stt.py`, `adapters/tts.py`). Three attempts, 0.25/0.5/1.0 s, behind
+   a breaker. TTS re-sends the utterance that was in flight, so a dropped socket is a stutter
+   rather than a mute call. Exhausting the attempts emits `ProviderDegraded(fatal=True)`.
+4. **Scripted line** — the existing `SYSTEM_ERROR_LINE`, now only for the *first* failure.
+5. **Transfer** (`core/transfer.py` + the reducer's triggers).
+
+### Why the hedge is same-provider, and not Groq
+
+The phase plan said "fire the secondary and take the winner". Phase 8 measured the only
+available secondary at **4,614 ms TTFT** on the real 5,023-token booking prompt against cached
+Haiku's **621 ms**, and Groq has no prompt caching so it pays full prefill every turn. It cannot
+win the race it would exist to win. Same pattern as Phase 14's semantic-EOU decision: the
+measurement, not the plan, decides. The hedge fires a second Anthropic request, which addresses
+the failure that actually occurs — a stalled or overloaded stream.
+
+A hedge is deliberately **not** written into `state.degraded`. A slow turn is not a sick
+provider, and poisoning that field is exactly the Cartesia-barge-in bug already recorded here.
+
+### Transfer triggers (all pure, all in the reducer)
+
+| Trigger | Threshold |
+|---|---|
+| Caller asks for a person | immediately, abandoning the in-flight model turn |
+| Emergency | after the 911 line has played |
+| LLM failures | 2 consecutive |
+| Tool failures | 2 consecutive **unserved** calls (no status, or 5xx) |
+| No-match (empty finals) | 3 consecutive |
+| ASR confidence < 0.6 | 3 consecutive |
+| `ProviderDegraded(fatal)` | immediately |
+
+A 403, 404 or 409 is an **answer**, not an outage — a wrong date of birth, a cancelled
+appointment, a slot someone else just took. Counting those would transfer a caller to a human
+for mistyping their birthday twice.
+
+### The ordering property
+
+`TransferToHuman` fires from `_on_bot_stopped`, **not** at the moment the decision is made. The
+hand-off line is spoken first and the SIP transfer waits for playback to end. On the emergency
+path the line in question is the 911 instruction, so firing early would cut the caller off
+mid-sentence in the single most important thing this system ever says. Same rule `closing.py`
+already applies to the farewell.
+
+If the transfer cannot happen — no `CLINIC_TRANSFER_NUMBER`, the local path, or LiveKit refuses
+— the adapter emits `TransferFailed` and the reducer speaks `HANDOFF_UNAVAILABLE_LINE` (a
+callback promise the escalation record lets staff keep) and closes cleanly. **A hand-off that
+ends in a click is worse than never having offered one.**
+
+### The dead-air filler
+
+`ToolExecutor` emits `ToolSlow` at `CLINIC_TOOL_FILLER_MS` (2,500 ms) and the reducer speaks one
+"let me pull that up" per caller turn — never twice, never over live speech, never for a tool
+that has already finished. The client timeout drops 10 s → `CLINIC_TOOL_TIMEOUT_S` (5 s).
+
+### Retry safety: which requests may be replayed
+
+`SchedulingClient._send(safe=...)` is narrow on purpose. Reads and the two POSTs carrying a
+stable `Idempotency-Key` (`/hold-slot`, `/confirm-booking`) retry on anything transient.
+`/cancel`, `/reschedule` and `/staff-tasks` retry **only** on a connection error or a gateway
+status — proof the request never reached the application. A retried `/staff-tasks` on a read
+timeout files the caller's refill twice, which is the exact class of bug the idempotency keys
+exist to prevent elsewhere.
+
+### One prompt correction this phase forced
+
+Two prompt fragments said *"There is no live transfer in this build"*. That is now false, and it
+had a measurable effect: on the `speak_to_human` suite the model said "I'm passing you to a
+staff member", the follow-through nudge fired (no tool was called — **there is no tool**, the
+engine performs the hand-off), and the model talked itself back out of it: *"I don't have the
+ability to transfer calls."* Fixed in two places — the prompt now says the system performs the
+hand-off, and `reducer._has_tools` skips the nudge for any intent with no tools at all, because
+on those the answer to "why did you call nothing" is always "there was nothing to call".
+
+### Verification (all offline — no live call was placed for this phase)
+
+| Suite | What it proves |
+|---|---|
+| `tests/test_reliability.py` (17) | breaker states, probe behaviour, the retry policy, no clock reads |
+| `tests/test_llm_resilience.py` (7) | retry, non-retryable failures, breaker, hedge wins/never-fires, cancel-mid-hedge |
+| `tests/test_provider_reconnect.py` (6) | STT/TTS socket death → reconnect, utterance replay, fatal give-up, no teardown race |
+| `tests/test_tool_resilience.py` (11) | the filler's three guards; the safe/unsafe retry split |
+| `tests/test_ladder.py` (19) | every trigger and every threshold, plus the speak-then-transfer ordering |
+| `tests/test_transfer.py` (9) | the `TransferSIPParticipantRequest` shape and every fallback path |
+| `tests/test_chaos.py` (4) | model outage, **API/Postgres partition through a real socket**, worker redeploy under live calls |
+| `eval/promptfoo/tests/degraded.yaml` (9) | what the agent *says* when a tool failed: no invented confirmation number, no "refill sent", no invented appointment list, no enumeration leak |
+
+Agent suite **469 → passing**; `./run_e2e.sh` green (478 with the e2e seam); promptfoo **81/81
+on three consecutive runs**. All 28 recorded traces in `logs/traces/` still replay.
+
+**What is NOT proven offline:** the actual PSTN transfer leg. Everything up to the
+`TransferSIPParticipantRequest` is tested; the leg itself needs a phone and a destination
+number in `CLINIC_TRANSFER_NUMBER`.

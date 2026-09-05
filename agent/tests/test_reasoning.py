@@ -61,13 +61,25 @@ def test_emergency_never_starts_an_llm_request():
     assert not any(isinstance(a, (StartLLM, ClassifyIntent)) for a in produced)
 
 
-def test_emergency_requests_an_urgent_transfer():
+def test_emergency_requests_an_urgent_transfer_AFTER_the_911_line_has_played():
+    """Phase 15 changed WHEN this fires, and the ordering is the safety property.
+
+    The transfer used to be returned in the same breath as the 911 instruction. That was
+    harmless while `TransferToHuman` was a log line; with a real SIP transfer behind it, it
+    would cut the caller off partway through the single most important sentence this system
+    ever says. It now fires when playback of that line ends.
+    """
     d = _greeted()
     produced = d.send(ev.FinalTranscript(text="my husband is unconscious"))
 
+    assert not any(isinstance(a, TransferToHuman) for a in produced)
+    assert d.state.transferring is True
+
+    produced = d.send(ev.BotStoppedSpeaking(utterance_id=d.state.utterance_id))
     transfer = next(a for a in produced if isinstance(a, TransferToHuman))
     assert transfer.urgent is True
     assert transfer.reason == "emergency:consciousness"
+    assert "unconscious" not in transfer.summary, "the summary carries no clinical detail"
 
 
 def test_the_crisis_utterance_never_enters_conversation_history():

@@ -572,16 +572,59 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 14 of 17.**
+**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 15 of 17.**
 Phases 9 (Postgres + Supabase), 10 (in-house event loop), 11 (concurrency + load proof), 12
-(reasoning layer), 13 (memory + verified tool surface) and **14 (latency finish)** are done.
-Phase 8's bake-off harness has had its **first real runs** (partial — 3 of 19 cases) and
-produced the prompt-caching result below.
+(reasoning layer), 13 (memory + verified tool surface), 14 (latency finish) and **15
+(reliability: failover + warm human transfer)** are done. Phase 8's bake-off harness has had its
+**first real runs** (partial — 3 of 19 cases) and produced the prompt-caching result below.
+
+**Phase 15 — reliability (2026-09-05). ✅ Built and verified entirely offline; no call placed.**
+Plan: `/Users/uvnikhil/.claude/plans/vast-dancing-scott.md`. Full detail: `docs/build_spec.md` →
+*Phase 15*. The rules that are easy to break:
+
+  - **`TransferToHuman` now performs a real SIP transfer, and it fires from `_on_bot_stopped`,
+    NOT when the decision is made.** The hand-off line is spoken first and the transfer waits
+    for playback to end. On the emergency path that line is the 911 instruction, so firing early
+    would cut the caller off mid-sentence in the single most important thing this system says.
+    Same rule `closing.py` applies to the farewell. `state.transfer_reason` decides,
+    `transfer_fired` makes it happen at most once.
+  - **A failed transfer must still speak.** No `CLINIC_TRANSFER_NUMBER` (the default — it is
+    unset on purpose), the local path, or a LiveKit refusal emits `TransferFailed`, and the
+    reducer answers with the callback line and a clean close. A hand-off that ends in a click is
+    worse than never having offered one.
+  - **The hedge is same-provider and deliberately so.** `CLINIC_LLM_TTFT_MS` (1,800 ms) fires a
+    second ANTHROPIC request, not Groq: Phase 8 measured Groq at 4,614 ms TTFT on the real
+    5,023-token booking prompt against cached Haiku's 621 ms, so a cross-provider hedge loses
+    every race it would exist to win. A hedge is **never** written to `state.degraded` — a slow
+    turn is not a sick provider, and that field drives the breaker.
+  - **`ProviderDegraded.fatal` is the whole signal.** Non-fatal = one socket blipped and the
+    adapter is reconnecting (3 attempts, 0.25/0.5/1.0 s). Fatal = it is not coming back, and the
+    call goes to a person. `ProviderRecovered` finally lets `degraded` shrink; before it, one
+    blip at turn two downgraded the model tier for the rest of the call.
+  - **Only an UNSERVED tool call counts toward the ladder** — no HTTP status, or 5xx. A 403, 404
+    or 409 is an answer (wrong DOB, no such appointment, slot just taken) and the model handles
+    all three in dialogue. Counting them would transfer a caller for mistyping their birthday
+    twice.
+  - **Retry safety is per-endpoint, not global** (`SchedulingClient._send(safe=...)`). Reads and
+    the two idempotency-keyed POSTs retry on anything transient; `/cancel`, `/reschedule` and
+    `/staff-tasks` retry ONLY on a connection error or a gateway status, because a read timeout
+    is ambiguous and a replayed `/staff-tasks` files the refill twice.
+  - **The follow-through nudge no longer fires on a tool-less intent** (`reducer._has_tools`).
+    On `speak_to_human` the model correctly said "I'm passing you to a staff member", got
+    nudged, and talked itself back out of it — *"I don't have the ability to transfer calls"* —
+    which as of this phase is also false. Two prompt fragments saying "there is no live transfer
+    in this build" were corrected at the same time. **`eval/promptfoo/provider.py` mirrors this
+    guard**; if the nudge rule changes, change it there too or the eval stops measuring the
+    system a caller meets.
+  - Promptfoo is now **81 cases** (the 72 per-intent ones plus `tests/degraded.yaml`), 100% on
+    three consecutive runs. The degraded suite is the fabrication check under failure: no
+    invented confirmation number, no "refill sent", no invented appointment list, no
+    patient-enumeration leak on a failed verification.
 
 ### START HERE — next session
 
-**Next: Phase 15 (reliability: failover + warm human transfer), then 16 (observability + eval at
-market bar), then 17 (BAA-readiness + multi-tenancy).** Full definitions:
+**Next: Phase 16 (observability + eval at market bar), then 17 (BAA-readiness +
+multi-tenancy).** Full definitions:
 `/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md`. All three are buildable and
 testable **offline** — which matters, because:
 
@@ -590,7 +633,9 @@ bill per call and there is one test handset. Do not propose "just place a call t
 verification step. Everything below the microphone is provable offline: `./run_e2e.sh` (real
 reducer, real tool executor, real HTTP, real Postgres), `core.recorder.replay` over the 14
 traces in `logs/traces/`, `eval/run_intent_eval.py --detector-only` (free), and
-`loadtest/tier_a.py` (no keys, no network). Reserve a live call for something that genuinely
+`loadtest/tier_a.py` (no keys, no network), and — since Phase 15 — `tests/test_chaos.py`, which
+kills the model, the scheduling API (a real socket on a dead port) and the worker under live
+calls. Reserve a live call for something that genuinely
 cannot be answered any other way, and say so explicitly when asking for one.
 
 **Phase 14 closed with three of its five planned items cancelled by measurement, not built.**

@@ -33,6 +33,7 @@ from loguru import logger
 
 from .. import events as ev
 from ..audio import OUTPUT_SAMPLE_RATE
+from ..reliability import CircuitBreaker
 
 CARTESIA_URL = "wss://api.cartesia.ai/tts/websocket"
 CARTESIA_VERSION = "2026-03-01"
@@ -41,6 +42,10 @@ EmitFn = Callable[[ev.Event], None]
 PlayFn = Callable[[str, bytes], Awaitable[None]]
 EndFn = Callable[[str], Awaitable[None]]
 ClearFn = Callable[[str], Awaitable[None]]
+ConnectFn = Callable[[], "websockets.ClientConnection"]
+
+# Same shape as the STT adapter's. See core/reliability.py for why three attempts and not more.
+RECONNECT_BACKOFF_S = (0.25, 0.5, 1.0)
 
 
 class CartesiaTTS:
@@ -57,6 +62,7 @@ class CartesiaTTS:
         *,
         model: str = "sonic-3.5",
         sample_rate: int = OUTPUT_SAMPLE_RATE,
+        connect: ConnectFn | None = None,
     ) -> None:
         self._api_key = api_key
         self._voice_id = voice_id
@@ -73,10 +79,22 @@ class CartesiaTTS:
         # audio for a cancelled utterance that was already in flight — drop it.
         self._active: set[str] = set()
 
-    async def start(self) -> None:
-        self._ws = await websockets.connect(
+        # Phase 15. A dropped Cartesia socket used to mute the agent for the rest of the call
+        # (the reply was sent into a closed connection and nothing reconnected). `_pending`
+        # keeps the messages of the utterance in flight so it can be re-sent on the new socket.
+        self._connect = connect or self._default_connect
+        self._breaker = CircuitBreaker("tts", threshold=len(RECONNECT_BACKOFF_S), cooldown_s=5.0)
+        self._pending: dict[str, list[dict]] = {}
+        self._reconnecting = False
+        self._closing = False
+
+    async def _default_connect(self):
+        return await websockets.connect(
             f"{CARTESIA_URL}?api_key={self._api_key}&cartesia_version={CARTESIA_VERSION}"
         )
+
+    async def start(self) -> None:
+        self._ws = await self._connect()
         self._task = asyncio.create_task(self._receive_loop(), name="tts-receive")
         logger.info(f"[tts] cartesia connected (model={self._model}, {self._sample_rate} Hz)")
 
@@ -101,11 +119,12 @@ class CartesiaTTS:
             },
             "add_timestamps": False,
         }
+        self._pending.setdefault(utterance_id, []).append(message)
         try:
             await self._ws.send(json.dumps(message))
         except websockets.ConnectionClosed as exc:
             self._ws = None
-            self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="tts", reason=str(exc)))
+            await self._reconnect(str(exc))
             return
         if final:
             logger.info("TTS  ▶ synthesis flushed for utterance")
@@ -113,12 +132,70 @@ class CartesiaTTS:
     async def cancel(self, utterance_id: str) -> None:
         """Stop synthesis AND drop buffered playback, so the bot goes quiet immediately."""
         self._active.discard(utterance_id)
+        self._pending.pop(utterance_id, None)
         if self._ws is not None:
             try:
                 await self._ws.send(json.dumps({"context_id": utterance_id, "cancel": True}))
             except websockets.ConnectionClosed:
                 self._ws = None
         await self._clear_playback(utterance_id)
+
+    async def _reconnect(self, reason: str) -> None:
+        """Re-open the socket and re-send the utterance that was in flight.
+
+        The caller may hear the opening clause of that utterance twice. That is the ceiling of
+        doing this without a per-sentence ack from Cartesia, and it is plainly better than the
+        alternative this replaces: an agent that goes silent for the rest of the call while
+        every log line still looks healthy.
+        """
+        if self._reconnecting or self._closing:
+            return
+        self._reconnecting = True
+        self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="tts", reason=reason))
+        try:
+            for delay in RECONNECT_BACKOFF_S:
+                if self._closing or not self._breaker.allow(time.monotonic()):
+                    break
+                await asyncio.sleep(delay)
+                if self._closing:
+                    return
+                try:
+                    ws = await self._connect()
+                except Exception as exc:  # noqa: BLE001
+                    self._breaker.record_failure(time.monotonic())
+                    logger.warning(f"[tts] reconnect failed: {exc}")
+                    continue
+                self._breaker.record_success()
+                self._ws = ws
+                # Never cancel the task we are running ON. `_reconnect` is reachable from the
+                # receive loop's own exception handler, and cancelling there would abort this
+                # coroutine at the next await — which is the re-send, the entire point.
+                current = asyncio.current_task()
+                if self._task is not None and self._task is not current:
+                    self._task.cancel()
+                self._task = asyncio.create_task(self._receive_loop(), name="tts-receive")
+                logger.info("[tts] cartesia reconnected")
+                self._emit(ev.ProviderRecovered(t=time.monotonic(), provider="tts"))
+                await self._resend()
+                return
+            logger.error("[tts] cartesia is gone; the call can no longer speak")
+            self._emit(
+                ev.ProviderDegraded(
+                    t=time.monotonic(), provider="tts", reason=reason, fatal=True
+                )
+            )
+        finally:
+            self._reconnecting = False
+
+    async def _resend(self) -> None:
+        """Replay the still-unfinished utterances onto the new socket."""
+        for utterance_id in list(self._active):
+            for message in self._pending.get(utterance_id, []):
+                try:
+                    await self._ws.send(json.dumps(message))
+                except (websockets.ConnectionClosed, AttributeError):
+                    return
+            logger.info(f"[tts] re-sent utterance {utterance_id} after reconnect")
 
     async def _receive_loop(self) -> None:
         assert self._ws is not None
@@ -129,7 +206,9 @@ class CartesiaTTS:
                 await self._handle(json.loads(raw))
         except websockets.ConnectionClosed as exc:
             logger.warning(f"[tts] cartesia connection closed: {exc}")
-            self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="tts", reason=str(exc)))
+            self._ws = None
+            if self._active:
+                await self._reconnect(str(exc))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - TTS must never take the call down
@@ -149,6 +228,7 @@ class CartesiaTTS:
             # Synthesis complete. Playback is not — the media adapter emits the end-of-turn
             # event once its buffer actually drains.
             self._active.discard(context_id)
+            self._pending.pop(context_id, None)
             await self._end_utterance(context_id)
 
         elif kind == "error":
@@ -167,10 +247,12 @@ class CartesiaTTS:
                 return
             logger.error(f"[tts] cartesia error: {detail}")
             self._active.discard(context_id)
+            self._pending.pop(context_id, None)
             self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="tts", reason=str(detail)))
             await self._clear_playback(context_id)
 
     async def aclose(self) -> None:
+        self._closing = True
         if self._task is not None:
             self._task.cancel()
             try:

@@ -55,6 +55,12 @@ class Settings:
     # Scheduling backend (local mock API)
     scheduling_api_base_url: str
 
+    # Phase 15 — where a warm transfer sends the caller. E.164 ("+15551234567") or a full SIP
+    # URI. Deliberately UNSET by default: with no destination the agent speaks the callback
+    # line and ends the call cleanly, which is honest, whereas a placeholder number would ring
+    # somebody who has never heard of this clinic.
+    transfer_number: str = ""
+
 
 def load_settings() -> Settings:
     """Build a Settings object from the current environment.
@@ -86,6 +92,7 @@ def load_settings() -> Settings:
         scheduling_api_base_url=os.getenv(
             "SCHEDULING_API_BASE_URL", "http://127.0.0.1:8000"
         ),
+        transfer_number=os.getenv("CLINIC_TRANSFER_NUMBER", "").strip(),
     )
 
 

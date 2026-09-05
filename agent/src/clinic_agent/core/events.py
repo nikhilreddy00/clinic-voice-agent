@@ -322,13 +322,62 @@ class ModelRouted(Event):
 
 @dataclass(frozen=True, slots=True)
 class ProviderDegraded(Event):
-    """A provider is unhealthy. Phase 10 only records it into state (visible in the trace);
-    the failover ladder that consumes it is Phase 15."""
+    """A provider is unhealthy. Recorded into ``state.degraded``; the Phase-15 ladder in the
+    reducer consumes it (retry/hedge -> scripted line -> transfer)."""
 
     provider: str = ""
     reason: str = ""
+    # Phase 15: the adapter has exhausted its reconnects/retries and is not coming back on its
+    # own. That is the difference between "one socket blipped" and "this call can no longer
+    # hear / speak", and only the second one should push the caller down the ladder.
+    fatal: bool = False
 
     kind: ClassVar[str] = "ProviderDegraded"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRecovered(Event):
+    """A previously-degraded provider is serving again (Phase 15).
+
+    The missing half of :class:`ProviderDegraded`. Before this existed a provider could only
+    ever be added to ``state.degraded``, so one dropped socket downgraded the model tier for
+    the remaining twenty turns of a call that had been healthy again since turn two.
+    """
+
+    provider: str = ""
+
+    kind: ClassVar[str] = "ProviderRecovered"
+
+
+@dataclass(frozen=True, slots=True)
+class TransferFailed(Event):
+    """The warm transfer could not be performed (Phase 15).
+
+    No destination configured, the local path (there is no SIP leg to transfer), or the
+    provider refused. The caller must still be told something — a hand-off that ends in a
+    click is worse than never having offered one.
+    """
+
+    reason: str = ""
+
+    kind: ClassVar[str] = "TransferFailed"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolSlow(Event):
+    """A tool call has been in flight past its budget and the caller is hearing nothing.
+
+    Phase 15. The scheduling client's timeout used to sit inside the voice turn at 10 s with
+    no filler, so a slow backend was ten seconds of dead air the caller reads as a dropped
+    call. Emitted once per tool call by the executor; the reducer speaks one filler line per
+    caller turn.
+    """
+
+    tool_call_id: str = ""
+    name: str = ""
+    waited_ms: float = 0.0
+
+    kind: ClassVar[str] = "ToolSlow"
 
 
 # --- (de)serialization for the recorder ---------------------------------------------------
@@ -355,6 +404,9 @@ _EVENT_TYPES: dict[str, type[Event]] = {
         BotStartedSpeaking,
         BotStoppedSpeaking,
         ProviderDegraded,
+        ProviderRecovered,
+        ToolSlow,
+        TransferFailed,
         IntentClassified,
         IntentClassificationFailed,
         ModelRouted,

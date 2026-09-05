@@ -31,11 +31,18 @@ from loguru import logger
 from .. import events as ev
 from ..audio import INPUT_SAMPLE_RATE, NUM_CHANNELS
 from ..endpointing import grace_seconds, looks_unfinished
+from ..reliability import CircuitBreaker
 
 DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
 
 EmitFn = Callable[[ev.Event], None]
 PartialFn = Callable[[str, float], None]
+ConnectFn = Callable[[], "websockets.ClientConnection"]
+
+# Phase 15. Reconnect delays, in seconds. Short and few on purpose: past about two seconds the
+# caller has already repeated themselves, and the ladder's next rung (a human) is the better
+# answer than a fourth attempt.
+RECONNECT_BACKOFF_S = (0.25, 0.5, 1.0)
 
 
 class DeepgramSTT:
@@ -64,6 +71,7 @@ class DeepgramSTT:
         model: str = "nova-3",
         language: str = "en-US",
         sample_rate: int = INPUT_SAMPLE_RATE,
+        connect: ConnectFn | None = None,
     ) -> None:
         self._api_key = api_key
         self._emit = emit
@@ -91,15 +99,71 @@ class DeepgramSTT:
         self._segments: list[str] = []
         self._confidences: list[float] = []
 
-    async def start(self) -> None:
+        # Phase 15. Until now nothing reconnected: a socket that closed mid-call left the agent
+        # deaf for the rest of it, with a healthy-looking log. Injectable so the chaos tests can
+        # kill the connection without a network.
+        self._connect = connect or self._default_connect
+        self._breaker = CircuitBreaker("stt", threshold=len(RECONNECT_BACKOFF_S), cooldown_s=5.0)
+        self._reconnecting = False
+        self._closing = False
+
+    async def _default_connect(self):
         url = f"{DEEPGRAM_URL}?{urlencode(self._params)}"
-        self._ws = await websockets.connect(
+        return await websockets.connect(
             url, additional_headers={"Authorization": f"Token {self._api_key}"}
         )
+
+    async def start(self) -> None:
+        self._ws = await self._connect()
+        self._start_loops()
+        logger.info(f"[stt] deepgram connected (model={self._params['model']}, {self._sample_rate} Hz)")
+
+    def _start_loops(self) -> None:
         self._last_send = time.monotonic()
         self._task = asyncio.create_task(self._receive_loop(), name="stt-receive")
         self._keepalive_task = asyncio.create_task(self._keepalive_loop(), name="stt-keepalive")
-        logger.info(f"[stt] deepgram connected (model={self._params['model']}, {self._sample_rate} Hz)")
+
+    def _schedule_reconnect(self, reason: str) -> None:
+        """Reconnect off the caller's path. Safe to call from anywhere, including the hot
+        audio path — the backoff must never block a 20 ms frame."""
+        if self._reconnecting or self._closing:
+            return
+        self._reconnecting = True
+        asyncio.create_task(self._reconnect(reason), name="stt-reconnect")
+
+    async def _reconnect(self, reason: str) -> None:
+        self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="stt", reason=reason))
+        try:
+            for delay in RECONNECT_BACKOFF_S:
+                if self._closing or not self._breaker.allow(time.monotonic()):
+                    break
+                await asyncio.sleep(delay)
+                if self._closing:
+                    return
+                try:
+                    ws = await self._connect()
+                except Exception as exc:  # noqa: BLE001 - a failed attempt is just an attempt
+                    self._breaker.record_failure(time.monotonic())
+                    logger.warning(f"[stt] reconnect failed: {exc}")
+                    continue
+                self._breaker.record_success()
+                self._ws = ws
+                if self._keepalive_task is not None:
+                    self._keepalive_task.cancel()
+                self._start_loops()
+                logger.info("[stt] deepgram reconnected")
+                self._emit(ev.ProviderRecovered(t=time.monotonic(), provider="stt"))
+                return
+            # Out of attempts. `fatal` is what tells the reducer this call can no longer hear —
+            # the difference between one blip and a caller talking to a deaf agent.
+            logger.error("[stt] deepgram is gone; the call can no longer hear")
+            self._emit(
+                ev.ProviderDegraded(
+                    t=time.monotonic(), provider="stt", reason=reason, fatal=True
+                )
+            )
+        finally:
+            self._reconnecting = False
 
     async def send_audio(self, pcm: bytes) -> None:
         """Push one PCM frame. Silently drops when disconnected — the call outlives the socket."""
@@ -110,7 +174,7 @@ class DeepgramSTT:
             self._last_send = time.monotonic()
         except websockets.ConnectionClosed:
             self._ws = None
-            self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="stt", reason="closed"))
+            self._schedule_reconnect("closed")
 
     async def _keepalive_loop(self) -> None:
         """Send a KeepAlive whenever the stream has been silent for a full interval.
@@ -133,9 +197,7 @@ class DeepgramSTT:
                     self._last_send = time.monotonic()
                 except websockets.ConnectionClosed:
                     self._ws = None
-                    self._emit(
-                        ev.ProviderDegraded(t=time.monotonic(), provider="stt", reason="closed")
-                    )
+                    self._schedule_reconnect("closed")
                     return
         except asyncio.CancelledError:
             raise
@@ -149,12 +211,14 @@ class DeepgramSTT:
                 self._handle(json.loads(raw))
         except websockets.ConnectionClosed as exc:
             logger.warning(f"[stt] deepgram connection closed: {exc}")
-            self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="stt", reason=str(exc)))
+            self._ws = None
+            self._schedule_reconnect(str(exc))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - STT must never take the call down
             logger.error(f"[stt] receive loop error: {exc}")
-            self._emit(ev.ProviderDegraded(t=time.monotonic(), provider="stt", reason=str(exc)))
+            self._ws = None
+            self._schedule_reconnect(str(exc))
 
     def _handle(self, message: dict) -> None:
         kind = message.get("type")
@@ -278,6 +342,8 @@ class DeepgramSTT:
         self._emit(ev.FinalTranscript(t=now, text=text, confidence=confidence))
 
     async def aclose(self) -> None:
+        # Set first: a socket closing during teardown must not start a reconnect race.
+        self._closing = True
         self._cancel_grace()
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()

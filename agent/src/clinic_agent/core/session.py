@@ -59,6 +59,7 @@ from .adapters.tts import CartesiaTTS
 from .adapters.turn import TurnEngine
 from .llm_router import LLMRouter
 from .recorder import TraceRecorder
+from .transfer import SIPTransfer
 from .reducer import reduce
 from .state import CallState, Phase
 
@@ -113,6 +114,7 @@ class CallSession:
         self._tts = self._build_tts()
         self._stt = self._build_stt()
         self._turn = self._build_turn()
+        self._transfer = self._build_transfer()
         # Phase-14 finding 2: is the loop blocked while LLM deltas queue up, or does the
         # wire deliver them in bursts? Off by default — it is a diagnostic, not a feature.
         self._loop_lag = (
@@ -189,6 +191,9 @@ class CallSession:
 
     def _build_turn(self) -> TurnEngine:
         return TurnEngine(emit=self.emit, forward_audio=self._stt.send_audio)
+
+    def _build_transfer(self) -> SIPTransfer:
+        return SIPTransfer(self.settings, TELEPHONY_ROOM_NAME, self.emit)
 
     async def _on_audio(self, pcm: bytes, now: float) -> None:
         await self._turn.feed(pcm, now)
@@ -276,15 +281,15 @@ class CallSession:
         elif isinstance(action, ClassifyIntent):
             self._classifier.classify(action.utterance)
         elif isinstance(action, TransferToHuman):
-            # No live transfer exists in this build — Phase 15 implements the warm handoff over
-            # LiveKit SIP. Logged at WARNING because a silent no-op here would look like a
-            # working escalation in the logs of a call where nobody was actually reached.
-            level = logger.error if action.urgent else logger.warning
-            level(
-                f"[transfer] NOT IMPLEMENTED — would transfer to a human "
-                f"(reason={action.reason!r}, urgent={action.urgent}): {action.summary}"
+            # Phase 15: a real SIP hand-off. The reducer has already spoken the line and will
+            # not take another turn, so this runs on the loop rather than in a task — the next
+            # thing that happens is either the caller's leg moving or a TransferFailed event.
+            await self._transfer.transfer(
+                self.state.caller_identity,
+                reason=action.reason,
+                summary=action.summary,
+                urgent=action.urgent,
             )
-            self.state = replace(self.state, escalated=True)
         elif isinstance(action, CancelLLM):
             self._llm.cancel(action.request_id)
         elif isinstance(action, Speak):
@@ -315,6 +320,16 @@ class CallSession:
             f"real={stats['bargein_true']}, false-positive={stats['bargein_false']}, "
             f"suppressed_echo_frames={stats['suppressed_frames']}"
         )
+        # Phase 15: a hedge or a retry on every turn is a provider problem worth seeing, and
+        # neither one is visible anywhere else — both are invisible to the caller by design.
+        hedges = getattr(self._llm, "hedges", 0)
+        retries = getattr(self._llm, "retries", 0)
+        if hedges or retries or self.state.degraded:
+            logger.warning(
+                f"[reliability] llm hedges={hedges} retries={retries} "
+                f"degraded={'+'.join(self.state.degraded) or 'none'} "
+                f"transfer={self.state.transfer_reason or 'none'}"
+            )
         logger.info(
             f"[session] outcome={self.state.outcome} turns={self.state.turn_index} "
             f"interruptions={self.state.interruptions} events={self._seq} "

@@ -33,12 +33,37 @@ from ...prompts import build_system_prompt
 from ...scheduling_tools import build_tools_schema
 from .. import events as ev
 from ..llm_router import LLMRouter, Tier
+from ..reliability import CircuitBreaker, is_retryable
 
 EmitFn = Callable[[ev.Event], None]
 
 # Voice replies are one or two sentences plus tool calls; a generous-but-bounded cap keeps a
 # runaway generation from holding the floor.
 MAX_TOKENS = 1024
+
+# Phase 15 — hedging. If no first token has arrived in this long, fire a SECOND request and take
+# whichever streams first.
+#
+# The phase plan said to hedge to a secondary PROVIDER. Phase 8 measured the only available one
+# (Groq) at 4,614 ms TTFT on the real 5,023-token booking prompt against cached Haiku's 621 ms,
+# and Groq has no prompt caching so it pays full prefill every turn -- it cannot win the race it
+# would exist to win. So the hedge is a second request to the SAME provider, which is the failure
+# mode that actually happens: a stream that stalls or an overloaded shard.
+#
+# 1,800 ms is ~3x the measured 627 ms p50 TTFT (2026-09-04, 29 turns), so a healthy turn never
+# fires one. `CLINIC_LLM_TTFT_MS=0` disables hedging.
+HEDGE_TTFT_MS_DEFAULT = 1800.0
+
+# Consecutive hard failures before the adapter stops trying. Per CALL, not per process: a
+# per-worker breaker would let one caller's outage mute a hundred healthy calls.
+# ponytail: per-call breaker; make it per-worker only if a real provider outage is ever measured
+# to affect every session at once.
+LLM_BREAKER_THRESHOLD = 3
+LLM_BREAKER_COOLDOWN_S = 20.0
+
+
+class _LostRace(Exception):
+    """A hedged attempt that another attempt beat. Not an error; nothing is emitted for it."""
 
 
 def to_anthropic_tools(schema: ToolsSchema) -> list[dict[str, Any]]:
@@ -115,6 +140,16 @@ class AnthropicLLM:
         self._emit = emit
         self._max_tokens = max_tokens
         self._tasks: dict[str, asyncio.Task] = {}
+        # Phase 15. `hedges` and `retries` are reported in the session teardown line: a hedge
+        # that fires on every turn is a provider problem worth seeing, not a silent cost.
+        self._breaker = CircuitBreaker(
+            "llm", threshold=LLM_BREAKER_THRESHOLD, cooldown_s=LLM_BREAKER_COOLDOWN_S
+        )
+        self._hedge_after_s = (
+            float(os.getenv("CLINIC_LLM_TTFT_MS", str(HEDGE_TTFT_MS_DEFAULT))) / 1000.0
+        )
+        self.hedges = 0
+        self.retries = 0
         # Phase 12: the reducer picks a tier; this maps it to a model. `now` is pinned at call
         # construction so every per-intent prompt in one call shares the same date table — a
         # long call must not silently change its own grounding at midnight.
@@ -212,44 +247,67 @@ class AnthropicLLM:
             task.cancel()
 
     async def _run(self, request_id, messages, decision, intent, context_note="") -> None:
+        """One logical request: breaker -> attempt (hedged) -> one retry -> events.
+
+        Phase 15. Before this there was no retry and no deadline at all, so a single 429 or a
+        stalled stream cost the caller a whole turn and produced the scripted apology.
+        """
         self._emit(ev.LLMStarted(t=time.monotonic(), request_id=request_id))
-        text_parts: list[str] = []
-        # The per-intent prompt is cached; the per-call context note is appended after it, so
-        # the cached part stays byte-identical across turns and only the tail varies.
+
+        if not self._breaker.allow(time.monotonic()):
+            # Two hard failures already; do not spend the caller's time on a third. The reducer
+            # speaks the scripted line and the ladder takes it from there.
+            logger.error(f"[llm] {request_id} refused: circuit open ({self._breaker.failures} failures)")
+            self._tasks.pop(request_id, None)
+            self._emit(
+                ev.ProviderDegraded(
+                    t=time.monotonic(), provider="llm", reason="circuit open", fatal=True
+                )
+            )
+            self._emit(
+                ev.LLMFailed(t=time.monotonic(), request_id=request_id, error="llm circuit open")
+            )
+            return
+
         prompt = self._scoped_prompt(intent)
         if context_note:
             prompt = f"{prompt}\n{context_note}"
         system = self._system_blocks(prompt)
-        try:
-            async with self._client.messages.stream(
-                model=decision.model,
-                max_tokens=decision.max_tokens,
-                system=system,
-                tools=self._scoped_tools(intent),
-                messages=messages,
-            ) as stream:
-                async for event in stream:
-                    if (
-                        event.type == "content_block_delta"
-                        and getattr(event.delta, "type", None) == "text_delta"
-                    ):
-                        text_parts.append(event.delta.text)
-                        self._emit(
-                            ev.LLMTextDelta(
-                                t=time.monotonic(), request_id=request_id, text=event.delta.text
-                            )
+
+        attempt = 0
+        while True:
+            try:
+                text_parts, final = await self._attempt(
+                    request_id, messages, decision, intent, system
+                )
+                break
+            except asyncio.CancelledError:
+                # Deliberate: barge-in or a new caller utterance superseded this request. Silent
+                # by design — the reducer already moved on and must not apologize for it.
+                logger.info(f"[llm] {request_id} cancelled")
+                raise
+            except Exception as exc:  # noqa: BLE001 - a provider error is a dialogue event
+                opened = self._breaker.record_failure(time.monotonic())
+                retryable = is_retryable(exc)
+                if attempt == 0 and retryable and self._breaker.allow(time.monotonic()):
+                    attempt += 1
+                    self.retries += 1
+                    logger.warning(f"[llm] {request_id} failed ({exc}); retrying once")
+                    continue
+                logger.error(f"[llm] {request_id} failed: {exc}")
+                self._tasks.pop(request_id, None)
+                if opened or not retryable:
+                    self._emit(
+                        ev.ProviderDegraded(
+                            t=time.monotonic(), provider="llm", reason=str(exc), fatal=opened
                         )
-                final = await stream.get_final_message()
-        except asyncio.CancelledError:
-            # Deliberate: barge-in or a new caller utterance superseded this request. Silent by
-            # design — the reducer already moved on and must not apologize for it.
-            logger.info(f"[llm] {request_id} cancelled")
-            raise
-        except Exception as exc:  # noqa: BLE001 - a provider error is a dialogue event, not a crash
-            logger.error(f"[llm] {request_id} failed: {exc}")
-            self._tasks.pop(request_id, None)
-            self._emit(ev.LLMFailed(t=time.monotonic(), request_id=request_id, error=str(exc)))
-            return
+                    )
+                self._emit(
+                    ev.LLMFailed(t=time.monotonic(), request_id=request_id, error=str(exc))
+                )
+                return
+
+        self._breaker.record_success()
 
         self._tasks.pop(request_id, None)
         text = "".join(text_parts)
@@ -277,6 +335,97 @@ class AnthropicLLM:
                 stop_reason=final.stop_reason or "end_turn",
             )
         )
+
+    async def _attempt(self, request_id, messages, decision, intent, system):
+        """Stream once, hedging a second identical request if no token arrives in time.
+
+        Exactly one attempt is allowed to emit: the first to produce output claims ownership
+        and the other raises :class:`_LostRace` and is cancelled. Without that claim the caller
+        would hear both replies interleaved, which is a far worse failure than the slow turn
+        the hedge exists to fix.
+        """
+        owner: list[str | None] = [None]
+
+        def claim(tag: str) -> bool:
+            if owner[0] is None:
+                owner[0] = tag
+            return owner[0] == tag
+
+        def spawn(tag: str) -> asyncio.Task:
+            return asyncio.create_task(
+                self._stream_once(
+                    request_id, messages, decision, intent, system, lambda: claim(tag)
+                ),
+                name=f"llm-{request_id}-{tag}",
+            )
+
+        tasks = {spawn("primary")}
+        may_hedge = self._hedge_after_s > 0
+        error: BaseException | None = None
+        try:
+            while tasks:
+                timeout = self._hedge_after_s if may_hedge else None
+                done, _ = await asyncio.wait(
+                    tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done and may_hedge:
+                    may_hedge = False
+                    if owner[0] is None:
+                        self.hedges += 1
+                        logger.warning(
+                            f"[llm] {request_id}: no first token in "
+                            f"{self._hedge_after_s * 1000:.0f} ms — hedging a second request"
+                        )
+                        tasks.add(spawn("hedge"))
+                    continue
+                may_hedge = False
+                for task in done:
+                    tasks.discard(task)
+                    try:
+                        return task.result()
+                    except (_LostRace, asyncio.CancelledError):
+                        continue
+                    except Exception as exc:  # noqa: BLE001 - keep waiting on the other attempt
+                        error = exc
+        finally:
+            for task in tasks:
+                task.cancel()
+        raise error or RuntimeError("the model returned no response")
+
+    async def _stream_once(self, request_id, messages, decision, intent, system, claim):
+        """One streaming call. Emits deltas only while this attempt owns the output."""
+        text_parts: list[str] = []
+        mine = False
+        async with self._client.messages.stream(
+            model=decision.model,
+            max_tokens=decision.max_tokens,
+            system=system,
+            tools=self._scoped_tools(intent),
+            messages=messages,
+        ) as stream:
+            async for event in stream:
+                if (
+                    event.type == "content_block_delta"
+                    and getattr(event.delta, "type", None) == "text_delta"
+                ):
+                    if not mine:
+                        # Claim on the FIRST token, not at the end: the whole point is to start
+                        # speaking as early as possible, and a claim at completion would make
+                        # the hedge worthless.
+                        if not claim():
+                            raise _LostRace
+                        mine = True
+                    text_parts.append(event.delta.text)
+                    self._emit(
+                        ev.LLMTextDelta(
+                            t=time.monotonic(), request_id=request_id, text=event.delta.text
+                        )
+                    )
+            final = await stream.get_final_message()
+        # A tool-only reply streams no text, so ownership is settled here instead.
+        if not mine and not claim():
+            raise _LostRace
+        return text_parts, final
 
     def _log_cache_usage(self, final: Any) -> None:
         """Report cache hits/misses when caching is on — a zero read is the only silent-miss tell."""

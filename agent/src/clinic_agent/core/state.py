@@ -157,6 +157,29 @@ class CallState:
     # promise. Reset alongside `nudged` on each new caller turn.
     turn_had_tool: bool = False
 
+    # Phase 15. One filler line per caller turn while a tool is slow, and the counters the
+    # degradation ladder runs on. All of them reset where they should: `filled` on each new
+    # caller turn, the failure counters on the next SUCCESS of the same kind, because the
+    # ladder asks "is this call failing repeatedly", not "has it ever failed".
+    filled: bool = False
+    llm_failures: int = 0
+    tool_failures: int = 0
+    no_match_count: int = 0
+    low_confidence_count: int = 0
+    # A transfer has been decided. Non-empty `transfer_reason` means the hand-off line is
+    # playing and the engine takes no further turns — whatever it would say next is the
+    # human's job. `transfer_fired` flips when the action has actually been handed to the
+    # adapter, which happens when playback ENDS, not when the decision is made: firing a SIP
+    # transfer while the agent is mid-sentence cuts the caller off in the middle of being told
+    # what is about to happen, and on the emergency path that sentence is the 911 instruction.
+    transfer_reason: str = ""
+    transfer_urgent: bool = False
+    transfer_fired: bool = False
+    # The LiveKit participant identity of the caller, needed to transfer them. Present from
+    # CallerPresent; empty on the local path, which is one of the reasons a transfer there
+    # falls back to the callback line rather than pretending.
+    caller_identity: str = ""
+
     turn_index: int = 0
     interruptions: int = 0
     booked: bool = False
@@ -168,6 +191,11 @@ class CallState:
 
     # --- provider health (recorded in Phase 10; consumed by the Phase-15 ladder) ---------
     degraded: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def transferring(self) -> bool:
+        """A hand-off has been decided; no further caller turns are taken."""
+        return bool(self.transfer_reason)
 
     @property
     def busy(self) -> bool:

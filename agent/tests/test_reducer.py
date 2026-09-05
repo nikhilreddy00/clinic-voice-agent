@@ -26,6 +26,7 @@ from clinic_agent.core.actions import (
 from clinic_agent.core.llm_router import Tier
 from clinic_agent.core.reducer import _split_speakable, reduce
 from clinic_agent.core.state import CallState, Phase
+from clinic_agent.intents import Intent
 from clinic_agent.prompts import GREETING, TELEPHONY_GREETING
 
 
@@ -750,3 +751,24 @@ def test_verify_identity_with_no_date_of_birth_never_reaches_the_api():
         "a refused tool must still count as a tool for the nudge, or the recovery turn gets "
         "re-prompted on top of the refusal"
     )
+
+
+def test_a_tool_less_intent_is_never_nudged():
+    """Phase 15. The nudge asks why no tool was called; on a tool-less intent there is none.
+
+    Live shape this fixes: the model said "I'm passing you to a staff member", the nudge fired,
+    and it talked itself back out of it — "I don't have the ability to transfer calls" — which
+    is now false as well as unhelpful. The hand-off is performed by the engine.
+    """
+    d = _greeted()
+    d.send(ev.FinalTranscript(text="are my test results back?"))
+    d.state = replace(d.state, intent=Intent.TEST_RESULTS)
+    produced = d.send(
+        ev.LLMCompleted(
+            request_id=d.state.request_id,
+            text="Let me pass you to a staff member who can look at that.",
+        )
+    )
+
+    assert not any(isinstance(a, StartLLM) for a in produced)
+    assert d.state.nudged is False

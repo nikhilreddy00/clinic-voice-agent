@@ -24,6 +24,7 @@ and recover (re-offer / escalate) instead of the turn crashing.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from datetime import datetime
@@ -79,8 +80,15 @@ class SchedulingClient:
     never raises for HTTP/transport failures — it maps them to `{"ok": False, "error": ...}`.
     """
 
-    def __init__(self, base_url: str, *, timeout: float = 10.0, call_id: str | None = None,
+    # Phase 15. Was 10 s, and that timeout sat INSIDE the voice turn: a slow backend meant ten
+    # seconds of dead air, which a caller reads as a dropped call. 5 s is still far outside the
+    # measured tool latency (tens of ms locally, low hundreds against Supabase) and the filler
+    # line now covers the first 2.5 s of it. `CLINIC_TOOL_TIMEOUT_S` overrides.
+    DEFAULT_TIMEOUT_S = float(os.getenv("CLINIC_TOOL_TIMEOUT_S", "5.0"))
+
+    def __init__(self, base_url: str, *, timeout: float | None = None, call_id: str | None = None,
                  api_token: str | None = None) -> None:
+        timeout = self.DEFAULT_TIMEOUT_S if timeout is None else timeout
         headers = {}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
@@ -103,6 +111,38 @@ class SchedulingClient:
         """
         return f"{self._call_id}:{operation}:{discriminator}"
 
+    async def _send(self, method: str, url: str, *, safe: bool, **kwargs) -> httpx.Response:
+        """One HTTP call, with one retry when a retry cannot do harm.
+
+        `safe` is the whole design here, and it is deliberately narrow. A GET, or a POST
+        carrying a stable Idempotency-Key, can be retried on anything transient. Everything
+        else — /cancel, /reschedule, /staff-tasks — is retried ONLY when the request provably
+        never reached the application: a connection failure, or a gateway status the proxy
+        itself produced. Retrying a read timeout on /staff-tasks would file the refill twice,
+        which is exactly the class of bug the idempotency keys exist to prevent elsewhere.
+        """
+        last_exc: httpx.HTTPError | None = None
+        for attempt in (1, 2):
+            try:
+                resp = await self._client.request(method, url, **kwargs)
+            except httpx.ConnectError as exc:
+                last_exc = exc          # never reached the app; always safe to retry
+            except httpx.HTTPError as exc:
+                if not safe:
+                    raise
+                last_exc = exc
+            else:
+                retryable = resp.status_code in ({502, 503, 504} if not safe else
+                                                 {429, 500, 502, 503, 504, 529})
+                if not retryable or attempt == 2:
+                    return resp
+                logger.warning(f"TOOL ▶ {method} {url} -> {resp.status_code}; retrying once")
+                continue
+            if attempt == 2:
+                raise last_exc
+            logger.warning(f"TOOL ▶ {method} {url} failed ({last_exc}); retrying once")
+        raise last_exc  # unreachable; keeps the type checker and the reader honest
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -121,7 +161,7 @@ class SchedulingClient:
         if provider_id is not None:
             params["provider_id"] = provider_id
         try:
-            resp = await self._client.get("/availability", params=params)
+            resp = await self._send("GET", "/availability", params=params, safe=True)
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             return {"ok": False, "error": f"could not reach the scheduling system ({exc})"}
@@ -130,10 +170,12 @@ class SchedulingClient:
 
     async def hold_slot(self, *, slot_id: int) -> dict:
         try:
-            resp = await self._client.post(
+            resp = await self._send(
+                "POST",
                 "/hold-slot",
                 json={"slot_id": slot_id},
                 headers={"Idempotency-Key": self._idempotency_key("hold", str(slot_id))},
+                safe=True,   # the key makes a replayed hold return the original hold
             )
         except httpx.HTTPError as exc:
             return {"ok": False, "error": f"could not reach the scheduling system ({exc})"}
@@ -171,9 +213,11 @@ class SchedulingClient:
             "phone": phone,
         }
         try:
-            resp = await self._client.post(
+            resp = await self._send(
+                "POST",
                 "/confirm-booking",
                 json=payload,
+                safe=True,   # keyed on the hold: a replay returns the original confirmation
                 # Keyed on the hold: confirming a given hold is the operation, and a retry of
                 # that same confirmation must replay the original confirmation number.
                 headers={"Idempotency-Key": self._idempotency_key("confirm", hold_id)},
@@ -201,10 +245,14 @@ class SchedulingClient:
     # matched once), so a prompt injection cannot talk the agent into looking up somebody
     # else's chart by naming a different number. The API re-verifies the pair anyway.
 
-    async def _verified_post(self, path: str, payload: dict) -> dict:
-        """POST a verified-caller request and map the standard failures for the model."""
+    async def _verified_post(self, path: str, payload: dict, *, safe: bool = False) -> dict:
+        """POST a verified-caller request and map the standard failures for the model.
+
+        `safe=True` only for the read-shaped ones (verify, list). A cancel, a reschedule, or a
+        staff task must not be replayed on a read timeout — see `_send`.
+        """
         try:
-            resp = await self._client.post(path, json=payload)
+            resp = await self._send("POST", path, json=payload, safe=safe)
         except httpx.HTTPError as exc:
             return {"ok": False, "error": f"could not reach the scheduling system ({exc})"}
         if resp.status_code == 403:
@@ -228,7 +276,7 @@ class SchedulingClient:
     async def caller_memory(self, *, phone: str) -> dict:
         """Pre-greeting lookup by ANI. Returns no identity — see the API's docstring."""
         try:
-            resp = await self._client.get("/caller-memory", params={"phone": phone})
+            resp = await self._send("GET", "/caller-memory", params={"phone": phone}, safe=True)
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             # A memory miss must never block a call: the agent simply greets as it always did.
@@ -241,6 +289,7 @@ class SchedulingClient:
         return await self._verified_post(
             "/verify-identity",
             {"phone": phone, "date_of_birth": date_of_birth, "name": name},
+            safe=True,
         )
 
     async def list_appointments(
@@ -249,6 +298,7 @@ class SchedulingClient:
         result = await self._verified_post(
             "/appointments",
             {"phone": phone, "date_of_birth": date_of_birth, "name": name},
+            safe=True,
         )
         if result.get("ok"):
             appts = [
@@ -290,8 +340,8 @@ class SchedulingClient:
 
     async def clinic_info(self, *, topic: str | None = None) -> dict:
         try:
-            resp = await self._client.get(
-                "/clinic-info", params={"topic": topic} if topic else {}
+            resp = await self._send(
+                "GET", "/clinic-info", params={"topic": topic} if topic else {}, safe=True
             )
             resp.raise_for_status()
         except httpx.HTTPError as exc:

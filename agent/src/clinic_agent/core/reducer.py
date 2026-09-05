@@ -28,8 +28,16 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from ..intents import Intent, needs_clarification, resolve_intent
-from ..prompts import EMERGENCY_RESPONSE, SYSTEM_ERROR_LINE, caller_context_note, greeting_for
+from ..intents import HANDLED_INTENTS, Intent, needs_clarification, resolve_intent
+from ..prompts import (
+    EMERGENCY_RESPONSE,
+    HANDOFF_LINE,
+    HANDOFF_UNAVAILABLE_LINE,
+    SYSTEM_ERROR_LINE,
+    TOOL_FILLER_LINE,
+    caller_context_note,
+    greeting_for,
+)
 from ..scheduling_tools import CALLER_SCOPED_TOOLS, VERIFICATION_REQUIRED_TOOLS
 from . import events as ev
 from .actions import (
@@ -248,6 +256,95 @@ def _open_utterance(state: CallState) -> tuple[CallState, str]:
     return replace(state, utterance_seq=seq, utterance_id=utterance_id), utterance_id
 
 
+# Phase 15 — the degradation ladder's thresholds.
+#
+# Two, not one: a single failure is a blip that the retry in the adapter has already absorbed,
+# and the model recovers from one bad tool result perfectly well ("sorry, let me try that
+# again"). Two IN A ROW is a pattern the caller is now paying for.
+#
+# Three for the conversation-quality signals, because those are noisier: one unintelligible
+# utterance is a cough, and a caller repeating themselves twice is normal on a phone line.
+_FAILURES_BEFORE_TRANSFER = 2
+_NO_MATCHES_BEFORE_TRANSFER = 3
+
+# Below this, Deepgram is guessing. Sustained low confidence means the line, the accent, or the
+# background noise is beyond this stack, and no amount of asking again fixes it.
+_MIN_ASR_CONFIDENCE = 0.6
+
+
+def _begin_transfer(
+    state: CallState,
+    reason: str,
+    *,
+    urgent: bool = False,
+    line: str | None = HANDOFF_LINE,
+) -> tuple[CallState, list[Action]]:
+    """Decide a hand-off: abort what is in flight, say what is about to happen, stop taking turns.
+
+    The transfer ACTION is deliberately not returned here. It fires from `_on_bot_stopped`,
+    once the line has actually played — firing it now would cut the caller off mid-sentence,
+    and on the emergency path that sentence is the 911 instruction.
+
+    ``line=None`` is for the paths that have already spoken (the emergency script) or that
+    cannot speak at all (a dead TTS provider).
+    """
+    if state.transferring:
+        return state, []
+    state, actions = _abort_in_flight(state)
+    if line is not None:
+        state, utterance_id = _open_utterance(state)
+        actions.append(
+            Speak(utterance_id=utterance_id, text=line, final=True, deterministic=True)
+        )
+        phase = Phase.SPEAKING if state.phase is not Phase.EMERGENCY else state.phase
+    else:
+        phase = state.phase
+    state = replace(
+        state,
+        transfer_reason=reason,
+        transfer_urgent=urgent,
+        escalated=True,
+        phase=phase,
+    )
+    if line is None:
+        # Nothing will ever play, so nothing will ever end: fire now or never.
+        return _fire_transfer(state, actions)
+    return state, actions
+
+
+def _fire_transfer(state: CallState, actions: list[Action]) -> tuple[CallState, list[Action]]:
+    """Hand the transfer to the adapter. Idempotent — a call transfers at most once."""
+    if state.transfer_fired or not state.transfer_reason:
+        return state, actions
+    return replace(state, transfer_fired=True), actions + [
+        TransferToHuman(
+            reason=state.transfer_reason,
+            summary=_transfer_summary(state),
+            urgent=state.transfer_urgent,
+        )
+    ]
+
+
+def _transfer_summary(state: CallState) -> str:
+    """What the human needs to know, and nothing a PHI boundary would object to.
+
+    No name, no date of birth, no symptom text. Whoever picks up has the caller on the line and
+    can ask; a summary is a routing aid, and it is written to logs and traces where a name is
+    exactly what must not appear.
+    """
+    intent = state.intent.value if state.intent else "unclassified"
+    parts = [
+        f"reason={state.transfer_reason}",
+        f"intent={intent}",
+        f"turns={state.turn_index}",
+        f"verified={state.identity_verified}",
+        f"booked={state.booked}",
+    ]
+    if state.degraded:
+        parts.append(f"degraded={'+'.join(state.degraded)}")
+    return ", ".join(parts)
+
+
 def _abort_in_flight(state: CallState) -> tuple[CallState, list[Action]]:
     """Cancel whatever the engine is currently doing and leave history valid to resend.
 
@@ -324,7 +421,13 @@ def _on_caller_present(state: CallState, e: ev.CallerPresent):
         return state, []
     state, utterance_id = _open_utterance(state)
     state = replace(
-        state, caller_present=True, phase=Phase.GREETING, caller_phone=e.phone or ""
+        state,
+        caller_present=True,
+        phase=Phase.GREETING,
+        caller_phone=e.phone or "",
+        # The LiveKit participant identity. Only ever used to transfer this caller's SIP leg;
+        # it is not an identifier of the person and is never spoken or sent to a model.
+        caller_identity=e.participant_id or "",
     )
     actions: list[Action] = [
         Speak(
@@ -367,7 +470,25 @@ def _on_final_transcript(state: CallState, e: ev.FinalTranscript):
     """A caller utterance is final: check for an emergency, then generate a reply."""
     text = e.text.strip()
     if not text:
+        # Phase 15. An empty final is STT hearing something and making nothing of it. One is a
+        # cough; three in a row is a line, an accent, or a room this stack cannot work with,
+        # and asking a fourth time is not going to change that.
+        misses = state.no_match_count + 1
+        state = replace(state, no_match_count=misses)
+        if misses >= _NO_MATCHES_BEFORE_TRANSFER:
+            return _begin_transfer(state, "no_match")
         return state, []
+
+    # Sustained low confidence is the same signal arriving through a different door: Deepgram
+    # answered, but it is guessing. Reset on any confident turn — a single bad one mid-call is
+    # normal on a phone line.
+    if e.confidence is not None and e.confidence < _MIN_ASR_CONFIDENCE:
+        weak = state.low_confidence_count + 1
+        state = replace(state, low_confidence_count=weak)
+        if weak >= _NO_MATCHES_BEFORE_TRANSFER:
+            return _begin_transfer(state, "low_asr_confidence")
+    else:
+        state = replace(state, no_match_count=0, low_confidence_count=0)
 
     # THE EMERGENCY CHECK COMES FIRST, before any model request exists. detect_emergency is a
     # pure function, so this fires identically on every call, on every model, during a provider
@@ -397,6 +518,12 @@ def _on_final_transcript(state: CallState, e: ev.FinalTranscript):
             )
         ]
 
+    if state.transferring:
+        # A hand-off is already under way. Starting a model turn here would have the agent
+        # talking over the transfer it just promised. Placed AFTER the emergency block on
+        # purpose: an emergency caller who keeps talking must keep hearing the 911 line.
+        return state, []
+
     state, actions = _abort_in_flight(state)
     state = replace(
         state,
@@ -405,6 +532,7 @@ def _on_final_transcript(state: CallState, e: ev.FinalTranscript):
         last_partial="",
         nudged=False,  # a fresh caller turn gets a fresh follow-through allowance
         turn_had_tool=False,
+        filled=False,  # ...and a fresh allowance for one "one moment" filler
     )
     state, start = _next_request(state)
     # Classification runs ALONGSIDE the turn, never before it. Intent is an optimization on the
@@ -430,19 +558,24 @@ def _enter_emergency(state: CallState, text: str, emergency):
         # path, and keeping a crisis description out of the conversation history means it never
         # reaches a provider on a later turn either.
     )
-    return state, actions + [
+    actions = actions + [
         Speak(
             utterance_id=utterance_id,
             text=EMERGENCY_RESPONSE,
             final=True,
             deterministic=True,
-        ),
-        TransferToHuman(
-            reason=f"emergency:{emergency.category}",
-            summary=f"Caller described a possible {emergency.category} emergency.",
-            urgent=True,
-        ),
+        )
     ]
+    # The 911 instruction IS the hand-off line, so no second line is spoken. The transfer fires
+    # when it finishes playing (_on_bot_stopped): a SIP transfer mid-sentence would cut the
+    # caller off in the middle of the single most important thing this system ever says.
+    state = replace(
+        state,
+        transfer_reason=f"emergency:{emergency.category}",
+        transfer_urgent=True,
+        escalated=True,
+    )
+    return state, actions
 
 
 def _on_user_interrupted(state: CallState, e: ev.UserInterrupted):
@@ -704,6 +837,9 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
     committed = tuple(b["id"] for b in state.turn_tool_uses)
     state = replace(
         state,
+        # A completed request clears the streak: the ladder asks "is this call failing
+        # repeatedly", not "has anything ever failed on it".
+        llm_failures=0,
         messages=messages,
         request_id=None,
         turn_text="",
@@ -721,6 +857,7 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
         and not state.turn_had_tool
         and not state.nudged
         and not reply.rstrip().endswith("?")
+        and _has_tools(state.intent)
         and _ACTION_CLAIM.search(reply)
     ):
         # Announced an action, took none. Give the model exactly one chance to follow through
@@ -744,15 +881,37 @@ def _on_llm_completed(state: CallState, e: ev.LLMCompleted):
     return replace(state, phase=Phase.LISTENING), actions
 
 
+def _has_tools(intent: Intent | None) -> bool:
+    """Whether this intent has any tool the model could have called.
+
+    Phase 15. The follow-through nudge asks "you announced an action — why did you not call a
+    tool?", and on a tool-less intent the answer is "because there is none", every time. On
+    SPEAK_TO_HUMAN it produced the worst version of that: the model correctly said "I'm passing
+    you to a staff member", got nudged, and talked itself out of it — "I don't have the ability
+    to transfer calls" — which as of this phase is also FALSE. The hand-off is performed by the
+    engine, not by a tool, so there is nothing here for a nudge to fix.
+    """
+    return intent is None or intent in HANDLED_INTENTS
+
+
 def _on_llm_failed(state: CallState, e: ev.LLMFailed):
     """Speak a scripted apology rather than leaving the caller in dead air."""
     if _stale(state, e.request_id):
         return state, []
 
+    degraded = state.degraded if "llm" in state.degraded else state.degraded + ("llm",)
+    failures = state.llm_failures + 1
+    state = replace(state, degraded=degraded, llm_failures=failures)
+
+    if failures >= _FAILURES_BEFORE_TRANSFER:
+        # The scripted apology asks the caller to repeat themselves. Asking twice, when the
+        # model is what failed both times, is how a caller ends up saying the same sentence
+        # four times to a system that was never going to answer.
+        return _begin_transfer(state, "llm_unavailable")
+
     state, actions = _abort_in_flight(state)
     state, utterance_id = _open_utterance(state)
-    degraded = state.degraded if "llm" in state.degraded else state.degraded + ("llm",)
-    state = replace(state, phase=Phase.SPEAKING, degraded=degraded)
+    state = replace(state, phase=Phase.SPEAKING)
     return state, actions + [
         Speak(utterance_id=utterance_id, text=SYSTEM_ERROR_LINE, final=True, deterministic=True)
     ]
@@ -800,6 +959,14 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
         e.name == "check_availability" and e.ok and e.result.get("count") == 0
     )
 
+    # Phase 15. Only a tool the system could not SERVE counts toward the ladder: no status at
+    # all (a timeout or a refused connection) or a 5xx. A 403, a 404 and a 409 are answers —
+    # a wrong date of birth, a cancelled appointment, a slot someone else just took — and the
+    # model handles every one of them in dialogue. Counting them would transfer a caller to a
+    # human for mistyping their birthday twice.
+    unserved = not e.ok and (e.http_status is None or e.http_status >= 500)
+    tool_failures = state.tool_failures + 1 if unserved else 0
+
     pending = tuple(t for t in state.pending_tools if t != e.tool_call_id)
     state = replace(
         state,
@@ -812,9 +979,16 @@ def _on_tool_completed(state: CallState, e: ev.ToolCompleted):
         patient_name=patient_name,
         submitted_dobs=submitted_dobs,
         active_hold_id=active_hold_id,
+        tool_failures=tool_failures,
     )
     if pending:
         return state, []
+
+    if tool_failures >= _FAILURES_BEFORE_TRANSFER:
+        # The scheduling system is not answering. Letting the model apologize a third time and
+        # ask the caller to try again is how a call ends in "abandoned" with nothing booked and
+        # nobody told.
+        return _begin_transfer(state, "scheduling_unavailable")
 
     state, start = _flush_tool_results(state)
     return state, [start]
@@ -845,6 +1019,11 @@ def _on_bot_stopped(state: CallState, e: ev.BotStoppedSpeaking):
     stray transcript cancel a booking that is mid-commit.
     """
     state = replace(state, bot_speaking=False)
+
+    # Phase 15. The hand-off line has now actually been heard, so the transfer can go. Doing it
+    # any earlier cuts the caller off mid-sentence — on the emergency path, mid-911-instruction.
+    if state.transferring and not state.transfer_fired:
+        return _fire_transfer(state, [])
 
     # The caller said goodbye and the agent has now finished saying it back. Waiting for
     # playback to drain rather than ending on the farewell itself is the whole point: it is
@@ -891,21 +1070,20 @@ def _on_intent_classified(state: CallState, e: ev.IntentClassified):
     # neither the request nor the outcome — so a call that ended in "I want a human" was
     # indistinguishable from one that simply stopped. TransferToHuman marks the call escalated
     # and carries the reason into the Phase-15 warm handoff.
-    escalation: list[Action] = []
     if intent is Intent.SPEAK_TO_HUMAN and previous is not Intent.SPEAK_TO_HUMAN:
-        escalation = [TransferToHuman(
-            reason="caller_requested_human",
-            summary="The caller asked to speak to a person.",
-        )]
+        # Phase 15: this is now a real hand-off rather than a marker. The in-flight model turn
+        # is abandoned on purpose — a caller who has asked for a person does not want to hear
+        # the agent finish its sentence first.
+        return _begin_transfer(state, "caller_requested_human")
 
     if state.phase is not Phase.THINKING or state.request_id is None:
-        return state, escalation  # nothing in flight; it scopes the next request
+        return state, []  # nothing in flight; it scopes the next request
     if _tool_surface(previous) == _tool_surface(intent):
-        return state, escalation
+        return state, []
 
     state, actions = _abort_in_flight(state)
     state, start = _next_request(state)
-    return state, escalation + actions + [start]
+    return state, actions + [start]
 
 
 def _tool_surface(intent: Intent | None) -> bool:
@@ -923,10 +1101,83 @@ def _on_model_routed(state: CallState, e: ev.ModelRouted):
     return state, []
 
 
-def _on_provider_degraded(state: CallState, e: ev.ProviderDegraded):
-    if e.provider in state.degraded:
+def _on_tool_slow(state: CallState, e: ev.ToolSlow):
+    """A tool is taking long enough that the caller is sitting in silence — say something.
+
+    Three guards, all of them load-bearing:
+
+    * only while tools are actually in flight (a result that landed a millisecond before this
+      event must not produce a filler for work that is already done);
+    * only when the agent is not already speaking, or the filler talks over the sentence that
+      preceded the tool call;
+    * once per caller turn, because two "one moment"s in a row is worse than the silence.
+    """
+    if state.phase is not Phase.TOOL_WAIT or e.tool_call_id not in state.pending_tools:
         return state, []
-    return replace(state, degraded=state.degraded + (e.provider,)), []
+    if state.filled or state.bot_speaking:
+        return state, []
+    state, utterance_id = _open_utterance(state)
+    return replace(state, filled=True), [
+        Speak(utterance_id=utterance_id, text=TOOL_FILLER_LINE, final=True, deterministic=True)
+    ]
+
+
+def _on_provider_degraded(state: CallState, e: ev.ProviderDegraded):
+    """Record the provider, and hand off when one of them is not coming back.
+
+    ``fatal`` means the adapter has exhausted its reconnects. A call with no STT cannot hear
+    the caller and a call with no TTS cannot answer them; either way there is nothing left for
+    the agent to do that a person would not do better, and the alternative is a caller talking
+    into a line that will never respond.
+    """
+    if e.provider not in state.degraded:
+        state = replace(state, degraded=state.degraded + (e.provider,))
+    if not e.fatal:
+        return state, []
+    # With TTS gone there is no way to speak the hand-off line, so the transfer goes straight
+    # out. With STT gone the caller can still HEAR, so they get told what is happening.
+    return _begin_transfer(
+        state,
+        f"{e.provider}_unavailable",
+        line=None if e.provider == "tts" else HANDOFF_LINE,
+    )
+
+
+def _on_provider_recovered(state: CallState, e: ev.ProviderRecovered):
+    """A provider is serving again — stop treating the rest of the call as degraded.
+
+    Without this, `degraded` only ever grew: one dropped socket at turn two downgraded the
+    model tier for the remaining twenty turns of a call that had been healthy since turn three.
+    """
+    if e.provider not in state.degraded:
+        return state, []
+    return replace(state, degraded=tuple(p for p in state.degraded if p != e.provider)), []
+
+
+def _on_transfer_failed(state: CallState, e: ev.TransferFailed):
+    """Nobody to transfer to. Say so, promise the callback, and end the call cleanly.
+
+    The promise is one the clinic can keep: the escalation is in the trace and the metrics with
+    the caller's number, which is the whole reason this is a spoken line and not a silent
+    hangup.
+    """
+    if state.emergency:
+        # The caller has already been told to hang up and call 911. "Someone will call you back
+        # as soon as they can" is the wrong thing to say to them and the wrong thing to have
+        # them wait for. The line closes instead.
+        return replace(state, phase=Phase.CLOSED, caller_present=False), [
+            EndCall(reason="emergency_handoff")
+        ]
+
+    state, utterance_id = _open_utterance(state)
+    return replace(state, closing=True, phase=Phase.SPEAKING), [
+        Speak(
+            utterance_id=utterance_id,
+            text=HANDOFF_UNAVAILABLE_LINE,
+            final=True,
+            deterministic=True,
+        )
+    ]
 
 
 def _on_hangup(state: CallState, e: ev.Hangup):
@@ -956,6 +1207,9 @@ _HANDLERS = {
     ev.IntentClassified: _on_intent_classified,
     ev.IntentClassificationFailed: _on_intent_failed,
     ev.ModelRouted: _on_model_routed,
+    ev.ToolSlow: _on_tool_slow,
     ev.ProviderDegraded: _on_provider_degraded,
+    ev.ProviderRecovered: _on_provider_recovered,
+    ev.TransferFailed: _on_transfer_failed,
     ev.Hangup: _on_hangup,
 }

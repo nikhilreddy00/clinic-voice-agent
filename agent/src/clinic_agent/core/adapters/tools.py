@@ -18,6 +18,7 @@ is Phase 13; here the 10 s client timeout still applies.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -29,6 +30,12 @@ from ...scheduling_tools import SchedulingClient, execute_tool
 from .. import events as ev
 
 EmitFn = Callable[[ev.Event], None]
+
+# Phase 15 — how long a tool may run before the caller is told something is happening. 2.5 s is
+# past every measured tool latency (tens of ms locally, low hundreds against Supabase), so a
+# healthy call never hears the filler; it only appears when the backend is genuinely slow, which
+# used to be up to ten seconds of silence with the old timeout sitting inside the voice turn.
+TOOL_FILLER_MS = float(os.getenv("CLINIC_TOOL_FILLER_MS", "2500"))
 
 
 class ToolExecutor:
@@ -44,6 +51,7 @@ class ToolExecutor:
         self._emit = emit
         self._collector = collector
         self._tasks: dict[str, asyncio.Task] = {}
+        self._slow_tasks: dict[str, asyncio.Task] = {}
         self._memory_task: asyncio.Task | None = None
 
     def invoke(self, tool_call_id: str, name: str, arguments: dict[str, Any]) -> None:
@@ -53,6 +61,30 @@ class ToolExecutor:
         self._tasks[tool_call_id] = asyncio.create_task(
             self._run(tool_call_id, name, arguments), name=f"tool-{name}-{tool_call_id}"
         )
+        if TOOL_FILLER_MS > 0:
+            self._slow_tasks[tool_call_id] = asyncio.create_task(
+                self._watch_slow(tool_call_id, name), name=f"tool-slow-{tool_call_id}"
+            )
+
+    async def _watch_slow(self, tool_call_id: str, name: str) -> None:
+        """Tell the reducer the caller has been waiting. One event per tool call.
+
+        A separate task rather than a timeout inside `_run`, because the tool must keep running
+        — the point is to fill the silence, not to abandon a call that is about to succeed.
+        """
+        try:
+            await asyncio.sleep(TOOL_FILLER_MS / 1000.0)
+        except asyncio.CancelledError:
+            return
+        if tool_call_id in self._tasks:
+            self._emit(
+                ev.ToolSlow(
+                    t=time.monotonic(),
+                    tool_call_id=tool_call_id,
+                    name=name,
+                    waited_ms=TOOL_FILLER_MS,
+                )
+            )
 
     async def _run(self, tool_call_id: str, name: str, arguments: dict[str, Any]) -> None:
         try:
@@ -70,6 +102,9 @@ class ToolExecutor:
             )
         finally:
             self._tasks.pop(tool_call_id, None)
+            slow = self._slow_tasks.pop(tool_call_id, None)
+            if slow is not None:
+                slow.cancel()
 
         self._emit(
             ev.ToolCompleted(
@@ -118,7 +153,8 @@ class ToolExecutor:
     async def aclose(self) -> None:
         if self._memory_task is not None and not self._memory_task.done():
             self._memory_task.cancel()
-        for task in list(self._tasks.values()):
+        for task in list(self._tasks.values()) + list(self._slow_tasks.values()):
             task.cancel()
         self._tasks.clear()
+        self._slow_tasks.clear()
         await self._client.aclose()
