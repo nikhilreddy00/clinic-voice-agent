@@ -32,10 +32,17 @@ The boundaries match the ones every latency number in this project already uses 
 it at `BotStoppedSpeaking` instead would fold the length of the reply into the latency and make
 a wordy answer look like a slow one.
 
-ONE THING TO KNOW BEFORE QUERYING TURN DURATION: a turn the engine deliberately HELD (the
+TWO THINGS TO KNOW BEFORE QUERYING TURN DURATION. A turn the engine deliberately HELD (the
 caller paused mid-sentence and `core/endpointing.py` bought them grace) has no reply, so its
-span runs to whenever they spoke again — seconds, legitimately. Those carry `turn.held=true`
-and any latency percentile has to exclude them, or the graph measures how long callers think.
+span runs to whenever they spoke again — seconds, legitimately. And a turn the agent never
+answered at all (the caller talked over themselves, or hung up) is not a latency measurement
+either. Both are marked — `turn.held`, `turn.answered` — and a latency percentile has to filter
+on both, or the graph measures how long callers think. Unfiltered, that put a p99 of 8 s on a
+dashboard whose real p99 is about 2 s.
+
+And the span named `playback` is how long the bot SPOKE, not how long TTS took to start. It was
+called `tts` for one afternoon and immediately read as synthesis latency, putting 25 s on a
+panel titled "which stage is the slow one".
 
 NO PHI ON A SPAN. NOT ONE FIELD.
 ---------------------------------
@@ -70,7 +77,7 @@ ATTRIBUTES = frozenset({
     "call.id", "call.mode", "call.turns", "call.tool_calls", "call.interruptions",
     "call.intent", "call.degraded", "call.booked", "call.transfer_failed_reason",
     # turn
-    "turn.index", "turn.intent", "turn.held", "turn.interrupted",
+    "turn.index", "turn.intent", "turn.held", "turn.interrupted", "turn.answered",
     # stt
     "stt.confidence", "stt.chars",
     # classifier
@@ -81,7 +88,7 @@ ATTRIBUTES = frozenset({
     # tool
     "tool.name", "tool.ok", "tool.http_status", "tool.call_id",
     # tts
-    "tts.utterance_id", "tts.completed",
+    "playback.utterance_id", "playback.completed",
     # provider health
     "provider.name", "provider.reason", "provider.fatal",
 })
@@ -194,6 +201,11 @@ def spans_from_events(events: list[ev.Event]) -> SpanSpec | None:
                 # every ordinary turn from the panel meant to show ordinary turns.
                 turn__held=False,
                 turn__interrupted=False,
+                # Whether the agent ever replied. A turn with no reply — the caller talked over
+                # themselves, or hung up — is not a latency measurement, and including those put
+                # a p99 of 8 s on a dashboard whose real p99 is about 2 s. Always present, for
+                # the same TraceQL reason `turn.held` is.
+                turn__answered=False,
                 # Denormalized from the call so a per-TURN query can filter by mode. The
                 # alternative is a structural TraceQL join for something that is one short enum.
                 call__mode=mode,
@@ -268,13 +280,15 @@ def spans_from_events(events: list[ev.Event]) -> SpanSpec | None:
             # wordy answer look like a slow one.
             if current is not None and current.end <= current.start:
                 current.end = t
+                current.attributes["turn.answered"] = True
             tts_open[event.utterance_id] = t
 
         elif isinstance(event, ev.BotStoppedSpeaking):
             start = tts_open.pop(event.utterance_id, None)
             if start is not None:
-                attach(SpanSpec(name="tts", start=start, end=t, attributes=_attrs(
-                    tts__utterance_id=event.utterance_id, tts__completed=event.completed,
+                attach(SpanSpec(name="playback", start=start, end=t, attributes=_attrs(
+                    playback__utterance_id=event.utterance_id,
+                    playback__completed=event.completed,
                 )))
 
         elif isinstance(event, ev.ProviderDegraded):

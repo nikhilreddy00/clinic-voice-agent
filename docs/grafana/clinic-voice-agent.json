@@ -56,17 +56,17 @@
         {
           "refId": "A",
           "queryType": "traceql",
-          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held = false} | quantile_over_time(duration, .5) by (name)"
+          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held = false && span.turn.answered = true} | quantile_over_time(duration, .5) by (name)"
         },
         {
           "refId": "B",
           "queryType": "traceql",
-          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held = false} | quantile_over_time(duration, .95) by (name)"
+          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held = false && span.turn.answered = true} | quantile_over_time(duration, .95) by (name)"
         },
         {
           "refId": "C",
           "queryType": "traceql",
-          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held = false} | quantile_over_time(duration, .99) by (name)"
+          "query": "{resource.service.name=\"clinic-voice-agent\" && name=\"turn\" && span.turn.held = false && span.turn.answered = true} | quantile_over_time(duration, .99) by (name)"
         }
       ],
       "fieldConfig": {
@@ -100,7 +100,7 @@
     {
       "type": "timeseries",
       "title": "Per stage, p95 \u2014 which stage is the slow one",
-      "description": "The whole point of splitting the turn. A single voice-to-voice number cannot say whether a slow call is the model, the endpointer, or the speech queue, and those have completely different fixes. Measured 2026-09-04, LLM TTFT was ~50% of every turn.",
+      "description": "The whole point of splitting the turn. A single voice-to-voice number cannot say whether a slow call is the model, the endpointer, or the speech queue, and those have completely different fixes. Measured 2026-09-04, LLM TTFT was ~50% of every turn. `playback` is deliberately NOT here: it measures how long the bot spoke, not how long TTS took to start, and on this panel it read as a 25 s synthesis stage.",
       "datasource": {
         "type": "tempo",
         "uid": "${tempo}"
@@ -115,7 +115,7 @@
         {
           "refId": "A",
           "queryType": "traceql",
-          "query": "{resource.service.name=\"clinic-voice-agent\" && (name=\"stt\" || name=\"llm\" || name=\"classifier\" || name=\"tts\")} | quantile_over_time(duration, .95) by (name)"
+          "query": "{resource.service.name=\"clinic-voice-agent\" && (name=\"stt\" || name=\"llm\" || name=\"classifier\")} | quantile_over_time(duration, .95) by (name)"
         }
       ],
       "fieldConfig": {

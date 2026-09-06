@@ -91,7 +91,7 @@ def test_the_tree_is_one_call_with_one_turn_and_its_stages():
     assert turn.attributes["turn.index"] == 0
     # Two LLM requests (the tool round trip), and the reply's TTS belongs to the turn — only
     # the greeting's does not, because there was no turn in flight when it played.
-    assert {s.name for s in turn.children} == {"stt", "llm", "tool.check_availability", "tts"}
+    assert {s.name for s in turn.children} == {"stt", "llm", "tool.check_availability", "playback"}
     assert len(_by_name(turn, "llm")) == 2
 
 
@@ -110,9 +110,9 @@ def test_a_turn_is_voice_to_voice_not_end_of_playback():
 def test_the_greeting_hangs_off_the_call_not_off_a_turn():
     """It is real TTS with real latency and it happens before any caller turn exists."""
     root = spans_from_events(_booking_turn())
-    greeting = [s for s in root.children if s.name == "tts"]
+    greeting = [s for s in root.children if s.name == "playback"]
     assert len(greeting) == 1
-    assert greeting[0].attributes["tts.utterance_id"] == "utt-greeting"
+    assert greeting[0].attributes["playback.utterance_id"] == "utt-greeting"
 
 
 def test_a_tool_span_is_placed_by_its_measured_latency():
@@ -389,6 +389,7 @@ def test_turn_flags_are_always_present_never_omitted_when_false():
     for turn in _by_name(spans_from_events(_booking_turn()), "turn"):
         assert turn.attributes["turn.held"] is False
         assert turn.attributes["turn.interrupted"] is False
+        assert turn.attributes["turn.answered"] is True
 
 
 def test_a_turn_carries_the_call_mode_so_per_turn_queries_can_filter_by_it():
@@ -435,3 +436,20 @@ def test_a_call_with_no_classifier_has_no_intent_rather_than_a_guess():
         ev.Hangup(t=1.0),
     ))
     assert "call.intent" not in root.attributes
+
+
+def test_a_turn_the_agent_never_answered_is_marked_unanswered():
+    """It is not a latency measurement. Unfiltered, turns like these put a p99 of 8 s on a
+    dashboard whose real p99 is about 2 s — the graph was measuring callers, not the agent."""
+    root = spans_from_events(_stream(
+        ev.CallStarted(t=0.0, call_id="C", mode="local"),
+        ev.SpeechStopped(t=1.0),
+        ev.FinalTranscript(t=1.3, text="um", confidence=0.5),
+        ev.SpeechStopped(t=9.0),
+        ev.FinalTranscript(t=9.2, text="sorry, go on", confidence=0.9),
+        ev.BotStartedSpeaking(t=10.0, utterance_id="u1"),
+        ev.Hangup(t=11.0),
+    ))
+    abandoned, answered = _by_name(root, "turn")
+    assert abandoned.attributes["turn.answered"] is False
+    assert answered.attributes["turn.answered"] is True
