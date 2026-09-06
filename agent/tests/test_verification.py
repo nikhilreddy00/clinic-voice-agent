@@ -8,6 +8,10 @@ becomes a request at all — no InvokeTool action, nothing on the wire, nothing 
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from clinic_agent.core import events as ev
 from clinic_agent.core.actions import InvokeTool, LoadCallerMemory, StartLLM
 from clinic_agent.scheduling_tools import VERIFICATION_REQUIRED_TOOLS
@@ -240,13 +244,19 @@ def test_a_failed_verification_attempt_does_not_poison_the_next_one():
     call re-sent "placeholder", so a caller with a valid appointment could never get in.
 
     Nothing is substituted on verify_identity: both fields are the credentials being tested.
+
+    The live call used the literal string "placeholder", which no longer reaches the API at all
+    — a value with no digits in it is refused by the reducer's partial-date guard. That is a
+    better outcome and it is NOT what this test is about, so the first attempt here uses a
+    well-formed date that is simply WRONG: it goes out, the API refuses it, and the question is
+    whether the next attempt carries the caller's real one.
     """
     d = _on_a_call()
     d.send(ev.FinalTranscript(text="I need to reschedule"))
 
-    junk = _tool_call(d, "verify_identity", name="Nikhil Kumar", date_of_birth="placeholder")
+    junk = _tool_call(d, "verify_identity", name="Nikhil Kumar", date_of_birth="01/01/1900")
     assert next(a for a in junk if isinstance(a, InvokeTool)).arguments["date_of_birth"] == (
-        "placeholder"
+        "01/01/1900"
     )
     d.send(ev.ToolCompleted(
         tool_call_id="tu-verify_identity", name="verify_identity", ok=False,
@@ -262,3 +272,75 @@ def test_a_failed_verification_attempt_does_not_poison_the_next_one():
     assert invoke.arguments["date_of_birth"] == "12/08/2000", (
         "the real date of birth was replaced by a stale failed attempt"
     )
+
+
+# --- a fragment is not a credential (Phase 16) ---------------------------------------------
+
+
+@pytest.mark.parametrize("partial", ["1990", "March 1990", "the eighth of December", "12/08"])
+def test_an_incomplete_date_of_birth_never_becomes_a_request(partial):
+    """Same class as the blank-DOB guard, one step further.
+
+    The API refuses a partial date with the IDENTICAL 403 a wrong date gets — it has to, or the
+    endpoint becomes a patient-enumeration oracle. That means the model cannot tell an
+    incomplete birthday from a wrong one, and would tell the caller their date of birth does not
+    match when it never asked for the year. Answering here costs no round trip and names the
+    real problem.
+    """
+    d = _on_a_call()
+    d.send(ev.FinalTranscript(text="I need to reschedule"))
+    produced = _tool_call(d, "verify_identity", name="Nikhil Kumar", date_of_birth=partial)
+
+    assert not [a for a in produced if isinstance(a, InvokeTool)], (
+        f"{partial!r} was sent to the API as a date of birth"
+    )
+    result = json.loads(d.state.tool_results[-1]["content"])
+    assert result["ok"] is False and "incomplete" in result["error"]
+    assert d.state.turn_had_tool is True, (
+        "a refused tool must still count as a tool for the nudge, or the recovery turn gets "
+        "re-prompted on top of the refusal"
+    )
+
+
+def test_a_complete_date_of_birth_goes_out_untouched():
+    """The guard must not cost a real caller a turn. Every spoken form the agent normalizes to
+    is eight digits once punctuation is removed."""
+    for spoken in ("12/08/2000", "12-8-2000", "3/5/2001"):
+        d = _on_a_call()
+        d.send(ev.FinalTranscript(text="I need to reschedule"))
+        produced = _tool_call(d, "verify_identity", name="Nikhil", date_of_birth=spoken)
+        invoke = next(a for a in produced if isinstance(a, InvokeTool))
+        assert invoke.arguments["date_of_birth"] == spoken
+
+
+def test_the_agent_and_the_api_agree_on_what_a_full_date_of_birth_is():
+    """The two copies of this rule must not drift, and one of them already did.
+
+    `reducer._is_full_dob` mirrors `scheduling_api.app.db`'s `normalize_dob` + `is_full_dob`,
+    duplicated because the two services never import each other. The first version left out the
+    zero-padding, so "12-8-2000" — seven digits — was treated as incomplete and a caller who
+    gave a complete date would have been asked for it again. The API would have accepted it.
+
+    A disagreement in the other direction is worse: the agent waving through something the API
+    treats as a fragment costs a round trip, but the agent REFUSING what the API accepts costs
+    the caller their appointment.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scheduling_api"))
+    try:
+        from app.db import is_full_dob
+    except ImportError:  # pragma: no cover - scheduling_api deps absent
+        pytest.skip("scheduling_api is not importable from this environment")
+
+    from clinic_agent.core.reducer import _is_full_dob
+
+    for value in (
+        "12/08/2000", "12-8-2000", "3/5/2001", "03/05/2001", "7.4.1975",  # complete
+        "1990", "March 1990", "12/08", "", "   ", "placeholder", "the eighth of December",
+        "123456789", "1/2/3",                                            # not complete
+    ):
+        assert _is_full_dob(value) is is_full_dob(value), (
+            f"{value!r}: agent says {_is_full_dob(value)}, API says {is_full_dob(value)}"
+        )

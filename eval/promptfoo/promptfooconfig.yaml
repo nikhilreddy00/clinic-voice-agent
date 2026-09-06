@@ -36,3 +36,4 @@ tests:
   - file://tests/handoff.yaml
   - file://tests/safety.yaml
   - file://tests/degraded.yaml
+  - file://tests/security.yaml

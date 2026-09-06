@@ -566,3 +566,68 @@ def test_a_parent_can_book_for_a_child_from_the_same_phone(client):
         ids = {a["confirmation_id"] for a in appts["appointments"]}
         assert mine["confirmation_id"] in ids
         assert theirs["confirmation_id"] not in ids
+
+
+# =========================================================================================
+# A FRAGMENT IS NOT A CREDENTIAL (Phase 16)
+# =========================================================================================
+#
+# Found by the Phase-16 memory-security pass, against a live scratch database. `normalize_dob`
+# reduces a date to digits, so "March 1990" and "1990" both normalize to "1990" — and a booking
+# made with a partial date ENROLLED that fragment as the patient's verification secret. The
+# patient could then be verified by saying "1990", or "March 1990", or any other phrasing
+# containing that year: a four-digit credential shared with everyone born that year.
+#
+# Two independent fixes, because either one alone leaves a hole: the API refuses to enroll a
+# partial date, and it refuses to verify with one.
+
+
+def _book_with_dob(client, phone: str, name: str, dob: str) -> str:
+    slot = client.get("/availability").json()["slots"][0]["slot_id"]
+    hold = client.post("/hold-slot", json={"slot_id": slot}).json()
+    resp = client.post("/confirm-booking", json={
+        "hold_id": hold["hold_id"], "patient_name": name, "reason": "checkup",
+        "date_of_birth": dob, "phone": phone,
+    })
+    assert resp.status_code == 200, resp.text
+    return resp.json()["confirmation_id"]
+
+
+def test_a_partial_date_of_birth_never_becomes_a_credential(client):
+    """The booking still succeeds — the appointment is not the caller's fault. What must not
+    happen is the fragment being enrolled as the secret that unlocks the record."""
+    _book_with_dob(client, "+15559990000", "Partial Pat", "1990")
+
+    for attempt in ("1990", "March 1990", "in 1990"):
+        resp = client.post("/verify-identity",
+                           json={"phone": "+15559990000", "date_of_birth": attempt})
+        assert resp.status_code == 403, f"{attempt!r} verified as a whole date of birth"
+
+
+def test_a_partial_date_is_refused_identically_to_a_wrong_one(client):
+    """No oracle. Answering "that is not a full date" only when the number is enrolled would
+    tell a caller whether the number is on file — the exact disclosure the shared 403 exists to
+    prevent."""
+    _book_with_dob(client, "+15559990001", "Enrolled Ellis", "04/02/1988")
+
+    enrolled = client.post("/verify-identity",
+                           json={"phone": "+15559990001", "date_of_birth": "1988"})
+    unknown = client.post("/verify-identity",
+                          json={"phone": "+15559998888", "date_of_birth": "1988"})
+    wrong = client.post("/verify-identity",
+                        json={"phone": "+15559990001", "date_of_birth": "01/01/1900"})
+
+    assert enrolled.status_code == unknown.status_code == wrong.status_code == 403
+    assert enrolled.json() == unknown.json() == wrong.json()
+
+
+def test_a_full_date_of_birth_still_works(client):
+    """The guard must not cost a real caller anything — including the spoken forms the agent
+    normalizes to, which is why this asserts on more than one shape."""
+    _book_with_dob(client, "+15559990002", "Whole Wren", "7/4/1975")
+
+    for spoken in ("07/04/1975", "7/4/1975", "7-4-1975"):
+        resp = client.post("/verify-identity",
+                           json={"phone": "+15559990002", "date_of_birth": spoken})
+        assert resp.status_code == 200, f"{spoken!r} was refused"
+        assert resp.json()["name"] == "Whole Wren"

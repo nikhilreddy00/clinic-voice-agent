@@ -214,7 +214,24 @@ async def main() -> int:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"\nresults: {path}")
 
-    ok = detector["recall"] == 1.0 and (
+    # FALSE POSITIVES ARE GATED TOO, at zero, and that is not perfectionism.
+    #
+    # Recall was always a build-breaker: a missed emergency is the worst outcome this system
+    # has. But a false positive is not merely noise here — `Intent.EMERGENCY` strips every tool
+    # and swaps the prompt for the 911 script, so a caller with a stubbed toe gets read
+    # emergency instructions by an agent that has lost the ability to book them anything. A live
+    # call did exactly that with a knee laceration (see intents.CLASSIFIER_ONLY_ADVISORY), and
+    # the detector is the half that must not repeat it.
+    #
+    # Zero is the measured state across the whole labelled set, so this gates the status quo
+    # rather than an aspiration. A newly added case that trips it is a decision someone has to
+    # make deliberately — which is the point.
+    detector_clean = detector["recall"] == 1.0 and not detector["false_positives"]
+    if not args.detector_only:
+        print(f"  detector false positives == 0 : "
+              f"{'PASS' if not detector['false_positives'] else 'FAIL'} "
+              f"({len(detector['false_positives'])})")
+    ok = detector_clean and (
         args.detector_only or payload.get("classifier", {}).get("accuracy", 0) >= 0.95
     )
     return 0 if ok else 1

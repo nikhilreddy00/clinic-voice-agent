@@ -561,11 +561,14 @@ async def confirm_booking(
             )).fetchone()
 
             # Phase 13: the booking is what creates the patient record, so the NEXT call from
-            # this number is a returning caller. Only with a phone AND a DOB -- a patient row
-            # without a DOB can never be verified, so it would be memory that is permanently
-            # useless for anything except a name we are not allowed to speak.
+            # this number is a returning caller. Only with a phone AND a FULL DOB -- a patient
+            # row without a DOB can never be verified, so it would be memory that is
+            # permanently useless for anything except a name we are not allowed to speak; and a
+            # row enrolled with a PARTIAL one is worse than useless, because that fragment
+            # becomes the credential (see is_full_dob). The booking itself still records
+            # whatever the caller said, so nothing is lost from the appointment.
             patient_id = None
-            if phone and date_of_birth:
+            if phone and is_full_dob(date_of_birth):
                 patient_id = await _upsert_patient(
                     conn, slot["clinic_id"], phone, patient_name, date_of_birth
                 )
@@ -740,6 +743,22 @@ def normalize_dob(value: str | None) -> str:
     return "".join(parts)
 
 
+def is_full_dob(value: str | None) -> bool:
+    """Whether this is a whole date of birth rather than a fragment of one.
+
+    THIS IS A CREDENTIAL CHECK, NOT A FORMAT PREFERENCE. `normalize_dob` reduces to digits, so
+    "March 1990" and "1990" both normalize to "1990" — and until this existed, a booking made
+    with a partial date ENROLLED that fragment as the patient's verification secret. Measured
+    against a live scratch database: a patient booked with date_of_birth "1990" could then be
+    verified by saying "1990", or "March 1990", or any other phrasing containing that year.
+    A four-digit credential shared by everyone born that year is not a second factor.
+
+    Eight digits is MMDDYYYY, which is what the agent normalizes speech to and what the
+    scheduling API stores. Anything shorter is a fragment; anything longer is not a date.
+    """
+    return len(normalize_dob(value)) == 8
+
+
 async def _upsert_patient(
     conn: AsyncConnection, clinic_id: int, phone: str | None, name: str, date_of_birth: str
 ) -> int:
@@ -818,7 +837,13 @@ async def _verify(
     anyone holding an enrolled patient's handset could verify as somebody else by name and DOB
     and have that person's bookings re-pointed at the phone they are holding.
     """
-    if not normalize_dob(date_of_birth):
+    # A FRAGMENT IS NOT A CREDENTIAL. "1990" normalizes to four digits and would match any
+    # patient enrolled with a partial date — see is_full_dob. Refused with the IDENTICAL body
+    # a wrong date gets: saying "that is not a full date of birth" only when the number is
+    # enrolled would turn the malformed-input path into the patient-enumeration oracle the
+    # 403 exists to prevent. The agent answers a partial date in the reducer instead, before
+    # it ever becomes a request (reducer._MISSING_DOB_RESULT).
+    if not is_full_dob(date_of_birth):
         raise NotVerified("Identity not verified")
 
     if phone:

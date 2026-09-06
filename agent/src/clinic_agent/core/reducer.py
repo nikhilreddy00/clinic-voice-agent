@@ -689,6 +689,44 @@ _MISSING_DOB_RESULT = {
     ),
 }
 
+# A PARTIAL date is the same class of problem as a blank one, and a worse one to send. The API
+# refuses it with the identical 403 a wrong date gets (it has to: differentiating them turns
+# the endpoint into a patient-enumeration oracle), so from the model's side an incomplete
+# birthday and a wrong birthday are indistinguishable — and it would tell the caller their date
+# of birth does not match when in fact it never asked for the year.
+#
+# Answering here costs no round trip and names the actual problem.
+_PARTIAL_DOB_RESULT = {
+    "ok": False,
+    "error": (
+        "date_of_birth is incomplete — you need the month, the day AND the year. Ask the "
+        "caller for the missing part, then call verify_identity again. Do not tell them their "
+        "date of birth did not match; it has not been checked yet."
+    ),
+}
+
+
+def _is_full_dob(value: str) -> bool:
+    """Month, day AND year — MMDDYYYY once normalized.
+
+    Mirrors `scheduling_api.app.db.normalize_dob` + `is_full_dob`. Duplicated rather than
+    imported because the agent and the API are separate services that talk over HTTP and never
+    import each other (CLAUDE.md), the same reason the percentile helpers are duplicated. The
+    API is the security boundary and enforces this regardless; this copy exists only so the
+    caller hears a useful question instead of a refusal.
+
+    THE ZERO-PADDING IS NOT COSMETIC, and leaving it out is how this drifted on its first test:
+    "12-8-2000" is seven digits, and a bare digit count rejects a caller who gave a complete
+    date in a form the agent normalizes every day. A three-part value is padded to MM DD YYYY
+    exactly as the API does; anything else keeps its digits and fails the length check, which is
+    the intended outcome for "1990" and "March 1990".
+    """
+    parts = [g for g in re.split(r"\D+", (value or "").strip()) if g]
+    if len(parts) == 3:
+        month, day, year = parts
+        return len(f"{month.zfill(2)}{day.zfill(2)}{year.zfill(4)}") == 8
+    return len("".join(parts)) == 8
+
 _UNVERIFIED_RESULT = {
     "ok": False,
     "error": (
@@ -756,15 +794,19 @@ def _on_tool_use(state: CallState, e: ev.LLMToolUse):
     # response to leak, and the whole decision is visible in a replayed trace.
     # Same mechanism as the gate below, one step earlier: synthesize the answer rather than
     # spend a round trip discovering the argument was blank.
-    if e.name == "verify_identity" and not str(e.arguments.get("date_of_birth") or "").strip():
-        state = replace(
-            state,
-            turn_tool_uses=state.turn_tool_uses + (block,),
-            turn_had_tool=True,
-            tool_results=state.tool_results
-            + (_tool_result_block(e.tool_call_id, _MISSING_DOB_RESULT),),
-        )
-        return state, []
+    if e.name == "verify_identity":
+        submitted_dob = str(e.arguments.get("date_of_birth") or "").strip()
+        if not submitted_dob or not _is_full_dob(submitted_dob):
+            state = replace(
+                state,
+                turn_tool_uses=state.turn_tool_uses + (block,),
+                turn_had_tool=True,
+                tool_results=state.tool_results + (_tool_result_block(
+                    e.tool_call_id,
+                    _MISSING_DOB_RESULT if not submitted_dob else _PARTIAL_DOB_RESULT,
+                ),),
+            )
+            return state, []
 
     if e.name in VERIFICATION_REQUIRED_TOOLS and not state.identity_verified:
         state = replace(
