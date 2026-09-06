@@ -9,6 +9,10 @@ event stream will, and this prints the parts that matter: what the caller said, 
 and whether they succeeded, where the engine held a turn instead of interrupting, the
 per-stage latency breakdown, and the verdict at the end.
 
+For the same call as a page — transcript, tool outcomes, and a per-turn latency waterfall —
+see `trace_viewer.py`. This stays the terminal tool; that one answers "where did this turn's
+two seconds go", which a column of numbers answers badly.
+
 The latency table is the point of the stage split. A single voice-to-voice number cannot tell
 you whether a slow call is the model, the endpointer, or the speech queue, and those have
 completely different fixes. Measured on the 2026-09-03 calls, LLM TTFT was 52% of every turn —
