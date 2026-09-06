@@ -51,6 +51,10 @@ echo "==> session_router"
 echo "==> tier 1 — recorded calls replayed through the reducer (no API calls, no cost)"
 "$ROOT/agent/.venv/bin/python" "$ROOT/eval/tier1_replay.py"
 
+echo "==> tier 2 harness — scripted model, real client, real HTTP, real Postgres (no cost)"
+CLINIC_EVAL_DATABASE_URL="postgresql://postgres@127.0.0.1:${PGPORT}/clinic_eval" \
+    "$ROOT/agent/.venv/bin/python" "$ROOT/eval/run_eval.py" --fake-backend
+
 echo "==> emergency detector (no API calls, no cost)"
 "$ROOT/agent/.venv/bin/python" "$ROOT/eval/run_intent_eval.py" --detector-only
 

@@ -42,6 +42,22 @@ from datetime import date, datetime, timedelta, timezone
 _TODAY = datetime.now(timezone.utc).date()
 
 
+def today() -> date:
+    """The clinic day the CURRENT clock says it is — not the one this module was imported on.
+
+    The expected dates below are computed once at import, and the API seeds its slots from the
+    clock in its own process. Those two agree right up until the day rolls over mid-run, at
+    which point a case that expected "tomorrow" fails for a reason no amount of reading the
+    transcript will reveal.
+
+    `run_eval.main()` compares this against the value it captured at start-up and says so. That
+    is deliberately a WARNING rather than an injected date: threading one through 500 lines of
+    case definitions would touch every case to prevent a failure that announces itself in one
+    line, and a suite nobody wants to edit is a suite that stops being extended.
+    """
+    return datetime.now(timezone.utc).date()
+
+
 def _next_weekday_with_slots(from_date: date) -> date:
     """First Mon-Fri strictly after `from_date` (the seed skips weekends)."""
     d = from_date + timedelta(days=1)

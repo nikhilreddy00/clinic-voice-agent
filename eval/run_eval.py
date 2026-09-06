@@ -1,7 +1,7 @@
 """Headless Phase-3 eval harness for the clinic voice agent.
 
 Runs each scripted conversation in `test_cases.py` through the REAL Phase-2 dialogue brain —
-`build_phase2_system_prompt()` + the scheduling-API tool schema + Anthropic/Claude + the real
+`build_system_prompt(SCHEDULE_APPOINTMENT)` + the tool schema + Anthropic/Claude + the real
 `SchedulingClient` HTTP calls against the mock API — but WITHOUT the audio pipeline (no mic, no
 ASR, no TTS). Simulated user utterances are fed as text straight into the LLM context, so the
 suite runs fast and repeatably in CI while still exercising the actual booking/tool-calling
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import socket
@@ -64,7 +65,8 @@ load_dotenv(REPO_ROOT / "agent" / ".env")
 
 from pipecat.adapters.services.anthropic_adapter import AnthropicLLMAdapter  # noqa: E402
 
-from clinic_agent.prompts import build_phase2_system_prompt  # noqa: E402
+from clinic_agent.intents import Intent  # noqa: E402
+from clinic_agent.prompts import build_system_prompt  # noqa: E402
 from clinic_agent.scheduling_tools import SchedulingClient, build_tools_schema  # noqa: E402
 
 import test_cases  # noqa: E402  (sibling module)
@@ -89,6 +91,37 @@ MAX_TOKENS = 1024
 EVAL_DATABASE_URL = os.getenv(
     "CLINIC_EVAL_DATABASE_URL", "postgresql://postgres@127.0.0.1:55432/clinic_eval"
 )
+
+
+def shard_database_url(index: int) -> str:
+    """`clinic_eval`, then `clinic_eval_2`, `clinic_eval_3`, ... for the extra shards.
+
+    Derived from the configured URL rather than configured separately, so pointing
+    CLINIC_EVAL_DATABASE_URL somewhere else moves every shard with it.
+    """
+    if index == 0:
+        return EVAL_DATABASE_URL
+    base, _, name = EVAL_DATABASE_URL.rpartition("/")
+    return f"{base}/{name}_{index + 1}"
+
+
+def ensure_database(url: str) -> None:
+    """Create a shard's database if it is missing. Idempotent, silent when it already exists.
+
+    Without this, `--workers 4` fails on every machine where somebody once created `clinic_eval`
+    by hand and nothing else — which is every machine.
+    """
+    import psycopg  # type: ignore
+
+    base, _, name = url.rpartition("/")
+    try:
+        with psycopg.connect(url, connect_timeout=5) as conn:
+            conn.execute("SELECT 1")
+        return
+    except psycopg.Error:
+        pass
+    with psycopg.connect(f"{base}/postgres", connect_timeout=5, autocommit=True) as conn:
+        conn.execute(f'CREATE DATABASE "{name}"')
 
 
 # =========================================================================================
@@ -233,9 +266,18 @@ async def _execute_tool(name: str, args: dict, client: SchedulingClient, trace: 
     elif name == "hold_slot":
         result = await client.hold_slot(slot_id=args.get("slot_id"))
     elif name == "confirm_booking":
+        # date_of_birth / new_patient / symptom_notes used to be DROPPED here while
+        # `score_case` asserted on them from the model's own arguments. The suite therefore
+        # reported "date of birth captured correctly" about a value the backend never saw: a
+        # booking could score green with no date of birth in Postgres at all. Since Phase 13
+        # the DOB is the credential a returning caller verifies with, so a booking that does
+        # not carry one is a patient who cannot be recognised on their next call.
         result = await client.confirm_booking(
             hold_id=args.get("hold_id"), patient_name=args.get("patient_name"),
             reason=args.get("reason"),
+            date_of_birth=args.get("date_of_birth"),
+            new_patient=args.get("new_patient"),
+            symptom_notes=args.get("symptom_notes"),
         )
     elif name == "get_clinic_info":
         # Phase 13 put a curated fact lookup in the scheduling tool set, so a case can ask
@@ -629,7 +671,15 @@ async def run_suite(cases: list[EvalCase], base_url: str, database_url: str, bac
     one case can never leak a 409 into the next.
     """
     tools = tools_for_backend(backend)
-    system_prompt = build_phase2_system_prompt()
+    # Checked, not assumed: build_system_prompt(SCHEDULE_APPOINTMENT) is byte-identical BOTH to
+    # the old build_phase2_system_prompt() and to the intent=None prompt a caller gets on turn
+    # one, and the unscoped build_tools_schema() is the same four tools a scheduling intent is
+    # given. Every case in this suite is a scheduling flow, so it already measured exactly what
+    # a booking caller meets — the "Phase-2" name was the only stale thing about it.
+    #
+    # What it does NOT exercise is intent SCOPING: no classifier runs here, so reschedule,
+    # cancel and refill flows are not covered. That is eval/promptfoo/, which is per-intent.
+    system_prompt = build_system_prompt(Intent.SCHEDULE_APPOINTMENT)
     seed_dates = seeded_dates()
 
     results: list[CaseResult] = []
@@ -648,36 +698,86 @@ async def run_suite(cases: list[EvalCase], base_url: str, database_url: str, bac
     return results
 
 
-async def _run_all(cases: list[EvalCase], base_url: str, database_url: str,
-                   model: str) -> list[CaseResult]:
-    """Single-model entrypoint used by `main()` (the pre-Phase-8 behaviour, now streaming)."""
+async def run_suite_parallel(cases: list[EvalCase], shards: list[tuple[str, str]], backend, *,
+                             metrics: RunMetrics | None = None) -> list[CaseResult]:
+    """Run the suite across several (base_url, database_url) shards at once.
+
+    ISOLATION MOVED; IT DID NOT DISAPPEAR. This suite was sequential because every case begins
+    by truncating the database, so two cases sharing one database would truncate each other's
+    slots mid-booking. A shard is therefore a whole stack — its own scratch database AND its own
+    API process — and each shard still runs its slice one case at a time with a reset between.
+    N cases against N databases is safe; N cases against one is not, and no amount of care in
+    the driver changes that.
+
+    Results come back in the original case order rather than in completion order, so the summary
+    table and the results file do not reshuffle from run to run.
+    """
+    buckets: list[list[tuple[int, EvalCase]]] = [[] for _ in shards]
+    for i, case in enumerate(cases):
+        buckets[i % len(shards)].append((i, case))
+
+    async def one_shard(shard, bucket):
+        base_url, database_url = shard
+        out = []
+        for index, case in bucket:
+            result = await run_suite([case], base_url, database_url, backend, metrics=metrics)
+            out.append((index, result[0]))
+        return out
+
+    gathered = await asyncio.gather(*(
+        one_shard(shard, bucket) for shard, bucket in zip(shards, buckets) if bucket
+    ))
+    return [r for _, r in sorted((pair for shard in gathered for pair in shard),
+                                 key=lambda p: p[0])]
+
+
+async def _run_all(cases: list[EvalCase], shards: list[tuple[str, str]],
+                   model: str, *, backend=None) -> list[CaseResult]:
+    """Single-model entrypoint used by `main()`."""
     from providers import Candidate
 
-    # An explicit --model / ANTHROPIC_MODEL may name something outside the candidate registry,
-    # so fall back to a bare Anthropic candidate rather than requiring registration.
-    candidate = next(
-        (c for c in CANDIDATES.values() if c.provider == "anthropic" and c.model == model),
-        Candidate(key="custom", label=model, provider="anthropic", model=model),
-    )
-    backend = build_backend(candidate, max_tokens=MAX_TOKENS)
+    owned = backend is None
+    if owned:
+        # An explicit --model / ANTHROPIC_MODEL may name something outside the candidate
+        # registry, so fall back to a bare Anthropic candidate rather than requiring
+        # registration.
+        candidate = next(
+            (c for c in CANDIDATES.values() if c.provider == "anthropic" and c.model == model),
+            Candidate(key="custom", label=model, provider="anthropic", model=model),
+        )
+        backend = build_backend(candidate, max_tokens=MAX_TOKENS)
     try:
-        return await run_suite(cases, base_url, database_url, backend)
+        if len(shards) == 1:
+            base_url, database_url = shards[0]
+            return await run_suite(cases, base_url, database_url, backend)
+        return await run_suite_parallel(cases, shards, backend)
     finally:
-        await backend.close()
+        if owned:
+            await backend.close()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Phase-3 headless eval harness")
+    parser = argparse.ArgumentParser(description="Headless text-in-the-loop eval (Tier 2)")
     parser.add_argument("--only", action="append", default=[],
                         help="Run only the given case id(s); repeatable.")
     parser.add_argument("--model", default=None,
                         help="Override the Claude model (else ANTHROPIC_MODEL / "
                              "claude-haiku-4-5-20251001).")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel shards. Each gets its OWN scratch database and its own "
+                             "API process — see run_suite_parallel for why sharing one is not "
+                             "an option. Each shard costs an API subprocess start (~1s), so "
+                             "this pays only when cases spend real time in a model.")
+    parser.add_argument("--fake-backend", action="store_true",
+                        help="Drive the harness with a scripted model instead of a real one. "
+                             "No API key, no cost, no network to Anthropic — this tests the "
+                             "HARNESS, not the model, and is what CI runs on every commit.")
     args = parser.parse_args()
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not args.fake_backend and not os.getenv("ANTHROPIC_API_KEY"):
         print("ERROR: ANTHROPIC_API_KEY is not set. Add it to agent/.env — this eval calls the "
-              "real Anthropic API.", file=sys.stderr)
+              "real Anthropic API. (Or pass --fake-backend to exercise the harness for free.)",
+              file=sys.stderr)
         return 2
 
     cases = [c for c in ALL_CASES if c.id in args.only] if args.only else ALL_CASES
@@ -686,11 +786,54 @@ def main() -> int:
         return 2
 
     model = args.model or os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-    database_url = EVAL_DATABASE_URL
+    backend = None
+    if args.fake_backend:
+        from fake_backend import ScriptedBackend
 
-    print(f"Starting scheduling API (scratch DB); model={model}")
-    with MockApiServer(database_url) as server:
-        results = asyncio.run(_run_all(cases, server.base_url, database_url, model))
+        backend, model = ScriptedBackend(), "scripted (no model was called)"
+        if not args.only:
+            # The script books unconditionally, so the five cases that must NOT end in a
+            # booking (3 escalated, 2 gracefully_handled) fail by construction. Refusing to
+            # book when refusing is right is a judgement a model makes; a script that only
+            # LOOKED like it made it would be the fake proving something it cannot.
+            skipped = [c for c in cases if c.expected.outcome != "booked"]
+            cases = [c for c in cases if c.expected.outcome == "booked"]
+            print(f"--fake-backend: running the {len(cases)} booking cases; skipping "
+                  f"{len(skipped)} that must NOT book ({', '.join(c.id for c in skipped)}) — "
+                  f"refusing is a model judgement, not a harness property.")
+
+    workers = max(1, min(args.workers, len(cases)))
+    started_on = test_cases.today()
+
+    print(f"Starting {workers} scheduling API shard(s); model={model}")
+    with contextlib.ExitStack() as stack:
+        shards = []
+        for i in range(workers):
+            url = shard_database_url(i)
+            ensure_database(url)
+            server = stack.enter_context(MockApiServer(url))
+            shards.append((server.base_url, url))
+        results = asyncio.run(_run_all(cases, shards, model, backend=backend))
+
+    # The cases compute their expected dates from the clock at import (test_cases.today()), and
+    # the API seeds slots from the clock in its own process. Those agree until the clinic day
+    # rolls over mid-run, and then a case that expected "tomorrow" fails for a reason no amount
+    # of reading the transcript will reveal. Cheaper to say so than to make 500 lines of case
+    # definitions take an injected date.
+    if test_cases.today() != started_on:
+        print(f"\nWARNING: the clinic day rolled over mid-run ({started_on} -> "
+              f"{test_cases.today()}). Date-constraint failures below are the clock, not the "
+              f"agent. Re-run.", file=sys.stderr)
+
+    if args.fake_backend:
+        # BEFORE the table, not after it. The per-category lines will read "0/6 passed" because
+        # the script books every case with the same name and reason, and a reader who meets
+        # that in a green CI log without the explanation above it learns to ignore the gate.
+        print("\n--fake-backend scores OUTCOME only: did the harness reach a committed booking "
+              "through the real client, real HTTP and real Postgres. The slot-filling column "
+              "below is expected to be red — extracting a caller's name and reason from a "
+              "sentence is the model's job, and there is no model here. A green run means the "
+              "harness works, never that the agent does.")
 
     summary = print_summary(results)
     write_results(results, summary, model)
@@ -698,6 +841,14 @@ def main() -> int:
     # 3 = one or more cases errored on infrastructure (e.g. API 429) and couldn't be scored.
     if summary["errored"]:
         return 3
+    if args.fake_backend:
+        # SLOT-FILLING IS NOT SCORED HERE, and pretending otherwise is the only way this mode
+        # could mislead. The script books every case with the same name and reason because
+        # extracting "Sam" and "flu shot" from a sentence is precisely the work a model does —
+        # so it fails the per-case value checks by construction. What it proves is that the
+        # harness reaches a committed booking through the real client, real HTTP and real
+        # Postgres, and that the scorer and the exit code agree about it.
+        return 0 if summary["outcome_matches"] == summary["scored_total"] else 1
     return 0 if summary["passed"] == summary["scored_total"] else 1
 
 

@@ -75,9 +75,10 @@ jobs:
           (cd session_router && uv sync --extra dev)
 
       - name: run_e2e.sh — every offline suite, the seam included
-        # scheduling_api (90) + agent unit and end-to-end + session_router (26) + Tier-1 replay
-        # + the emergency detector. The e2e suite refuses to run unless the API reports the
-        # scratch database by name, so a misconfigured runner is a skip, never a false pass.
+        # scheduling_api + agent unit and end-to-end + session_router + Tier-1 replay + the
+        # Tier-2 harness driven by a scripted model + the emergency detector. The e2e suite
+        # refuses to run unless the API reports the scratch database by name, so a
+        # misconfigured runner is a skip, never a false pass.
         run: ./run_e2e.sh
 
       - name: Landing-page claims still match the code
@@ -134,6 +135,11 @@ jobs:
       - name: Fail fast without a key
         # Better than 81 cases erroring one at a time with an auth message each.
         run: test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY secret is not set"; exit 1; }
+
+      - name: Tier 2 — text-in-the-loop, 19 cases against a real model
+        # Sharded across 4 scratch databases and 4 API processes. Sharing one database is not
+        # an option: every case starts by truncating it. See run_suite_parallel.
+        run: agent/.venv/bin/python eval/run_eval.py --workers 4
 
       - name: Intent eval — emergency recall must be 100%
         run: agent/.venv/bin/python eval/run_intent_eval.py
