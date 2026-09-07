@@ -55,6 +55,9 @@ class CallState:
 
     call_id: str = ""
     mode: str = "local"
+    # The clinic being answered for (Phase 17). Empty means "whatever prompts.greeting_for
+    # defaults to", which keeps every pre-tenancy trace replaying to the same greeting.
+    clinic_name: str = ""
     phase: Phase = Phase.INIT
 
     # --- conversation -------------------------------------------------------------------

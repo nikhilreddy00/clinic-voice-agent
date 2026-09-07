@@ -197,3 +197,17 @@ class CallMetricsResponse(BaseModel):
     call_id: str
     turns: int
     tools: int
+
+
+class ClinicResponse(BaseModel):
+    """A tenant's public identity, resolved from the number the caller dialed (Phase 17).
+
+    Deliberately not PHI and deliberately small: the agent needs a name to say, a zone to reason
+    about "tomorrow" in, and somewhere to transfer a call that needs a person.
+    """
+
+    slug: str
+    name: str
+    timezone: str
+    did: str | None = None
+    transfer_number: str | None = None

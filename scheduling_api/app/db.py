@@ -24,8 +24,11 @@ than a separate release-then-acquire that could interleave.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
+import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -42,6 +45,8 @@ from psycopg_pool import AsyncConnectionPool
 
 from . import seed_data
 
+_logger = logging.getLogger("clinic.api")
+
 # The clinic's wall clock. Slot times are stored as timestamptz (absolute instants), so this is
 # used for *reasoning* about the clinic's day -- "has this time passed today?" -- not storage.
 CLINIC_TZ = ZoneInfo("America/New_York")
@@ -52,9 +57,18 @@ HOLD_TTL_SECONDS = int(os.getenv("CLINIC_HOLD_TTL_SECONDS", "120"))
 # How often the background sweeper runs (see main.py lifespan).
 SWEEP_INTERVAL_SECONDS = int(os.getenv("CLINIC_SWEEP_INTERVAL_SECONDS", "30"))
 
-# Single-tenant today; every table carries clinic_id so Phase 17 multi-tenancy is a routing
-# change rather than a migration.
+# The tenant a request belongs to when it does not say (every existing caller, every script,
+# every test written before Phase 17). Multi-tenancy here IS the routing change the schema was
+# built for: `clinic_id` was on every row from Phase 9, so this phase adds a lookup and a
+# WHERE clause, not a migration.
 DEFAULT_CLINIC_SLUG = "grove-family"
+
+# The tenant of the request currently being served. A contextvar rather than a parameter on
+# forty call sites: it is ambient request metadata, it has to reach `_clinic_id` from the middle
+# of a transaction, and defaulting it keeps every pre-Phase-17 caller working untouched.
+_CLINIC_SLUG: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "clinic_slug", default=DEFAULT_CLINIC_SLUG
+)
 
 DATABASE_URL = os.getenv(
     "CLINIC_DATABASE_URL", "postgresql://postgres@127.0.0.1:5432/clinic_dev"
@@ -184,7 +198,63 @@ async def init_db() -> None:
     async with p.connection() as conn:
         await conn.execute(_SCHEMA_PATH.read_text())
         await migrate_patient_identity(conn)
+        await migrate_phi_at_rest(conn)
         await _seed(conn)
+
+
+async def migrate_phi_at_rest(conn: AsyncConnection) -> dict[str, int]:
+    """Bring stored PHI up to the configured posture. Idempotent; runs on every boot.
+
+    Two conversions, both one-directional:
+
+      * every `date_of_birth` (patients AND bookings) becomes `dob_key(...)` — canonical when
+        no key is configured, digested when one is;
+      * every plaintext `symptom_notes` becomes `pgp:`-marked ciphertext once a key is
+        configured.
+
+    Doing it here rather than in schema.sql is the same reason `migrate_patient_identity` is
+    Python: the transform needs the key and the canonicalization rules that live in this module,
+    and the two migrations have to run in this order — patients are canonicalized and deduped
+    before the unique key exists, and only then is it safe to rewrite the rest.
+
+    Note what this deliberately does NOT do: there is no path back. Turning a key off leaves the
+    digests in place and every caller unverifiable, which is the correct behaviour for a
+    credential and is why the key is documented as part of the data.
+    """
+    counts = {"patient_dobs": 0, "booking_dobs": 0, "notes": 0}
+
+    for table, counter in (("patients", "patient_dobs"), ("bookings", "booking_dobs")):
+        key_column = "id" if table == "patients" else "confirmation_id"
+        rows = await (await conn.execute(
+            f"SELECT {key_column} AS k, date_of_birth FROM {table} "
+            f"WHERE date_of_birth IS NOT NULL"
+        )).fetchall()
+        for row in rows:
+            stored = dob_key(row["date_of_birth"])
+            if stored != row["date_of_birth"]:
+                await conn.execute(
+                    f"UPDATE {table} SET date_of_birth = %s WHERE {key_column} = %s",
+                    (stored, row["k"]),
+                )
+                counts[counter] += 1
+
+    if PHI_KEY:
+        # pgcrypto is required the moment a key is configured. If it cannot be installed, that
+        # is a hard failure at boot: quietly continuing would write plaintext into a deployment
+        # whose operator believes it is encrypted.
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        result = await conn.execute(
+            f"""
+            UPDATE bookings
+               SET symptom_notes = %s || encode(pgp_sym_encrypt(symptom_notes, %s), 'base64')
+             WHERE symptom_notes IS NOT NULL
+               AND symptom_notes NOT LIKE %s
+            """,
+            (_NOTE_PREFIX, PHI_KEY, f"{_NOTE_PREFIX}%"),
+        )
+        counts["notes"] = result.rowcount or 0
+
+    return counts
 
 
 async def migrate_patient_identity(conn: AsyncConnection) -> dict[str, int]:
@@ -220,7 +290,7 @@ async def migrate_patient_identity(conn: AsyncConnection) -> dict[str, int]:
         "SELECT id, date_of_birth FROM patients WHERE date_of_birth IS NOT NULL"
     )).fetchall()
     for row in rows:
-        canonical = normalize_dob(row["date_of_birth"])
+        canonical = dob_key(row["date_of_birth"])
         if canonical != row["date_of_birth"]:
             await conn.execute(
                 "UPDATE patients SET date_of_birth = %s WHERE id = %s", (canonical, row["id"])
@@ -261,27 +331,53 @@ async def migrate_patient_identity(conn: AsyncConnection) -> dict[str, int]:
     return counts
 
 
-async def _clinic_id(conn: AsyncConnection, slug: str = DEFAULT_CLINIC_SLUG) -> int:
+async def _clinic_id(conn: AsyncConnection, slug: str | None = None) -> int:
+    """The clinic this request belongs to.
+
+    `slug=None` means "the request's tenant" — the `X-Clinic-Slug` header bound by main.py's
+    middleware, falling back to DEFAULT_CLINIC_SLUG. Passing a slug explicitly is for seeding
+    and maintenance, which iterate over tenants rather than serving one.
+    """
     row = await (await conn.execute(
-        "SELECT id FROM clinics WHERE slug = %s", (slug,)
+        "SELECT id FROM clinics WHERE slug = %s", (slug or _CLINIC_SLUG.get(),)
     )).fetchone()
     if row is None:
-        raise RuntimeError(f"clinic {slug!r} is not seeded")
+        raise RuntimeError(f"clinic {slug or _CLINIC_SLUG.get()!r} is not seeded")
     return row["id"]
 
 
+async def clinic_by_did(did: str) -> dict[str, Any] | None:
+    """Resolve a DIALED number to its tenant. The agent's entry point into multi-tenancy."""
+    async with pool().connection() as conn:
+        return await (await conn.execute(
+            """
+            SELECT slug, name, timezone, did, transfer_number
+              FROM clinics WHERE did = %s
+            """,
+            (did,),
+        )).fetchone()
+
+
 async def _seed(conn: AsyncConnection) -> None:
-    """Insert the synthetic clinic, providers, and slots. Idempotent via fixed keys."""
+    """Insert every synthetic tenant, its providers and its slots. Idempotent via fixed keys."""
+    for clinic in seed_data.CLINICS:
+        await _seed_clinic(conn, clinic)
+    await refresh_available_slots(conn)
+
+
+async def _seed_clinic(conn: AsyncConnection, clinic: "seed_data.ClinicSeed") -> None:
     await conn.execute(
         """
-        INSERT INTO clinics (slug, name, timezone) VALUES (%s, %s, %s)
-        ON CONFLICT (slug) DO NOTHING
+        INSERT INTO clinics (slug, name, timezone, did, transfer_number)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (slug) DO UPDATE
+            SET did = EXCLUDED.did, transfer_number = EXCLUDED.transfer_number
         """,
-        (DEFAULT_CLINIC_SLUG, seed_data.CLINIC_NAME, str(CLINIC_TZ)),
+        (clinic.slug, clinic.name, str(clinic.timezone), clinic.did, clinic.transfer_number),
     )
-    clinic_id = await _clinic_id(conn)
+    clinic_id = await _clinic_id(conn, clinic.slug)
 
-    for provider_id, name, specialty in seed_data.PROVIDERS:
+    for provider_id, name, specialty in clinic.providers:
         await conn.execute(
             """
             INSERT INTO providers (id, clinic_id, name, specialty) VALUES (%s, %s, %s, %s)
@@ -290,7 +386,7 @@ async def _seed(conn: AsyncConnection) -> None:
             (provider_id, clinic_id, name, specialty),
         )
 
-    for slot_id, provider_id, start, reason in seed_data.generate_slots():
+    for slot_id, provider_id, start, reason in seed_data.generate_slots(clinic):
         await conn.execute(
             """
             INSERT INTO slots (id, clinic_id, provider_id, start_time, reason_category, status)
@@ -300,7 +396,7 @@ async def _seed(conn: AsyncConnection) -> None:
             (slot_id, clinic_id, provider_id, start, reason),
         )
 
-    for topic, content in seed_data.CLINIC_FACTS.items():
+    for topic, content in clinic.facts.items():
         await conn.execute(
             """
             INSERT INTO clinic_facts (clinic_id, topic, content) VALUES (%s, %s, %s)
@@ -308,8 +404,6 @@ async def _seed(conn: AsyncConnection) -> None:
             """,
             (clinic_id, topic, content),
         )
-
-    await refresh_available_slots(conn)
 
 
 # =========================================================================================
@@ -387,16 +481,17 @@ async def refresh_available_slots(conn: AsyncConnection) -> None:
     out. Re-stamping the still-'available' slots keeps a long-running server offering appointments
     without a restart. Held and booked slots keep their original time.
     """
-    clinic_id = await _clinic_id(conn)
-    for slot_id, _provider_id, start, reason in seed_data.generate_slots():
-        await conn.execute(
-            """
-            UPDATE slots
-               SET start_time = %s, reason_category = %s
-             WHERE id = %s AND clinic_id = %s AND status = 'available'
-            """,
-            (start, reason, slot_id, clinic_id),
-        )
+    for clinic in seed_data.CLINICS:
+        clinic_id = await _clinic_id(conn, clinic.slug)
+        for slot_id, _provider_id, start, reason in seed_data.generate_slots(clinic):
+            await conn.execute(
+                """
+                UPDATE slots
+                   SET start_time = %s, reason_category = %s
+                 WHERE id = %s AND clinic_id = %s AND status = 'available'
+                """,
+                (start, reason, slot_id, clinic_id),
+            )
 
 
 async def sweep() -> dict[str, int]:
@@ -429,10 +524,12 @@ async def list_available_slots(
                p.specialty, s.start_time, s.reason_category
           FROM slots s
           JOIN providers p ON p.id = s.provider_id
-         WHERE s.status = 'available'
+          JOIN clinics c ON c.id = s.clinic_id
+         WHERE c.slug = %s
+           AND s.status = 'available'
            AND s.start_time >= now()
     """
-    params: list[Any] = []
+    params: list[Any] = [_CLINIC_SLUG.get()]
     if provider_id is not None:
         sql += " AND s.provider_id = %s"
         params.append(provider_id)
@@ -443,8 +540,11 @@ async def list_available_slots(
         # Compare the clinic-local calendar day: a caller asking for "Tuesday" means Tuesday in
         # the clinic's zone, not in UTC. Late-evening clinic slots fall on the next UTC day, so
         # casting in UTC would silently drop them from the requested date.
-        sql += " AND (s.start_time AT TIME ZONE %s)::date = %s::date"
-        params.extend([str(CLINIC_TZ), date])
+        # c.timezone, not the module constant: "Tuesday" means Tuesday where the CLINIC is, and
+        # tenants are not all in one zone (Bayside is Central). Reading it from the joined row
+        # keeps the answer right without a second query.
+        sql += " AND (s.start_time AT TIME ZONE c.timezone)::date = %s::date"
+        params.append(date)
     sql += " ORDER BY s.start_time, s.provider_id"
 
     async with pool().connection() as conn:
@@ -484,24 +584,28 @@ async def hold_slot(slot_id: int) -> dict[str, Any]:
     expires_at = _now() + timedelta(seconds=HOLD_TTL_SECONDS)
 
     async with pool().connection() as conn:
+        clinic_id = await _clinic_id(conn)
         row = await (await conn.execute(
             """
             UPDATE slots
                SET status = 'held', hold_id = %s, hold_expires_at = %s
              WHERE id = %s
+               AND clinic_id = %s
                AND (status = 'available'
                     OR (status = 'held' AND hold_expires_at < now()))
             RETURNING id AS slot_id, hold_id, hold_expires_at
             """,
-            (hold_id, expires_at, slot_id),
+            (hold_id, expires_at, slot_id, clinic_id),
         )).fetchone()
 
         if row is not None:
             return row
 
-        # The swap failed. Read once more only to produce the right error code.
+        # The swap failed. Read once more only to produce the right error code — scoped to this
+        # tenant, so another clinic's slot id reads as "no such slot" rather than "taken", which
+        # would confirm that the id exists somewhere.
         existing = await (await conn.execute(
-            "SELECT status FROM slots WHERE id = %s", (slot_id,)
+            "SELECT status FROM slots WHERE id = %s AND clinic_id = %s", (slot_id, clinic_id)
         )).fetchone()
 
     if existing is None:
@@ -546,11 +650,12 @@ async def confirm_booking(
                 UPDATE slots
                    SET status = 'booked', hold_id = NULL, hold_expires_at = NULL
                  WHERE hold_id = %s
+                   AND clinic_id = %s
                    AND status = 'held'
                    AND hold_expires_at > now()
                 RETURNING id AS slot_id, clinic_id, start_time, provider_id
                 """,
-                (parsed_hold,),
+                (parsed_hold, await _clinic_id(conn)),
             )).fetchone()
 
             if slot is None:
@@ -573,12 +678,17 @@ async def confirm_booking(
                     conn, slot["clinic_id"], phone, patient_name, date_of_birth
                 )
 
+            # PHI at rest (Phase 17): the DOB is stored digested and the clinical note
+            # encrypted, both no-ops until CLINIC_PHI_KEY is set. The booking still records
+            # whatever the caller said about their birthday even when it is a fragment — that
+            # is intake, not a credential; only `patients` enrolls one (see is_full_dob).
+            notes_sql, notes_params = _stored_note_sql(symptom_notes)
             await conn.execute(
-                """
+                f"""
                 INSERT INTO bookings (confirmation_id, clinic_id, slot_id, patient_id,
                                       patient_name, reason,
                                       date_of_birth, new_patient, symptom_notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, {notes_sql})
                 """,
                 (
                     confirmation_id,
@@ -587,11 +697,13 @@ async def confirm_booking(
                     patient_id,
                     patient_name,
                     reason,
-                    date_of_birth,
+                    dob_key(date_of_birth) if date_of_birth else None,
                     new_patient,
-                    symptom_notes,
+                    *notes_params,
                 ),
             )
+
+    await _audit("confirm_booking", "booking", confirmation_id)
 
     return {
         "confirmation_id": confirmation_id,
@@ -743,6 +855,105 @@ def normalize_dob(value: str | None) -> str:
     return "".join(parts)
 
 
+# =========================================================================================
+# Phase 17 — PHI at rest
+# =========================================================================================
+#
+# Two columns, two different treatments, because they are two different KINDS of thing.
+#
+# `date_of_birth` is a CREDENTIAL. It is only ever compared for equality — nothing reads it
+# back, nothing speaks it, no endpoint returns it. A value like that does not want encryption,
+# it wants a password digest: HMAC-SHA256 under CLINIC_PHI_KEY, which is one-way (a database
+# dump discloses nothing) and deterministic (so `UNIQUE (clinic_id, phone, date_of_birth)`
+# and every comparison keep working unchanged). Reversible encryption would be strictly worse
+# here — same exposure surface, plus a decryptable plaintext nobody needs.
+#
+# `symptom_notes` is CLINICAL TEXT a person has to read eventually, so it must be reversible:
+# pgcrypto `pgp_sym_encrypt`, base64'd into the existing TEXT column with a `pgp:` marker.
+#
+# CLINIC_PHI_KEY unset (the dev/test default) means both stay in the clear, with a warning at
+# boot. That is a documented posture, not a silent downgrade — `init_db` says so out loud.
+#
+# THE KEY IS PART OF THE DATA. Change or lose CLINIC_PHI_KEY and every stored date of birth
+# becomes unverifiable: the digests no longer match anything a caller can say. There is no
+# recovery path by design — that is what one-way means. Rotating it is a re-enrollment, and
+# docs/compliance.md says so.
+PHI_KEY = os.getenv("CLINIC_PHI_KEY", "").strip()
+
+_DOB_HASH_PREFIX = "h1:"   # HMAC-SHA256, v1
+_NOTE_PREFIX = "pgp:"      # pgp_sym_encrypt, base64
+
+
+def phi_at_rest_enabled() -> bool:
+    return bool(PHI_KEY)
+
+
+def dob_key(value: str | None) -> str:
+    """The stored form of a date of birth: canonical, and digested when a key is configured.
+
+    Idempotent on its own output — an already-digested value passes through untouched, which is
+    what lets the boot migration run on every start and lets `dob_matches` take either form.
+    """
+    text = str(value or "")
+    if text.startswith(_DOB_HASH_PREFIX):
+        return text
+    canonical = normalize_dob(text)
+    if not canonical or not PHI_KEY:
+        return canonical
+    digest = hmac.new(PHI_KEY.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+    return f"{_DOB_HASH_PREFIX}{digest}"
+
+
+def dob_matches(stored: str | None, spoken: str | None) -> bool:
+    """Whether a spoken date of birth matches a stored one.
+
+    Replaces the old `normalize_dob(a) == normalize_dob(b)` at every comparison site. Stored
+    values are canonical (the migration guarantees it), so exactly one side needs converting —
+    and re-normalizing a digest would silently turn it into the digits of its own hex.
+    """
+    if not stored or not spoken:
+        return False
+    return str(stored) == dob_key(spoken)
+
+
+def _stored_note_sql(value: str | None) -> tuple[str, tuple]:
+    """The VALUES fragment and parameters for writing a clinical note.
+
+    Returns a plain placeholder when no key is configured and a pgcrypto expression when one is,
+    so there is one INSERT rather than two code paths that could drift.
+    """
+    if not PHI_KEY or value is None:
+        return "%s", (value,)
+    return "%s || encode(pgp_sym_encrypt(%s, %s), 'base64')", (_NOTE_PREFIX, value, PHI_KEY)
+
+
+async def read_clinical_note(
+    confirmation_id: str, conn: AsyncConnection | None = None
+) -> str | None:
+    """A booking's symptom note, decrypted. The read half of the encryption, for staff tooling.
+
+    Nothing in the voice path calls this — the agent writes the note and never reads it back,
+    which is the whole reason the column can be encrypted at all. It exists so the ciphertext is
+    not write-only, and so the round trip is testable.
+    """
+    if conn is None:
+        async with pool().connection() as own:
+            return await read_clinical_note(confirmation_id, own)
+    row = await (await conn.execute(
+        "SELECT symptom_notes FROM bookings WHERE confirmation_id = %s", (confirmation_id,)
+    )).fetchone()
+    if row is None or row["symptom_notes"] is None:
+        return None
+    stored = row["symptom_notes"]
+    if not stored.startswith(_NOTE_PREFIX):
+        return stored  # written before a key was configured
+    decrypted = await (await conn.execute(
+        "SELECT pgp_sym_decrypt(decode(%s, 'base64'), %s) AS note",
+        (stored[len(_NOTE_PREFIX):], PHI_KEY),
+    )).fetchone()
+    return decrypted["note"]
+
+
 def is_full_dob(value: str | None) -> bool:
     """Whether this is a whole date of birth rather than a fragment of one.
 
@@ -798,7 +1009,7 @@ async def _upsert_patient(
             SET name = EXCLUDED.name
         RETURNING id
         """,
-        (clinic_id, phone, name, normalize_dob(date_of_birth)),
+        (clinic_id, phone, name, dob_key(date_of_birth)),
     )).fetchone()
     return row["id"]
 
@@ -846,16 +1057,23 @@ async def _verify(
     if not is_full_dob(date_of_birth):
         raise NotVerified("Identity not verified")
 
+    # EVERY lookup below is scoped to the requesting tenant. Before Phase 17 two of them were
+    # not — `WHERE phone = %s` and a name+DOB scan across the WHOLE patients table — which is a
+    # cross-tenant PHI disclosure reachable through the ordinary verify path the moment a second
+    # clinic exists. A phone number and a birthday are not rare enough to rely on.
+    clinic_id = await _clinic_id(conn)
+
     if phone:
         # EVERY person enrolled on this number, not just one. A shared handset holds a whole
         # household, and fetching a single row here is what let the first caller own the number
         # forever — see _upsert_patient. The DOB still decides WHICH of them is calling.
         rows = await (await conn.execute(
-            "SELECT id, name, date_of_birth FROM patients WHERE phone = %s", (phone,)
+            "SELECT id, name, date_of_birth FROM patients WHERE clinic_id = %s AND phone = %s",
+            (clinic_id, phone),
         )).fetchall()
         if rows:
             for row in rows:
-                if normalize_dob(row["date_of_birth"]) == normalize_dob(date_of_birth):
+                if dob_matches(row["date_of_birth"], date_of_birth):
                     return row
             # An enrolled number presenting a DOB that matches NOBODY on it. Still a hard stop,
             # and still for the original reason: falling through to the name+DOB search below
@@ -869,34 +1087,37 @@ async def _verify(
     # their partner's phone, a new handset, or a withheld ANI. Same two factors; no rebinding,
     # because a patient row holds one number and silently moving it would be a surprise.
     existing = await (await conn.execute(
-        "SELECT id, name, date_of_birth FROM patients WHERE date_of_birth IS NOT NULL"
+        """
+        SELECT id, name, date_of_birth FROM patients
+         WHERE clinic_id = %s AND date_of_birth IS NOT NULL
+        """,
+        (clinic_id,),
     )).fetchall()
     for row in existing:
-        if _same_name(row["name"], name) and normalize_dob(row["date_of_birth"]) == normalize_dob(
-            date_of_birth
-        ):
+        if _same_name(row["name"], name) and dob_matches(row["date_of_birth"], date_of_birth):
             return row
 
-    # DOB is compared in Python, not SQL: the column stores what the caller spoke, and
-    # normalize_dob is the only thing that knows "3-15-1990" and "03/15/1990" are one date.
+    # DOB is compared in Python, not SQL: dob_key is the only thing that knows "3-15-1990"
+    # and "03/15/1990" are one date, and (Phase 17) that the stored form is a digest.
     candidates = await (await conn.execute(
         """
         SELECT confirmation_id, clinic_id, patient_name, date_of_birth
           FROM bookings
-         WHERE status = 'confirmed'
+         WHERE clinic_id = %s
+           AND status = 'confirmed'
            AND patient_id IS NULL
            AND date_of_birth IS NOT NULL
-        """
+        """,
+        (clinic_id,),
     )).fetchall()
     matched = [
         b for b in candidates
         if _same_name(b["patient_name"], name)
-        and normalize_dob(b["date_of_birth"]) == normalize_dob(date_of_birth)
+        and dob_matches(b["date_of_birth"], date_of_birth)
     ]
     if not matched:
         raise NotVerified("Identity not verified")
 
-    clinic_id = matched[0]["clinic_id"]
     # NULL, not "": phone is UNIQUE per clinic, and an empty string would collide the moment
     # a second caller verified with no ANI (the local path). NULLs do not collide.
     patient_id = await _upsert_patient(
@@ -908,6 +1129,67 @@ async def _verify(
     )
     return {"id": patient_id, "name": matched[0]["patient_name"],
             "date_of_birth": date_of_birth}
+
+
+# =========================================================================================
+# Phase 17 — the audit trail
+# =========================================================================================
+#
+# Every access to PHI writes one row. The row records THAT it happened — who, what, which
+# record, which call, when — and never what was said or seen: an audit log that copies the data
+# it is auditing has doubled the exposure it exists to control.
+#
+# Two decisions worth knowing:
+#
+# 1. **A denial is audited too, and is the more interesting row.** "Someone tried to reach a
+#    chart with the wrong date of birth, four times, on one call" is exactly the pattern this
+#    log exists to make visible. Success-only logging would record everything except the attack.
+#
+# 2. **`_audit` takes its OWN connection, deliberately outside the caller's transaction.** A
+#    denial raises, the transaction rolls back, and a row written inside it would vanish —
+#    losing precisely the events worth keeping. The cost is one extra pooled connection per PHI
+#    call; the alternative is an audit log that cannot record failure.
+_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar("call_id", default=None)
+_ACTOR: contextvars.ContextVar[str] = contextvars.ContextVar("actor", default="voice-agent")
+
+
+def set_request_context(
+    *, call_id: str | None, actor: str | None = None, clinic_slug: str | None = None
+) -> None:
+    """Bind the current request's call id, actor and tenant. Set by main.py's middleware."""
+    _CALL_ID.set(call_id or None)
+    _ACTOR.set(actor or "voice-agent")
+    _CLINIC_SLUG.set(clinic_slug or DEFAULT_CLINIC_SLUG)
+
+
+async def _audit(action: str, resource: str, resource_id: str | int | None = None) -> None:
+    """Append one audit row. Best-effort: never fail a caller's request over telemetry."""
+    try:
+        async with pool().connection() as conn:
+            clinic_id = await _clinic_id(conn)
+            await conn.execute(
+                """
+                INSERT INTO audit_log (clinic_id, actor, action, resource, resource_id, call_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (clinic_id, _ACTOR.get(), action, resource,
+                 None if resource_id is None else str(resource_id), _CALL_ID.get()),
+            )
+    except Exception:  # noqa: BLE001 - an audit failure must not drop a caller's appointment
+        _logger.exception("audit write failed for %s", action)
+
+
+async def _audited_verify(
+    conn: AsyncConnection, action: str, phone: str, date_of_birth: str, name: str | None
+) -> dict[str, Any]:
+    """`_verify`, with the access recorded either way. The single entry point for PHI reads."""
+    try:
+        patient = await _verify(conn, phone, date_of_birth, name)
+    except NotVerified:
+        await _audit(f"{action}:denied", "patient")
+        raise
+    await _audit(action, "patient", patient["id"])
+    return patient
 
 
 async def caller_memory(phone: str) -> dict[str, Any]:
@@ -939,10 +1221,15 @@ async def caller_memory(phone: str) -> dict[str, Any]:
               FROM patients p
               LEFT JOIN bookings b ON b.patient_id = p.id
               LEFT JOIN slots s ON s.id = b.slot_id
-             WHERE p.phone = %s
+             WHERE p.clinic_id = %s AND p.phone = %s
             """,
-            (phone,),
+            (await _clinic_id(conn), phone),
         )).fetchone()
+    # Audited with no resource_id on purpose: this runs BEFORE verification, so the only
+    # identifier available is the caller's phone number — and putting that in the audit log
+    # would be storing an identifier to record that an identifier was looked at. The call_id
+    # links the row to the trace, which is what an investigation actually needs.
+    await _audit("caller_memory", "phone")
     if row is None or not row["people"]:
         return {"known": False, "upcoming_appointments": 0}
     return {"known": True, "upcoming_appointments": int(row["upcoming"] or 0)}
@@ -954,7 +1241,9 @@ async def verify_identity(
     """Check a caller against the records: phone + DOB, or name + DOB. See _verify."""
     async with pool().connection() as conn:
         async with conn.transaction():  # path 2 enrolls, so this can write
-            patient = await _verify(conn, phone, date_of_birth, name)
+            patient = await _audited_verify(
+                conn, "verify_identity", phone, date_of_birth, name
+            )
     return {"patient_id": patient["id"], "name": patient["name"]}
 
 
@@ -964,7 +1253,9 @@ async def list_appointments(
     """Upcoming confirmed appointments for a verified caller."""
     async with pool().connection() as conn:
         async with conn.transaction():
-            patient = await _verify(conn, phone, date_of_birth, name)
+            patient = await _audited_verify(
+                conn, "list_appointments", phone, date_of_birth, name
+            )
             rows = await (await conn.execute(
                 """
                 SELECT b.confirmation_id, b.slot_id, b.reason, s.start_time,
@@ -994,7 +1285,9 @@ async def cancel_appointment(
     """
     async with pool().connection() as conn:
         async with conn.transaction():
-            patient = await _verify(conn, phone, date_of_birth, name)
+            patient = await _audited_verify(
+                conn, "cancel_appointment", phone, date_of_birth, name
+            )
             booking = await (await conn.execute(
                 """
                 SELECT confirmation_id, slot_id, status
@@ -1048,7 +1341,9 @@ async def reschedule_appointment(
     """
     async with pool().connection() as conn:
         async with conn.transaction():
-            patient = await _verify(conn, phone, date_of_birth, name)
+            patient = await _audited_verify(
+                conn, "reschedule_appointment", phone, date_of_birth, name
+            )
             booking = await (await conn.execute(
                 """
                 SELECT confirmation_id, slot_id, status
@@ -1068,12 +1363,13 @@ async def reschedule_appointment(
                     UPDATE slots
                        SET status = 'booked', hold_id = NULL, hold_expires_at = NULL
                      WHERE id = %s
+                       AND clinic_id = %s
                        AND start_time >= now()
                        AND (status = 'available'
                             OR (status = 'held' AND hold_expires_at < now()))
                     RETURNING id
                     """,
-                    (new_slot_id,),
+                    (new_slot_id, await _clinic_id(conn)),
                 )).fetchone()
                 if taken is None:
                     raise SlotUnavailable(f"Slot {new_slot_id} is not available")
@@ -1119,7 +1415,9 @@ async def create_staff_task(
     """
     async with pool().connection() as conn:
         async with conn.transaction():
-            patient = await _verify(conn, phone, date_of_birth, name)
+            patient = await _audited_verify(
+                conn, "create_staff_task", phone, date_of_birth, name
+            )
             row = await (await conn.execute(
                 """
                 INSERT INTO staff_tasks (clinic_id, patient_id, kind, payload)
@@ -1139,7 +1437,8 @@ async def clinic_info(topic: str | None = None) -> dict[str, Any]:
     """
     async with pool().connection() as conn:
         rows = await (await conn.execute(
-            "SELECT topic, content FROM clinic_facts ORDER BY topic"
+            "SELECT topic, content FROM clinic_facts WHERE clinic_id = %s ORDER BY topic",
+            (await _clinic_id(conn),),
         )).fetchall()
     facts = {r["topic"]: r["content"] for r in rows}
     if topic and topic in facts:

@@ -37,6 +37,12 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams, LLMService
 
+# Phase 17: the one place that decides what a PHI-carrying value looks like in a log line.
+# Every `TOOL ▶` line below goes through it — see phi.py for why this is a module and not a
+# convention.
+from . import tenant
+from .phi import redact, redact_phone  # noqa: F401 — redact_phone is re-exported
+
 if TYPE_CHECKING:
     from .intents import Intent
     from .metrics import LatencyCollector
@@ -87,17 +93,25 @@ class SchedulingClient:
     DEFAULT_TIMEOUT_S = float(os.getenv("CLINIC_TOOL_TIMEOUT_S", "5.0"))
 
     def __init__(self, base_url: str, *, timeout: float | None = None, call_id: str | None = None,
-                 api_token: str | None = None) -> None:
+                 api_token: str | None = None, clinic_slug: str | None = None) -> None:
         timeout = self.DEFAULT_TIMEOUT_S if timeout is None else timeout
-        headers = {}
+        self._call_id = call_id or uuid.uuid4().hex
+        headers = {
+            # Phase 17: ties every audit row the API writes to this call's trace file and OTel
+            # trace. Metadata about the request, so a header rather than a field on nine bodies.
+            "X-Call-Id": self._call_id,
+            # The tenant every request below is scoped to. Absent means the API's default
+            # clinic, which is what the eval harness and the pre-tenancy tests send.
+            "X-Clinic-Slug": clinic_slug or tenant.current().slug,
+        }
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"), timeout=timeout, headers=headers
         )
-        # Scopes idempotency keys to this call, so two callers booking at the same moment never
-        # collide on a key. Falls back to a random id when the pipeline doesn't supply one.
-        self._call_id = call_id or uuid.uuid4().hex
+        # (self._call_id is set above, before the headers that carry it.) It also scopes
+        # idempotency keys to this call, so two callers booking at the same moment never collide
+        # on a key; it falls back to a random id when the pipeline doesn't supply one.
         self._attempt = 0
 
     def _idempotency_key(self, operation: str, discriminator: str) -> str:
@@ -374,12 +388,6 @@ class SchedulingClient:
 # availability/hold/booking data and speaks from it — no manual context editing here.
 
 
-def _redact_phone(phone: str | None) -> str:
-    """Last four digits only. The ANI is an identifier; logs are not a place to keep one."""
-    digits = "".join(c for c in (phone or "") if c.isdigit())
-    return f"***{digits[-4:]}" if digits else "unset"
-
-
 def _tool_http_status(result: dict) -> int | None:
     """Best-effort HTTP status for a tool result (for the metrics sink).
 
@@ -462,16 +470,18 @@ async def execute_tool(
         logger.info(f"TOOL ▶ POST /hold-slot req={{slot_id={slot_id!r}}}")
         result = await client.hold_slot(slot_id=slot_id)
     elif name == "confirm_booking":
-        # PHI minimization (governance: no patient data in logs). DOB and the free-text symptom
-        # note are the most sensitive fields, so log only presence/length indicators, never the
-        # values themselves. new_patient is a non-identifying boolean and is safe to log.
+        # PHI minimization (governance: no patient data in logs). Every value here goes through
+        # phi.redact, so the name, the DOB and the free-text symptom note are reduced to
+        # presence/length indicators. `reason` (a coarse category) and `new_patient` (a boolean)
+        # are non-identifying and pass through, which is what makes this line still useful.
         symptom_notes = args.get("symptom_notes")
         logger.info(
             f"TOOL ▶ POST /confirm-booking req={{hold_id={args.get('hold_id')!r}, "
-            f"patient_name={args.get('patient_name')!r}, reason={args.get('reason')!r}, "
-            f"dob={'set' if args.get('date_of_birth') else 'unset'}, "
+            f"patient_name={redact('patient_name', args.get('patient_name'))}, "
+            f"reason={args.get('reason')!r}, "
+            f"dob={redact('date_of_birth', args.get('date_of_birth'))}, "
             f"new_patient={args.get('new_patient')!r}, "
-            f"symptom_notes_len={len(symptom_notes) if symptom_notes else 0}}}"
+            f"symptom_notes={redact('symptom_notes', symptom_notes)}}}"
         )
         result = await client.confirm_booking(
             hold_id=args.get("hold_id"),
@@ -485,15 +495,17 @@ async def execute_tool(
     elif name == "verify_identity":
         # PHI minimization: the DOB is the verification secret. Log only that one was supplied.
         logger.info(
-            f"TOOL ▶ POST /verify-identity req={{phone={_redact_phone(args.get('phone'))}, "
-            f"dob={'set' if args.get('date_of_birth') else 'unset'}}}"
+            f"TOOL ▶ POST /verify-identity req={{phone={redact('phone', args.get('phone'))}, "
+            f"dob={redact('date_of_birth', args.get('date_of_birth'))}}}"
         )
         result = await client.verify_identity(
             phone=args.get("phone", ""), date_of_birth=args.get("date_of_birth", ""),
             name=args.get("name"),
         )
     elif name == "list_appointments":
-        logger.info(f"TOOL ▶ POST /appointments req={{phone={_redact_phone(args.get('phone'))}}}")
+        logger.info(
+            f"TOOL ▶ POST /appointments req={{phone={redact('phone', args.get('phone'))}}}"
+        )
         result = await client.list_appointments(
             phone=args.get("phone", ""), date_of_birth=args.get("date_of_birth", ""),
             name=args.get("name"),
@@ -525,7 +537,7 @@ async def execute_tool(
         # The medication name is clinical detail; log its presence, not the drug.
         logger.info(
             f"TOOL ▶ POST /staff-tasks req={{kind='refill', "
-            f"medication={'set' if args.get('medication') else 'unset'}}}"
+            f"medication={redact('medication', args.get('medication'))}}}"
         )
         result = await client.request_refill(
             phone=args.get("phone", ""),
@@ -583,9 +595,11 @@ def _log_tool_result(
             f"hold_id={result['hold_id']} expires_at={result['expires_at']}"
         )
     elif name == "confirm_booking":
+        # The API echoes patient_name back; it does not become a log line. A confirmation id is
+        # the join key for anything a developer needs to look up afterwards.
         logger.info(
             f"TOOL ▶ POST /confirm-booking → BOOKED confirmation_id={result['confirmation_id']} "
-            f"{result['display_time']} with {result['provider_name']} for {result['patient_name']}"
+            f"{result['display_time']} with {result['provider_name']}"
         )
     elif name == "verify_identity":
         logger.info("TOOL ▶ POST /verify-identity → VERIFIED (caller matched a patient on file)")

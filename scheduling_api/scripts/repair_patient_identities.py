@@ -87,7 +87,9 @@ async def run(url: str, apply: bool) -> int:
 
         mismatched = [
             r for r in rows
-            if db.normalize_dob(r["date_of_birth"]) != db.normalize_dob(r["row_dob"])
+            # Phase 17: both sides are stored in canonical form (db.dob_key), so they compare
+            # directly. Re-normalizing here would turn a digest into the digits of its own hex.
+            if db.dob_key(r["date_of_birth"]) != db.dob_key(r["row_dob"])
         ]
         if not mismatched:
             print("no merged identities found — nothing to repair")
@@ -114,7 +116,7 @@ async def run(url: str, apply: bool) -> int:
                 RETURNING id
                 """,
                 (r["clinic_id"], r["phone"], r["patient_name"],
-                 db.normalize_dob(r["date_of_birth"])),
+                 db.dob_key(r["date_of_birth"])),
             )).fetchone()
             await conn.execute(
                 "UPDATE bookings SET patient_id = %s WHERE confirmation_id = %s",

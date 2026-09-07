@@ -28,6 +28,7 @@ from urllib.parse import urlencode
 import websockets
 from loguru import logger
 
+from ... import phi
 from .. import events as ev
 from ..audio import INPUT_SAMPLE_RATE, NUM_CHANNELS
 from ..endpointing import grace_seconds, looks_unfinished
@@ -241,7 +242,7 @@ class DeepgramSTT:
         if not message.get("is_final"):
             if text:
                 self._cancel_grace()  # the caller resumed — they were only thinking
-                logger.debug(f"ASR  ▷ interim: {text!r}")
+                logger.debug(f"ASR  ▷ interim: {phi.speech(text)}")
                 self._emit(ev.PartialTranscript(t=now, text=text))
                 if self._on_partial:
                     self._on_partial(text, now)
@@ -338,7 +339,7 @@ class DeepgramSTT:
         )
         self._segments.clear()
         self._confidences.clear()
-        logger.info(f"ASR  ▶ transcript received: {text!r}")
+        logger.info(f"ASR  ▶ transcript received: {phi.speech(text)}")
         self._emit(ev.FinalTranscript(t=now, text=text, confidence=confidence))
 
     async def aclose(self) -> None:

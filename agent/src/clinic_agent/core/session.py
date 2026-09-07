@@ -58,6 +58,7 @@ from .adapters.tools import ToolExecutor
 from .otel import OtelExporter, otel_enabled
 from .adapters.tts import CartesiaTTS
 from .adapters.turn import TurnEngine
+from .. import tenant
 from .llm_router import LLMRouter
 from .recorder import TraceRecorder
 from .transfer import SIPTransfer
@@ -111,6 +112,10 @@ class CallSession:
         # Pinned once per call so every per-intent prompt shares one date table, and so a long
         # call cannot silently re-ground itself across midnight mid-conversation.
         self._now = datetime.now(timezone.utc)
+        # Pinned once per call, from the process-level tenant resolved at worker startup
+        # (tenant.load). Read once here rather than per use, so one call cannot straddle a
+        # tenant change mid-conversation.
+        self._clinic = tenant.current()
         self._router = LLMRouter()
         self._llm = self._build_llm()
         self._classifier = self._build_classifier()
@@ -138,7 +143,7 @@ class CallSession:
         return AnthropicLLM(
             api_key=self.settings.anthropic_api_key,
             model=self.settings.anthropic_model,
-            system_prompt=build_phase2_system_prompt(self._now),
+            system_prompt=build_phase2_system_prompt(self._now, self._clinic),
             tools=build_tools_schema(),
             emit=self.emit,
             router=self._router,
@@ -160,7 +165,11 @@ class CallSession:
         # timed-out voice turn replays the original booking instead of creating a second
         # appointment, while two concurrent callers never collide on a key.
         return ToolExecutor(
-            SchedulingClient(self.settings.scheduling_api_base_url, call_id=self.call_id),
+            SchedulingClient(
+                self.settings.scheduling_api_base_url,
+                call_id=self.call_id,
+                clinic_slug=self._clinic.slug,
+            ),
             emit=self.emit,
             collector=self.metrics,
         )
@@ -198,7 +207,13 @@ class CallSession:
         return TurnEngine(emit=self.emit, forward_audio=self._stt.send_audio)
 
     def _build_transfer(self) -> SIPTransfer:
-        return SIPTransfer(self.settings, TELEPHONY_ROOM_NAME, self.emit)
+        # A per-tenant escalation number, falling back to the process-wide one. "Transfer to a
+        # human" is a different human at each clinic, so CLINIC_TRANSFER_NUMBER can only be the
+        # default, never the answer.
+        settings = self.settings
+        if not settings.transfer_number and self._clinic.transfer_number:
+            settings = replace(settings, transfer_number=self._clinic.transfer_number)
+        return SIPTransfer(settings, TELEPHONY_ROOM_NAME, self.emit)
 
     async def _on_audio(self, pcm: bytes, now: float) -> None:
         await self._turn.feed(pcm, now)
@@ -233,7 +248,12 @@ class CallSession:
         # agent finishes connecting. If CallerPresent were reduced first, the greeting would be
         # chosen against the default mode and a telephony caller would never hear the
         # call-recording consent line. That is a governance failure, not a cosmetic ordering nit.
-        self.emit(ev.CallStarted(t=time.monotonic(), call_id=self.call_id, mode=self.settings.mode))
+        self.emit(ev.CallStarted(
+            t=time.monotonic(),
+            call_id=self.call_id,
+            mode=self.settings.mode,
+            clinic_name=self._clinic.name,
+        ))
 
         if self._loop_lag is not None:
             self._loop_lag.start()

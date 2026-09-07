@@ -18,6 +18,7 @@ import sys
 
 from loguru import logger
 
+from .. import tenant
 from ..config import load_settings, require_phase1_keys, require_telephony_keys
 from .session import CallSession
 
@@ -41,6 +42,10 @@ async def run() -> None:
     require_phase1_keys(settings)  # fail fast on missing keys before opening the mic
     if settings.mode == "telephony":
         require_telephony_keys(settings)
+
+    # Which clinic is this process answering for? Resolved ONCE here, before any session is
+    # constructed, from the dialed number — never on the call's critical path. See tenant.py.
+    await tenant.load(settings.scheduling_api_base_url, settings.livekit_phone_number)
 
     session = CallSession(settings)
     logger.info(

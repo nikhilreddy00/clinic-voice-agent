@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 
 from loguru import logger
 
+from .. import tenant
 from ..config import Settings
 from .jsonl import close_shared, flush_shared
 from .session import CallSession
@@ -111,6 +112,11 @@ class Worker:
         """Load shared resources and fill the prewarm pool before accepting calls."""
         t0 = time.monotonic()
         shared_inference_session()  # pay the model load once, at boot, not on a call
+        # The tenant this worker answers for. Resolved here for the same reason the VAD weights
+        # are loaded here: anything a call would otherwise wait for belongs at boot.
+        await tenant.load(
+            self.settings.scheduling_api_base_url, self.settings.livekit_phone_number
+        )
         await self._refill_pool()
         logger.info(
             f"[worker] ready: capacity={self.capacity} prewarm={len(self._pool)} "

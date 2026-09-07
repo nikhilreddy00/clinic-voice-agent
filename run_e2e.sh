@@ -24,9 +24,22 @@ fi
 createdb -h 127.0.0.1 -p "$PGPORT" -U postgres "$DB" 2>/dev/null || true
 createdb -h 127.0.0.1 -p "$PGPORT" -U postgres clinic_test 2>/dev/null || true
 
+# A port already in use is a HARD STOP, not a warning. uvicorn would fail to bind, the health
+# check below would be answered by whatever is already there, and the whole suite would silently
+# grade a build from an earlier session — which is exactly the "restart the API" failure this
+# project has paid for twice (CLAUDE.md). Verified: it cost a full round of e2e results.
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "Port ${PORT} is already in use. Kill the stale API first:" >&2
+    echo "    lsof -nP -tiTCP:${PORT} -sTCP:LISTEN | xargs kill" >&2
+    exit 1
+fi
+
 echo "==> scheduling API on :${PORT} (database ${DB})"
+# `exec` so $! is uvicorn itself rather than the subshell wrapping it — without it the trap
+# below kills the wrapper and leaves the server running, which is how the stale process above
+# survived in the first place.
 ( cd "$ROOT/scheduling_api" && CLINIC_DATABASE_URL="$URL" \
-    uv run uvicorn app.main:app --port "$PORT" >/tmp/clinic-e2e-api.log 2>&1 ) &
+    exec uv run uvicorn app.main:app --port "$PORT" >/tmp/clinic-e2e-api.log 2>&1 ) &
 API_PID=$!
 trap 'kill $API_PID 2>/dev/null || true' EXIT
 
@@ -40,6 +53,14 @@ curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null || {
 echo "==> scheduling_api"
 ( cd "$ROOT/scheduling_api" && CLINIC_DATABASE_URL="postgresql://postgres@127.0.0.1:${PGPORT}/clinic_test" \
     uv run pytest -q )
+
+# Phase 17: the same suite again with PHI-at-rest turned on. Digested dates of birth and
+# encrypted notes have to hold up under EVERY verified flow, not just the ones in
+# test_phi_at_rest.py — the failure mode is a comparison site somewhere else that still expects
+# to read a birthday out of the column.
+echo "==> scheduling_api (again, with CLINIC_PHI_KEY set)"
+( cd "$ROOT/scheduling_api" && CLINIC_DATABASE_URL="postgresql://postgres@127.0.0.1:${PGPORT}/clinic_test" \
+    CLINIC_PHI_KEY="e2e-phi-key-not-a-secret" uv run pytest -q )
 
 echo "==> agent (unit + end-to-end through the real API)"
 ( cd "$ROOT/agent" && CLINIC_E2E_API="http://127.0.0.1:${PORT}" \

@@ -407,7 +407,13 @@ def reduce(state: CallState, event: ev.Event) -> tuple[CallState, list[Action]]:
 
 
 def _on_call_started(state: CallState, e: ev.CallStarted):
-    return replace(state, call_id=e.call_id, mode=e.mode, phase=Phase.INIT), []
+    return replace(
+        state,
+        call_id=e.call_id,
+        mode=e.mode,
+        clinic_name=e.clinic_name or state.clinic_name,
+        phase=Phase.INIT,
+    ), []
 
 
 def _on_caller_present(state: CallState, e: ev.CallerPresent):
@@ -432,7 +438,7 @@ def _on_caller_present(state: CallState, e: ev.CallerPresent):
     actions: list[Action] = [
         Speak(
             utterance_id=utterance_id,
-            text=greeting_for(state.mode),
+            text=greeting_for(state.mode, state.clinic_name),
             final=True,
             deterministic=True,
         )

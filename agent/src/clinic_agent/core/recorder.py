@@ -11,8 +11,9 @@ loop shows up as a diff in the replayed action sequence, from a trace captured o
 phone call, without placing a phone call.
 
 Traces contain caller utterances, so they are PHI-shaped. All data in this project is
-synthetic (see CLAUDE.md), and ``logs/`` is git-ignored; Phase 17 adds the tagged redaction
-boundary that makes this safe for real deployments.
+synthetic (see CLAUDE.md), and ``logs/`` is git-ignored. Phase 17 added the switch that makes
+this safe for a real deployment: ``CLINIC_PHI_LOGS=0`` scrubs spoken content out of every
+record on the way in (``phi.scrub_event``), keeping the structure that replay needs.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from typing import Iterable, Iterator
 
 from loguru import logger
 
+from .. import phi
 from ..metrics import resolve_log_dir
 from .actions import Action
 from .events import Event, event_from_dict
@@ -63,7 +65,9 @@ class TraceRecorder:
     def record(self, event: Event) -> None:
         if self._writer is None:
             return
-        self._writer.write(event.to_dict())
+        # phi.scrub_event is a no-op unless CLINIC_PHI_LOGS=0, in which case the trace keeps
+        # every event and timing and loses only the words. See phi.py.
+        self._writer.write(phi.scrub_event(event.to_dict()))
         self.count += 1
 
     def close(self) -> None:
