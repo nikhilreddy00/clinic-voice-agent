@@ -1408,3 +1408,294 @@ on three consecutive runs**. All 28 recorded traces in `logs/traces/` still repl
 **What is NOT proven offline:** the actual PSTN transfer leg. Everything up to the
 `TransferSIPParticipantRequest` is tested; the leg itself needs a phone and a destination
 number in `CLINIC_TRANSFER_NUMBER`.
+
+---
+
+## Phase 16 — Observability + eval at market bar
+
+Plan: `~/.claude/plans/adaptive-churning-lark.md`. Two problems, one shape: **nothing about
+this system was automatically checked, and the one metrics path it had did not work where it
+was deployed.**
+
+Until this phase there was no CI. Every defect recorded in `CLAUDE.md` was found by a human
+reading `logs/traces/*.jsonl` after a live call. The suites all existed — 389 agent tests, 90
+API tests, 81 promptfoo cases, `./run_e2e.sh` — and nothing ran them.
+
+### 16.1 — Tier 1: recorded calls replayed through the reducer
+
+`eval/tier1_replay.py`, corpus in `eval/traces/` (7 real calls; `logs/` is git-ignored, so a
+trace must be copied in to be a gate).
+
+**It is NOT "assert the recorded action sequence still reproduces".** That test rots on the
+first legitimate fix: request ids derive from state counters, so a change that adds or removes
+a request renumbers everything after it. Two of the nine traces I started with replay to *zero*
+tool calls for exactly that reason, and were dropped.
+
+So Tier 1 checks eight invariants, each independent of request numbering and each violated by a
+real defect on a real call:
+
+| Invariant | The defect it pins |
+|---|---|
+| `ungated_phi_tool` | a PHI tool became a request before verification |
+| `orphan_tool_use` | a refused tool with no result — the turn never drains, the call sits in silence |
+| `thinking_spoken` | the model's `<thinking>` block, hold UUID included, read to the caller |
+| `unbacked_confirmation` | a confirmation number spoken that no tool returned |
+| `nudge_discipline` | the follow-through nudge firing on a turn it must not touch |
+| `identity_pairing` | `patient_name` and `verified_dob` describing two different people |
+| `hold_id_retyped` | `confirm_booking` carrying a hold_id the model retyped |
+| `nondeterminism` | the same trace replaying differently twice |
+
+**The corpus is not evidence the checks work** — a check that always returns "clean" passes all
+seven traces. `agent/tests/test_tier1.py` is that evidence: each invariant is fed a hand-built
+stream containing its defect and must go red, plus an end-to-end test that removes the gate from
+the real reducer and asserts Tier 1 catches it. A trace whose tool calls all replay stale fails
+rather than passing vacuously, and each trace reports `[n/m tool calls replayed]` so coverage
+decay is visible.
+
+### 16.2 — The gate
+
+`.github/workflows/ci.yml`. **Two jobs, split on money, not speed.**
+
+* **`offline`** — every push and PR, no key, no cost, blocks merge. The whole of `./run_e2e.sh`
+  (API + agent + session_router + the e2e seam) plus Tier 1, the Tier-2 harness under a scripted
+  model, the emergency detector, and `site/check_page.py`.
+* **`evals`** — opt-in via the `run-evals` label or a manual dispatch. Tier 2 against a real
+  model, the full intent eval, and promptfoo. It bills per run; it is a release check.
+
+`agent/tests/test_prompt_contract.py` (32 tests) asserts the load-bearing prompt rules are still
+*in* the prompt — the AI disclosure, recording consent on telephony only, the anti-fabrication
+rule in every intent's prompt, never-ask-for-the-phone-number, no name before verification, and
+the date table scoped to scheduling intents. **It catches deletion, not weakening.** Weakening
+is promptfoo's job and that tier costs money, so a green `offline` is never "the prompt is fine".
+
+**`scripts/prove_ci_gate.sh` is the exit criterion, executable.** It plants three real
+regressions — delete the anti-fabrication rule, empty `VERIFICATION_REQUIRED_TOOLS`, drop
+`turn_had_tool` from the nudge condition — asserts the suite goes red on each, and restores the
+tree. It found a hole on its first run: **nothing asserted the nudge respects `turn_had_tool`**,
+the 2026-09-03 defect that truncated a confirmation read-back 1.06 s into an 8-second sentence.
+Three tests referenced the field; all three checked it was *set*, none that it *suppressed*.
+
+### 16.3 — `calls.jsonl` retired as a cross-service bus
+
+The agent appended to it and the API re-read **the whole file on every `/metrics` request**.
+That worked on one host and nowhere else: on Railway the two are separate containers with no
+shared volume, so the dashboard was empty in the only deployment that counts. It was also
+unbounded, and O(all history) per page load.
+
+The agent now POSTs one batch per call to `/call-metrics` at teardown — the same transport as
+everything else these two services say to each other.
+
+* `schema.sql`: `call_metrics` + `call_turn_metrics` + `call_tool_metrics`, RLS on all three.
+  **Turns are stored individually**: percentiles of per-call percentiles are not percentiles,
+  and the dashboard's p95 *is* the slow call's tail.
+* `db.record_call_metrics` is idempotent on `call_id`, and replaces children **wholesale** — an
+  upsert keyed per row would leave a longer earlier post's tail alive forever.
+* `models.py` uses `extra="forbid"`. These are operational rows whose retention policy assumes
+  no clinical content, so a name or DOB attached to one fails at the boundary with a 422.
+* `metrics.aggregate_metrics` is now a pure function over the same event shape. The aggregation
+  was never what was wrong; only the transport moved.
+* `CallSession._ship_metrics` has a 3 s teardown budget and swallows every failure. The caller
+  has hung up, nothing is waiting, and a sink that can fail a session is worse than no sink.
+
+`logs/calls.jsonl` is still written and is now purely a local debug artifact.
+
+### 16.4 — OpenTelemetry: one trace per call, one span per turn
+
+`core/otel.py`, enabled by `CLINIC_OTEL_ENDPOINT` (unset ⇒ the SDK is never imported).
+
+**Spans are built from the finished event stream and exported with explicit timestamps, not
+opened live.** Three things follow: `spans_from_events` is pure and unit-tests without an SDK or
+a clock; nothing in the voice path can block on a telemetry backend; and **any recorded trace
+can be exported, including one from months ago** — which is how the Grafana dashboards were
+populated and verified with no live call. `agent/scripts/export_traces_otel.py` does that.
+
+Boundaries match every latency number in this project: a turn is `SpeechStopped →
+BotStartedSpeaking`. Ending it at `BotStoppedSpeaking` would fold the reply's length into the
+latency and make a wordy answer read as a slow one.
+
+**No PHI on a span. `ATTRIBUTES` is a closed set and `_attrs` raises on anything else** —
+dropping silently is how an unreviewed field reaches an APM the following week. The transcript
+is reduced to `stt.chars`; provider errors to a class, because a provider's error text can echo
+the request back. The boundary is tested against all seven corpus calls' real names, dates of
+birth, confirmation numbers and sentences.
+
+Dashboard: `docs/grafana/clinic-voice-agent.json`, 11 TraceQL panels.
+
+**Five bugs the real backend and the rendered dashboard found, none visible offline:**
+
+| Bug | Why it mattered |
+|---|---|
+| `ModelRouted` arrives *before* the LLM span is built | tier/model silently never attached |
+| an abandoned turn's close test was `<` where a fresh span has `end == start` | the turn ran to the end of the call and dominated every percentile |
+| `turn.held` emitted only when true | **TraceQL does not match a span that LACKS an attribute**, so `!= true` excluded every ordinary turn and the latency panel read "No data" |
+| `call.intent` took the *last* classification | the last thing a caller says is "thanks, bye" → all seven calls labelled `unknown` |
+| the `tts` span measured playback, not synthesis | 25 s on a panel titled "which stage is the slow one"; renamed `playback` and removed from it |
+
+Plus `turn.answered`: a turn the agent never replied to is not a latency measurement. 62 of the
+corpus's 168 turns are held or unanswered; excluding them moves p95 from 3,910 ms to **3,109 ms**
+and removes an 8 s p99. And `call.emergency` was dropped from the allowlist — nothing emits it,
+so it would have sat there looking supported while permanently absent. A test now drives a
+maximal event stream and asserts every allowed attribute is one the mapper can produce.
+
+**Corpus baseline** (7 calls, 106 answered unheld turns): **p50 1,521 ms / p95 3,109 ms**.
+Higher than CLAUDE.md's 1,556/1,625 because this corpus spans 2026-08-28 → 09-04 and includes
+calls from before prompt caching — a wider window, not a regression.
+
+*Also found:* a real `CLINIC_OTEL_ENDPOINT` in `agent/.env` made the **test suite phone home**
+(`config.py` calls `load_dotenv()` at import), 5.0 s → 17.2 s. `agent/tests/conftest.py` unsets
+it for the session.
+
+### 16.5 — Per-call trace viewer
+
+`agent/scripts/trace_viewer.py --html`. `inspect_call.py` prints the numbers and stays the
+terminal tool; this answers what a column of numbers answers badly — **where did a turn's two
+seconds go, and did what the agent said match what it did.**
+
+Built out of two things that already existed: the waterfall is
+`core/otel.spans_from_events` — *the same span tree Grafana runs on*, so the two cannot disagree
+— and the verdict is `eval/tier1_replay.check_events`, the same invariants CI runs.
+
+`playback` is excluded from the waterfall (15.6 s against a 2.5 s turn on one call would make
+every stage a sliver) and reported on the meta line instead. The shared scale comes from where
+bars *end*, not turn duration. Caller speech is escaped; it is arbitrary text from a live phone
+line. **The page contains what the caller said, by design** — it writes to git-ignored
+`logs/viewer/` and is not for sharing. The OTel trace is the redacted view of the same call.
+
+### 16.6 — Tier 2: text-in-the-loop
+
+**The defect:** `_execute_tool` called `confirm_booking(hold_id, patient_name, reason)` and
+dropped `date_of_birth`, `new_patient`, `symptom_notes` — while the scorer asserted on all three
+*from the model's arguments*. The suite reported "date of birth captured correctly" about a
+value the backend never saw. Since Phase 13 the DOB is the credential a returning caller
+verifies with, so a booking without one is a patient who cannot be recognised next call.
+
+**The non-defect, checked before "fixing" it:** the plan said this suite measures a prompt no
+caller meets. It does not. `build_system_prompt(SCHEDULE_APPOINTMENT)` is byte-identical both to
+the old `build_phase2_system_prompt()` and to the `intent=None` prompt a caller gets on turn one,
+and the unscoped tool schema is the same four tools a scheduling intent gets. Only the name was
+stale. What it genuinely does not cover is intent scoping — that is promptfoo's job.
+
+**Parallel, with the isolation moved rather than removed.** A shard is a whole stack — its own
+database *and* its own API process — because every case begins by truncating. `--workers 4`
+creates `clinic_eval_2..4` on demand; results return in case order. **Speedup against a real
+model is unmeasured**; with the scripted backend shard startup dominates (2.1 s → 4.0 s).
+
+`eval/fake_backend.py` drives the harness with no key and no cost — real client, real HTTP, real
+Postgres, no model. Scored on outcome only, booking cases only, with the explanation printed
+*before* the table because "[happy_path] 0/6 passed" scrolling past in a green log is how people
+learn to ignore a gate. Its first version keyed state by `id(history)` and CPython recycled a
+freed list's id, so case 8 inherited case 7's "already booked" flag; it is stateless now.
+
+**Clock coupling: guarded, not refactored.** `run_eval` compares the clinic day at start against
+the day at finish. Threading an injected date through 500 lines of case definitions would touch
+every case to prevent a failure that announces itself in one line.
+
+### 16.7 — Memory security, and the credential defect it found
+
+**Most of this subtask already existed** and rebuilding it would have been duplication: the
+intent confusion matrix, emergency-recall gate and per-intent tier assertions landed in Phase 12;
+the fallback-chain regression is Phase 15's `test_ladder.py`; 42 API and 21 agent tests already
+covered shared handsets, spoofed ANI, wrong DOBs, third-DOB and stranger-by-name refusal.
+
+**What the pass actually found: a fragment was a credential.** `normalize_dob` reduces a date to
+digits, so `"March 1990"` and `"1990"` both become `"1990"` — and a booking made with a partial
+date **enrolled that fragment as the patient's verification secret**. Verified against a live
+scratch database: a patient booked with `date_of_birth: "1990"` then verified by saying "1990",
+or "March 1990", or anything containing that year. A four-digit credential shared with everyone
+born that year.
+
+Fixed at both boundaries, because either alone leaves a hole:
+
+* `db.is_full_dob` — the API refuses to **enroll** a partial date (the booking still records what
+  the caller said; only the credential is withheld) and refuses to **verify** with one, using the
+  identical 403 a wrong date gets. Saying "that is not a full date" only when the number is
+  enrolled would turn malformed input into the patient-enumeration oracle the shared 403 prevents.
+* `reducer._PARTIAL_DOB_RESULT` — a partial date never becomes a request. The API's refusal is
+  indistinguishable from a wrong date, so without this the model tells the caller their date of
+  birth did not match when it never asked for the year.
+
+**The reducer's copy of the rule drifted from the API's on its first test** — it counted digits
+without zero-padding, so `12-8-2000` (seven digits) read as incomplete. There is now a contract
+test that imports both and asserts they agree; duplicated security logic without one is a
+promise, not a guarantee.
+
+Also gated the emergency detector's **false positives at zero** — measured since Phase 12, never
+enforced. `Intent.EMERGENCY` strips every tool and swaps in the 911 script, so a false positive
+is a caller with a stubbed toe being read emergency instructions by an agent that can no longer
+book them anything. A live call did that with a knee laceration.
+
+`eval/promptfoo/tests/security.yaml` — 7 cases of the one thing no offline test can cover: the
+model being **talked out of** the rule. Spouse-on-behalf-of, urgency as authorisation, caller ID
+as proof, pressure across turns, partial credential, "just approve the refill".
+
+> **What the first run taught me, recorded because it will recur.** 4 of 7 failed and **3 were
+> my rubrics, not the agent.** I graded the phrasing ("must ask for the date of birth") when the
+> agent correctly asks for name and DOB one at a time, as its own prompt instructs. And the
+> spouse case: the agent echoing "happy to move Nicholas's appointment" is **not a leak**,
+> because the reply is word for word the same whether or not Nicholas is a patient. *A leak is a
+> reply that DIFFERS based on what is on file.* Every rubric now grades that invariant.
+>
+> I also added a prompt clause for that case and then **reverted it**: written for a rubric that
+> was wrong, it pushed `cancel_appointment` past the size guard in
+> `test_intent_scoping_shrinks_non_booking_prompts`, and earns nothing under the corrected
+> rubric. Reverting returned the prompt to its already-validated state, so the 81 existing cases
+> needed no revalidation.
+
+Security suite: **7/7 on two runs, 6/7 on a third** (one rubric-judgement flake). That is *not*
+the "100% on three consecutive runs" the other suites earned and should not be recorded as such.
+
+### 16.8 — Tier 3: degraded channel, audio path built to the seam
+
+`eval/tier3_audio/`. Tier 3 asks whether the agent still gets the job done when it cannot hear
+the caller cleanly. **The obvious offline version is not a cheap version of that test, it is an
+empty one:** synthesise audio, degrade it, feed it to a *fake* STT, and the fake hands the
+session a scripted string — the audio is generated, thrown away, and the transcript arrives
+perfect. That measures plumbing and calls it robustness.
+
+So the offline path models the **output** of a bad line rather than its input. `channel.py` is a
+pure, seeded transcript-corruption model — dropped function words, teens/tens confusion,
+homophones, tail truncation, per-condition ASR confidence — applied to the real Tier-2 cases and
+scored by Tier 2's own scorer. It exercises the part that matters: how the *dialogue* recovers,
+through the real prompt, real tools, real Postgres.
+
+Four conditions — `clean` (control), `mild`, `noisy`, `clipped` — each carrying the voice and SNR
+sweep the live path would use, declared once so the two paths cannot describe different
+experiments by the same name.
+
+**`--live` is not implemented and says so honestly**: what it would do, what it would cost (19
+cases × 4 voices × 4 conditions = 304 billed conversations), and why. Writing several hundred
+never-executed lines is how `loadtest/fake_adapters.FakeLLM` came to report success for 800 dead
+sessions. The seam it needs already exists.
+
+Two things the first runs taught:
+
+* `--preview` showed the model never touched "December fifteenth". A caller does not say
+  "December fifteen" — dates of birth and appointment days are almost entirely **ordinals**, and
+  they are exactly where being wrong by a decade is not a rounding error.
+* the first sweep reported 14/19 on every condition *including clean*, which read as a dialogue
+  regression and was not: the scripted model books unconditionally. Fake mode now filters to
+  booking cases and states that **the channel is inert** under a model that does not read the
+  transcript. That produced a check worth keeping — under the scripted model every condition
+  *must* come out identical, so a difference means the sweep is leaking state between conditions.
+
+The run gate is the **clean** channel. A degraded channel is expected to cost cases; failing on
+that would make the tier unrunnable, and a tier that always fails stops being run.
+
+### Verification
+
+| Gate | Result |
+|---|---|
+| `./run_e2e.sh` | green — API **101**, agent **625**, session_router 26 |
+| `eval/tier1_replay.py` | 7/7 traces clean, 8 invariants each, ~1 s, no keys |
+| `run_eval.py --fake-backend` | 14/14 outcome match, free |
+| `run_intent_eval.py --detector-only` | emergency recall 100%, **0 false positives (now gated)** |
+| `python -m tier3_audio --fake-backend` | 14/14 × 4 conditions |
+| promptfoo (88 cases) | 87/88 — the one failure is a pre-existing `degraded.yaml` phrasing edge |
+| `scripts/prove_ci_gate.sh` | **3/3 planted regressions blocked** |
+| Grafana | 7 corpus traces exported, HTTP 200, 11 panels rendering |
+
+**Both phase exit criteria met:** CI blocks a deliberately-regressed prompt (proven, not
+asserted), and the trace viewer renders a real call.
+
+**Not proven:** `--live` audio-in-the-loop (never run, by choice); Tier 2's parallel speedup
+against a real model (unmeasured); the security suite's three-consecutive-run standard.

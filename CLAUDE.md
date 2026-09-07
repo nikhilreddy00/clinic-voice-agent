@@ -498,7 +498,7 @@ target. **Not yet re-measured on a live call after the caching change** — that
 #   createdb -h 127.0.0.1 -p 55432 -U postgres clinic_dev   # and clinic_test, clinic_eval
 export CLINIC_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/clinic_dev
 cd scheduling_api && uv sync --extra dev && uv run uvicorn app.main:app --reload
-cd scheduling_api && uv run pytest        # 90 tests; SKIPPED if no Postgres is reachable
+cd scheduling_api && uv run pytest        # 101 tests; SKIPPED if no Postgres is reachable
 
 # --- Supabase is the backend database ------------------------------------------------
 # Project : clinic-voice-agent   ref qhrvyhssfytkrfcodbuc   region us-east-1   Postgres 17.6
@@ -537,16 +537,37 @@ cd agent && uv run python -m clinic_agent.pipeline
 # Telephony either way needs the one-time, idempotent SIP trunk + dispatch rule:
 cd agent && uv run python scripts/setup_livekit_sip.py
 
-cd agent && uv run pytest        # 389 tests (9 e2e SKIP without a scratch API)
+cd agent && uv run pytest        # 625 tests (9 e2e SKIP without a scratch API)
 ./run_e2e.sh                     # everything, incl. the e2e seam. Run before any live call.
+./scripts/prove_ci_gate.sh       # plants 3 real regressions; the gate must go red on each
 
 # Phase-12 intent eval. --detector-only runs the SAFETY half with no API calls and no cost.
 agent/.venv/bin/python eval/run_intent_eval.py --detector-only
 agent/.venv/bin/python eval/run_intent_eval.py
 
-# Per-intent behavioural evals (promptfoo). One suite per intent; 72 cases; needs an API key.
-cd eval/promptfoo && ./run.sh                    # everything
-cd eval/promptfoo && ./run.sh tests/refill.yaml  # one intent, while iterating
+# Tier 1 — recorded calls replayed through the reducer. Milliseconds, no keys, every commit.
+agent/.venv/bin/python eval/tier1_replay.py
+agent/.venv/bin/python eval/tier1_replay.py -v      # + per-trace replay coverage
+
+# Tier 2 — text-in-the-loop. --fake-backend is free and proves the HARNESS, not the agent.
+agent/.venv/bin/python eval/run_eval.py --fake-backend
+agent/.venv/bin/python eval/run_eval.py --workers 4      # real model; bills
+
+# Tier 3 — degraded channel. --preview and --fake-backend are free; --live is NOT implemented.
+cd eval && ../agent/.venv/bin/python -m tier3_audio --preview
+cd eval && ../agent/.venv/bin/python -m tier3_audio --fake-backend
+
+# One call as a page (transcript + tool outcomes + latency waterfall). Writes to logs/viewer/.
+agent/.venv/bin/python agent/scripts/trace_viewer.py --open
+
+# Ship recorded traces to Grafana Tempo. No live call needed — spans are built from the
+# finished event stream, so a call from months ago exports fine. Needs CLINIC_OTEL_ENDPOINT.
+agent/.venv/bin/python agent/scripts/export_traces_otel.py --dry-run
+agent/.venv/bin/python agent/scripts/export_traces_otel.py
+
+# Per-intent behavioural evals (promptfoo). One suite per intent; 88 cases; needs an API key.
+cd eval/promptfoo && ./run.sh                     # everything (88 cases)
+cd eval/promptfoo && ./run.sh tests/security.yaml # one suite, while iterating
 cd eval/promptfoo && ./run.sh --view             # browse the last run
 
 # Session router (Phase 11 control plane) — only needed for room-per-call dispatch
@@ -572,10 +593,11 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 15 of 17.**
+**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 16 of 17.**
 Phases 9 (Postgres + Supabase), 10 (in-house event loop), 11 (concurrency + load proof), 12
-(reasoning layer), 13 (memory + verified tool surface), 14 (latency finish) and **15
-(reliability: failover + warm human transfer)** are done. Phase 8's bake-off harness has had its
+(reasoning layer), 13 (memory + verified tool surface), 14 (latency finish), 15 (reliability:
+failover + warm human transfer) and **16 (observability + eval at market bar — CI, OTel +
+Grafana, the three eval tiers)** are done. Phase 8's bake-off harness has had its
 **first real runs** (partial — 3 of 19 cases) and produced the prompt-caching result below.
 
 **Phase 15 — reliability (2026-09-05). ✅ Built and verified entirely offline; no call placed.**
@@ -619,26 +641,109 @@ Plan: `/Users/uvnikhil/.claude/plans/vast-dancing-scott.md`. Full detail: `docs/
     in this build" were corrected at the same time. **`eval/promptfoo/provider.py` mirrors this
     guard**; if the nudge rule changes, change it there too or the eval stops measuring the
     system a caller meets.
-  - Promptfoo is now **81 cases** (the 72 per-intent ones plus `tests/degraded.yaml`), 100% on
-    three consecutive runs. The degraded suite is the fabrication check under failure: no
+  - Promptfoo is now **88 cases** (72 per-intent + `tests/degraded.yaml` + Phase 16's
+    `tests/security.yaml`). The 81 that predate Phase 16 were 100% on three consecutive runs;
+    the security suite has NOT met that bar (7/7 twice, 6/7 once — a rubric-judgement flake).
+    The degraded suite is the fabrication check under failure: no
     invented confirmation number, no "refill sent", no invented appointment list, no
     patient-enumeration leak on a failed verification.
 
+**Phase 16 — observability + eval at market bar (2026-09-07). ✅ Entirely offline; no call
+placed.** Full detail: `docs/build_spec.md` → *Phase 16*. Plan:
+`/Users/uvnikhil/.claude/plans/adaptive-churning-lark.md`. The rules that are easy to break:
+
+  - **THERE IS CI NOW, and the split is about money.** `.github/workflows/ci.yml`: `offline`
+    runs on every push with no key and blocks merge (all of `./run_e2e.sh` + Tier 1 + the
+    Tier-2 harness under a scripted model + the emergency detector + `site/check_page.py`);
+    `evals` bills per run and is opt-in via the `run-evals` label. **A green `offline` is not
+    "the prompt is fine"** — it asserts prompt rules are PRESENT
+    (`tests/test_prompt_contract.py`), and only promptfoo can tell you the model still obeys
+    them.
+  - **`scripts/prove_ci_gate.sh` is the exit criterion, executable.** Plants three real
+    regressions and asserts the suite goes red on each. Run it after touching any gate. It
+    found a hole on its first run: nothing asserted the nudge respects `turn_had_tool`.
+  - **Tier 1 checks INVARIANTS, never a recorded action sequence.** Request ids derive from
+    state counters, so an action-diff test rots on the first legitimate fix — two of the nine
+    candidate traces replay to zero tool calls for exactly that reason. A trace whose tool calls
+    all replay stale FAILS rather than passing vacuously. Adding a trace to `eval/traces/`:
+    check the `[n/m tool calls replayed]` count.
+  - **The corpus does not prove the checks work.** `agent/tests/test_tier1.py` does, by feeding
+    each invariant its own defect. An invariant suite that has never been seen to fail is
+    decoration.
+  - **`logs/calls.jsonl` is no longer a bus.** The agent POSTs `/call-metrics` at teardown and
+    the rows live in Postgres; the file is a local debug artifact. Turns are stored
+    INDIVIDUALLY — percentiles of per-call percentiles are not percentiles. The request models
+    are `extra="forbid"`, so PHI on an operational row is a 422, not a silent write.
+  - **OTel spans are built from the FINISHED event stream, not opened live.** That is what lets
+    `agent/scripts/export_traces_otel.py` ship a call recorded months ago — which is how the
+    Grafana dashboards were populated and verified with no live call. `CLINIC_OTEL_ENDPOINT`
+    unset means the SDK is never imported.
+  - **`otel.ATTRIBUTES` is a closed set and `_attrs` RAISES on anything outside it.** Spans
+    leave the building; `logs/traces/` does not. Transcript → `stt.chars`, provider errors → a
+    class only. Adding an attribute is deliberate, and there is a test that every allowed
+    attribute is one the mapper can actually emit (`call.emergency` was not, and was removed).
+  - **TraceQL does not match a span that LACKS an attribute.** `turn.held` / `turn.answered` are
+    therefore emitted on EVERY turn, not only when true — emitting them conditionally made the
+    voice-to-voice panel read "No data" while looking correct in the code. Latency queries must
+    filter `turn.held = false && turn.answered = true`, or they measure how long callers think.
+  - **A real `CLINIC_OTEL_ENDPOINT` in `agent/.env` makes the test suite phone home**
+    (`config.py` calls `load_dotenv()` at import). `agent/tests/conftest.py` unsets it. 5.0s vs
+    17.2s.
+  - **`eval/fake_backend.py` proves the HARNESS, never the agent.** No key, no cost, real
+    client, real HTTP, real Postgres, no model — so slot-filling is not scored and the
+    must-not-book cases are skipped. The banner prints BEFORE the results table on purpose.
+  - **Tier 2 shards are whole stacks.** Every case begins by truncating its database, so
+    `--workers N` means N databases AND N API processes. Sharing one is not an option no matter
+    how careful the driver is.
+  - **A FRAGMENT IS NOT A CREDENTIAL (`db.is_full_dob`).** `normalize_dob` reduces to digits, so
+    "March 1990" and "1990" both became "1990" — and a booking made with a partial date enrolled
+    that fragment as the verification secret. Verified live: a patient booked with "1990" then
+    verified by saying "1990". Refused at BOTH boundaries — the API will not enroll or verify
+    with one, and `reducer._PARTIAL_DOB_RESULT` answers it before it becomes a request. The
+    API's refusal is the IDENTICAL 403 a wrong date gets; differentiating them would make it an
+    enumeration oracle.
+  - **The reducer's `_is_full_dob` and the API's `is_full_dob` must agree**, and drifted on the
+    first test (digit count without zero-padding rejects "12-8-2000"). Pinned by a contract test
+    that imports both. Duplicated security logic without one is a promise, not a guarantee.
+  - **Emergency detector FALSE POSITIVES are gated at zero** now, not just recall.
+    `Intent.EMERGENCY` strips every tool and swaps in the 911 script.
+  - **When a promptfoo case fails, suspect the rubric first.** 3 of 4 failures in the new
+    security suite were mine: I graded phrasing ("must ask for the date of birth") when the
+    agent correctly asks for name and DOB one at a time. **A leak is a reply that DIFFERS based
+    on what is on file** — echoing a caller's own framing is not one. Grade the invariant.
+  - **Tier 3's offline path corrupts the TRANSCRIPT, not the audio**, and `eval/tier3_audio/
+    channel.py` says why: audio into a fake STT is not a cheap version of the test, it is an
+    empty one. `--live` is NOT implemented and prints what it would cost. Under the scripted
+    model every condition must come out identical — a difference means the sweep is leaking
+    state between conditions.
+
+**Phase 16 baseline from the corpus** (7 calls, 106 answered unheld turns): **p50 1,521 ms /
+p95 3,109 ms**. Higher than the 1,556/1,625 below because the corpus spans 2026-08-28 → 09-04
+and includes pre-caching calls — a wider window, not a regression.
+
 ### START HERE — next session
 
-**Next: Phase 16 (observability + eval at market bar), then 17 (BAA-readiness +
-multi-tenancy).** Full definitions:
-`/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md`. All three are buildable and
-testable **offline** — which matters, because:
+**Next: Phase 17 — BAA-readiness + multi-tenancy.** Full definition:
+`/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md`. Buildable and testable
+**offline** — which matters, because:
+
+Phase 16's PHI boundary work is a head start on it: `otel.ATTRIBUTES` is already a closed
+allowlist with a leak test over the real corpus, and `/call-metrics` already refuses clinical
+fields at the schema. Phase 17 generalises those into one tagged boundary and adds the
+append-only audit log, column encryption, `clinic_id` on every call, and `docs/compliance.md`.
+Note `scheduling_tools.py:256-263` still logs `patient_name` verbatim and `db.py` persists DOB
+and symptom notes as plaintext.
 
 **LIVE CALLS COST REAL CREDIT AND THE AUTHOR IS CONSERVING IT.** Cartesia + Deepgram + LiveKit
 bill per call and there is one test handset. Do not propose "just place a call to check" as a
 verification step. Everything below the microphone is provable offline: `./run_e2e.sh` (real
-reducer, real tool executor, real HTTP, real Postgres), `core.recorder.replay` over the 14
-traces in `logs/traces/`, `eval/run_intent_eval.py --detector-only` (free), and
-`loadtest/tier_a.py` (no keys, no network), and — since Phase 15 — `tests/test_chaos.py`, which
-kills the model, the scheduling API (a real socket on a dead port) and the worker under live
-calls. Reserve a live call for something that genuinely
+reducer, real tool executor, real HTTP, real Postgres), `eval/tier1_replay.py` (7 recorded calls, 8 invariants, ~1 s),
+`eval/run_intent_eval.py --detector-only` (free), `eval/run_eval.py --fake-backend` (free),
+`python -m tier3_audio --fake-backend` (free), `loadtest/tier_a.py` (no keys, no network), and
+— since Phase 15 — `tests/test_chaos.py`, which kills the model, the scheduling API (a real
+socket on a dead port) and the worker under live calls. Phase 16 also made every recorded trace
+exportable to Grafana and renderable as a page, so a call can be investigated long after it
+happened without placing a new one. Reserve a live call for something that genuinely
 cannot be answered any other way, and say so explicitly when asking for one.
 
 **Phase 14 closed with three of its five planned items cancelled by measurement, not built.**
@@ -654,7 +759,7 @@ is close but NOT formally met. Do not record it as met without more turns.
 **Phase 13's exit criterion is MET — see *Phase 13 CLOSED* below.** It took six live attempts;
 five were defeated by the defects recorded here, and the sixth by an un-restarted API serving
 pre-fix code. Everything below the microphone was already proven offline by `./run_e2e.sh`
-(real reducer, real tool executor, real HTTP, real Postgres) and 90 API tests — which is the
+(real reducer, real tool executor, real HTTP, real Postgres) and the API tests — which is the
 lesson: the offline suites were necessary and were never sufficient, because every defect lived
 in the seam between components or in the audio timing above them.
 
