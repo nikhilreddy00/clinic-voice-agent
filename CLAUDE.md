@@ -263,6 +263,15 @@ cases, one suite per intent, **100% on three consecutive runs**. Full detail:
   - The eval provider imports the agent's real prompt/tool builders and mirrors the nudge, so
     it measures the system a caller meets. Do not let it grow a private copy of the prompt.
 
+**`run_e2e.sh` used to leave a stale API running and then grade against it (fixed 2026-09-07).**
+The server was started as `( cd … && uv run uvicorn … ) &`, so `$!` was the SUBSHELL; the exit
+trap killed the wrapper and left uvicorn listening. Every later run then hit "address in use",
+its own server died, and the health check was answered by **the process from an earlier
+session** — the suite silently graded pre-change code and printed "All suites green". Found when
+a Phase-17 audit test failed against code that was already fixed. Now `exec`'d so the trap kills
+uvicorn itself, plus a hard stop if the port is occupied. Same failure as the rule below, one
+level up: when a result contradicts the code, check WHAT IS RUNNING first.
+
 **RESTART THE SCHEDULING API AFTER CHANGING IT.** Python imports a module once; editing
 `app/db.py` does nothing to a process that is already running, and `uvicorn` is started here
 WITHOUT `--reload`. This cost a full round of live calls: the shared-phone fix was written at
@@ -539,7 +548,12 @@ cd agent && uv run python scripts/setup_livekit_sip.py
 
 cd agent && uv run pytest        # 625 tests (9 e2e SKIP without a scratch API)
 ./run_e2e.sh                     # everything, incl. the e2e seam. Run before any live call.
-./scripts/prove_ci_gate.sh       # plants 3 real regressions; the gate must go red on each
+./scripts/prove_ci_gate.sh       # plants 5 real regressions; the gate must go red on each
+
+# PHI at rest + PHI in logs are OFF by default (synthetic data). Two switches turn them on:
+CLINIC_PHI_KEY=<32+ random bytes>   # DOB digested (HMAC), clinical notes encrypted (pgcrypto)
+CLINIC_PHI_LOGS=0                   # no transcripts on the console OR in logs/traces/
+# The API states its posture in a startup line either way. See docs/compliance.md.
 
 # Phase-12 intent eval. --detector-only runs the SAFETY half with no API calls and no cost.
 agent/.venv/bin/python eval/run_intent_eval.py --detector-only
@@ -593,12 +607,13 @@ both. Full telephony setup steps: `docs/build_spec.md` → *Phase 5 — Telephon
 
 ## Current status
 
-**Phases 0–7 shipped the working product; the production-scale rebuild is at Phase 16 of 17.**
-Phases 9 (Postgres + Supabase), 10 (in-house event loop), 11 (concurrency + load proof), 12
-(reasoning layer), 13 (memory + verified tool surface), 14 (latency finish), 15 (reliability:
-failover + warm human transfer) and **16 (observability + eval at market bar — CI, OTel +
-Grafana, the three eval tiers)** are done. Phase 8's bake-off harness has had its
-**first real runs** (partial — 3 of 19 cases) and produced the prompt-caching result below.
+**Phases 0–7 shipped the working product; the production-scale rebuild is COMPLETE through
+Phase 17.** Phases 9 (Postgres + Supabase), 10 (in-house event loop), 11 (concurrency + load
+proof), 12 (reasoning layer), 13 (memory + verified tool surface), 14 (latency finish), 15
+(reliability: failover + warm human transfer), 16 (observability + eval at market bar — CI, OTel
++ Grafana, the three eval tiers) and **17 (BAA-readiness + multi-tenancy)** are done. Phase 8's
+bake-off harness has had its **first real runs** (partial — 3 of 19 cases) and produced the
+prompt-caching result below — it is the only phase not closed.
 
 **Phase 15 — reliability (2026-09-05). ✅ Built and verified entirely offline; no call placed.**
 Shipped on branch `phase15-reliability` (commit `6ee2d1a`) — **check whether it has been merged
@@ -723,16 +738,70 @@ and includes pre-caching calls — a wider window, not a regression.
 
 ### START HERE — next session
 
-**Next: Phase 17 — BAA-readiness + multi-tenancy.** Full definition:
-`/Users/uvnikhil/.claude/plans/cheerful-enchanting-comet.md`. Buildable and testable
-**offline** — which matters, because:
+**Every planned phase is closed except Phase 8's bake-off** (3 of 19 cases run). What is left is
+execution that needs money or a phone, not code: Tier B load (25–50 real concurrent calls, no
+cost-per-minute number exists), the remaining 16 bake-off cases, a live call through the
+in-house engine as the DEFAULT entrypoint (a one-line change nobody has made), and re-running
+promptfoo now that the clinic name is a variable in the prompt.
 
-Phase 16's PHI boundary work is a head start on it: `otel.ATTRIBUTES` is already a closed
-allowlist with a leak test over the real corpus, and `/call-metrics` already refuses clinical
-fields at the schema. Phase 17 generalises those into one tagged boundary and adds the
-append-only audit log, column encryption, `clinic_id` on every call, and `docs/compliance.md`.
-Note `scheduling_tools.py:256-263` still logs `patient_name` verbatim and `db.py` persists DOB
-and symptom notes as plaintext.
+**Phase 17 — BAA-readiness + multi-tenancy (2026-09-07). ✅ Entirely offline; no call placed.**
+Plan: `/Users/uvnikhil/.claude/plans/dazzling-skipping-rain.md`. Full detail:
+`docs/build_spec.md` → *Phase 17*. Gap analysis: `docs/compliance.md`. The rules that are easy
+to break:
+
+  - **PHI in a log line goes through `phi.py`, and nothing else.** The hand-applied convention
+    it replaced was correct wherever it was remembered and silent where it was not — it was not
+    remembered for `patient_name`, on two lines, for four phases. `PHI_FIELDS` is deny-by-default
+    over a NAMED set; adding a tool argument that carries PHI means adding it there.
+    `agent/tests/test_phi.py` drives every tool with sentinel values through the REAL logger, so
+    forgetting fails the build. A source grep would not — it passes on an f-string.
+  - **`reason` is deliberately NOT a PHI field.** It is a coarse category from a fixed
+    four-value list and seeing it is how a booking flow gets debugged. Clinical text lives in
+    `symptom_notes`, which is covered.
+  - **`CLINIC_PHI_LOGS` governs the console AND `logs/traces/`, and defaults to ON.** Redacting
+    the console while writing the full transcript to a file on the same disk is theater. Set to
+    `0` and traces keep every event, timing and tool call while losing the words — replay still
+    runs.
+  - **The date of birth is a CREDENTIAL, so it is HMAC'd (`db.dob_key`), not encrypted.** It is
+    only ever compared. Consequences: compare with `dob_matches`, NEVER
+    `normalize_dob(a) == normalize_dob(b)` — re-normalizing a digest silently reduces it to the
+    digits of its own hex; `dob_key` is idempotent on its own output because the boot migration
+    runs every start; and `is_full_dob` still runs on the PLAINTEXT, before hashing.
+  - **The key is part of the data.** Change or lose `CLINIC_PHI_KEY` and every enrolled patient
+    is unverifiable, with no recovery path. That is what one-way means, it fails CLOSED, and
+    there is a test named for it.
+  - **`run_e2e.sh` runs the API suite TWICE, the second time with a key set.** The failure this
+    catches is not in `test_phi_at_rest.py`; it is a comparison site elsewhere that still expects
+    to read a birthday out of the column.
+  - **`patient_name` is still plaintext, deliberately** — spoken back to the caller, fuzzy
+    matched, and the app holds the key next to the database. It is listed as an open gap in
+    `compliance.md`, not hidden.
+  - **A denial writes an audit row, and `_audit` uses its OWN connection.** A denial raises and
+    the transaction rolls back, so a row written inside it would vanish — losing exactly the
+    events worth keeping ("four wrong birthdays on one call").
+  - **`audit_log` is append-only by TRIGGER, not by GRANT.** The service connects as an owner
+    and owner privileges ignore `REVOKE ... FROM PUBLIC`; triggers fire for owners.
+  - **Tenancy: `_verify` had TWO lookups with no clinic filter at all**, one of them a scan of
+    the entire `patients` table reachable from an unknown number. Invisible with one clinic, a
+    cross-tenant disclosure with two. `X-Clinic-Slug` selects the tenant, absent = the default,
+    and `scheduling_api/tests/test_tenancy.py` seeds the SAME phone number and birthday at both
+    clinics — the case that finds it.
+  - **The availability date filter reads the tenant's timezone from the joined `clinics` row.**
+    Bayside is Central. A shared module constant here is the Phase-9 seed bug with a tenant
+    column added.
+  - **The agent resolves its tenant ONCE at worker startup, from the dialed number.** Never on
+    the call's critical path — an HTTP round trip in front of the greeting is what the Phase-13
+    memory rule forbids, and with Direct dispatch a process serves one trunk anyway. Per-call
+    `sip.trunkPhoneNumber` resolution belongs with room-per-call dispatch; building it now would
+    be code that cannot run. Every failure degrades to the default tenant.
+  - **The clinic name travels on `CallStarted`, never read from a module global in the
+    reducer.** `reduce` is pure: a trace recorded at one clinic must replay to that clinic's
+    greeting on a machine configured for another.
+  - **The AI disclosure and the recording consent are NOT per-tenant.** A clinic does not get to
+    configure whether its callers are told they are talking to an AI.
+  - `scripts/prove_ci_gate.sh` is now **five** planted regressions. The tenancy one preserves the
+    query's parameter ORDER so it reproduces the old unscoped lookup rather than going red for
+    the wrong reason, and it skips loudly with no Postgres.
 
 **LIVE CALLS COST REAL CREDIT AND THE AUTHOR IS CONSERVING IT.** Cartesia + Deepgram + LiveKit
 bill per call and there is one test handset. Do not propose "just place a call to check" as a

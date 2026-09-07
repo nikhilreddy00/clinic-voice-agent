@@ -55,6 +55,10 @@ class CallStarted(Event):
 
     call_id: str = ""
     mode: str = "local"
+    # The tenant this process is answering for (Phase 17). Carried on the event, not read from
+    # a module global inside the reducer, because `reduce` is pure: a trace has to replay to the
+    # same greeting on any machine, including one configured for a different clinic.
+    clinic_name: str = ""
 
     kind: ClassVar[str] = "CallStarted"
 

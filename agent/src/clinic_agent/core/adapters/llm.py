@@ -28,6 +28,7 @@ from loguru import logger
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 
+from ... import phi
 from ...intents import Intent
 from ...prompts import build_system_prompt
 from ...scheduling_tools import build_tools_schema
@@ -312,7 +313,7 @@ class AnthropicLLM:
         self._tasks.pop(request_id, None)
         text = "".join(text_parts)
         if text.strip():
-            logger.info(f"LLM  ▶ response generated: {text.strip()!r}")
+            logger.info(f"LLM  ▶ response generated: {phi.speech(text.strip())}")
 
         for block in final.content:
             if getattr(block, "type", None) == "tool_use":

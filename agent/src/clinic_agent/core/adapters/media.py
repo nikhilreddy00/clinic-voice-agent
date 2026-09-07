@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable
 
 from loguru import logger
 
+from ... import phi
 from ...barge_in import frame_rms
 from .. import events as ev
 from ..audio import (
@@ -344,11 +345,17 @@ class LiveKitMedia(MediaAdapter):
         @self._room.on("participant_connected")
         def _on_join(participant) -> None:  # noqa: ANN001
             # Logged, NOT announced. See _announce.
-            logger.info(f"[telephony] caller joined room (participant={participant.identity})")
+            logger.info(
+                f"[telephony] caller joined room "
+                f"(participant={phi.redact_phone(participant.identity)})"
+            )
 
         @self._room.on("participant_disconnected")
         def _on_leave(participant) -> None:  # noqa: ANN001
-            logger.info(f"[telephony] caller left room (participant={participant.identity})")
+            logger.info(
+                f"[telephony] caller left room "
+                f"(participant={phi.redact_phone(participant.identity)})"
+            )
             self._emit(ev.Hangup(t=time.monotonic(), reason="caller_left"))
 
         await self._room.connect(self._url, self._token)

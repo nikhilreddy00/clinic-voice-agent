@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import psycopg  # noqa: E402
 from psycopg.rows import dict_row  # noqa: E402
 
-from app import db  # noqa: E402
+from app import db, seed_data  # noqa: E402
 
 SESSION_POOLER_PORT = 5432
 TRANSACTION_POOLER_PORT = 6543
@@ -145,15 +145,27 @@ async def _verify(url: str) -> int:
             print("  FAIL: no available slots — seeding did not run")
             return 1
 
-        sample = await (await conn.execute(
-            "SELECT start_time FROM slots ORDER BY start_time LIMIT 1"
-        )).fetchone()
-        local = sample["start_time"].astimezone(db.CLINIC_TZ)
-        print(f"  first slot (clinic-local): {local.isoformat()}")
-        if not (7 <= local.hour <= 19):
-            print(f"  FAIL: slot at {local.hour}:00 clinic-local is outside business hours —")
-            print("        the timezone fix did not apply.")
-            return 1
+        # PER CLINIC, in that clinic's own zone (Phase 17). Checking every tenant's slots
+        # against one hardcoded timezone is how you get a green tick on a clinic whose
+        # appointments are all at 4 AM: Bayside is Central, and a 9:00 slot there is 10:00
+        # Eastern — inside business hours by luck, not by correctness.
+        for clinic in seed_data.CLINICS:
+            sample = await (await conn.execute(
+                """
+                SELECT s.start_time FROM slots s JOIN clinics c ON c.id = s.clinic_id
+                 WHERE c.slug = %s ORDER BY s.start_time LIMIT 1
+                """,
+                (clinic.slug,),
+            )).fetchone()
+            if sample is None:
+                print(f"  FAIL: {clinic.slug} has no slots — seeding did not run for it")
+                return 1
+            local = sample["start_time"].astimezone(clinic.timezone)
+            print(f"  first slot ({clinic.slug}, local): {local.isoformat()}")
+            if not (7 <= local.hour <= 19):
+                print(f"  FAIL: slot at {local.hour}:00 clinic-local is outside business hours —")
+                print("        the timezone fix did not apply.")
+                return 1
 
     print("\n  OK — schema applied, RLS on, seeded, times in business hours.")
     return 0

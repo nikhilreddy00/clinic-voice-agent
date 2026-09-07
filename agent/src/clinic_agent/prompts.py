@@ -15,6 +15,7 @@ from datetime import date, timedelta, timezone
 from datetime import datetime as _datetime
 from zoneinfo import ZoneInfo
 
+from . import tenant as _tenant
 from .intents import SCHEDULING_INTENTS, Intent
 
 # timezone: US/Eastern (America/New_York) — agent operates in clinic local time. The current
@@ -37,21 +38,23 @@ RECORDING_CONSENT = (
 )
 
 # Greeting delivered at the start of the call (GREETING_DISCLOSURE) on the LOCAL path.
-GREETING = (
-    "Thanks for calling Grove Family Clinic. "
+_GREETING_TEMPLATE = (
+    "Thanks for calling {clinic_name}. "
     f"{AI_DISCLOSURE} "
     "I can help you book an appointment. How can I help today?"
 )
+GREETING = _GREETING_TEMPLATE.format(clinic_name=_tenant.DEFAULT.name)
 
 # Greeting for the TELEPHONY path: identical AI disclosure, plus the call-recording consent
 # line, spoken up front before any booking. The disclosure and consent lead so both governance
 # statements are delivered before the caller shares anything.
-TELEPHONY_GREETING = (
-    "Thanks for calling Grove Family Clinic. "
+_TELEPHONY_GREETING_TEMPLATE = (
+    "Thanks for calling {clinic_name}. "
     f"{AI_DISCLOSURE} "
     f"{RECORDING_CONSENT} "
     "I can help you book an appointment. How can I help today?"
 )
+TELEPHONY_GREETING = _TELEPHONY_GREETING_TEMPLATE.format(clinic_name=_tenant.DEFAULT.name)
 
 
 # Scripted line spoken when the LLM request itself fails (Phase 10). The in-house event loop
@@ -107,13 +110,18 @@ EMERGENCY_INSTRUCTION = (
 )
 
 
-def greeting_for(mode: str) -> str:
-    """Return the greeting for the given runtime mode.
+def greeting_for(mode: str, clinic_name: str | None = None) -> str:
+    """Return the greeting for the given runtime mode and tenant.
 
     Telephony adds the call-recording consent line to the shared AI disclosure; local dev
     records nothing, so it uses the disclosure-only greeting.
+
+    Only the clinic's NAME varies per tenant. The disclosure and the recording consent are
+    fixed text in both greetings and are not a per-tenant setting — a clinic does not get to
+    configure whether its callers are told they are talking to an AI.
     """
-    return TELEPHONY_GREETING if mode == "telephony" else GREETING
+    template = _TELEPHONY_GREETING_TEMPLATE if mode == "telephony" else _GREETING_TEMPLATE
+    return template.format(clinic_name=clinic_name or _tenant.current().name)
 
 # Minimal Phase-1 system prompt. Scoped to greeting + disclosure + answering a single
 # scripted turn (confirming the agent can help schedule). It deliberately does NOT do
@@ -161,12 +169,12 @@ never request detailed medical information.
 # (Sonnet 4.6/5 and Opus 4.8 are 1,024), not a smaller prompt.
 
 _CORE_TEMPLATE = """\
-You are the virtual scheduling assistant for Grove Family Clinic, speaking with a caller by
+You are the virtual scheduling assistant for {clinic_name}, speaking with a caller by
 phone. You have already greeted the caller and disclosed that you are an automated AI
 assistant.
 
 Today's date is {today} ({weekday}), and the current time is {now_local} — this is the clinic's
-local time (US/Eastern). Reason about time in the clinic's local timezone. Speak appointment
+local time ({tz_label}). Reason about time in the clinic's local timezone. Speak appointment
 times naturally (e.g. "Monday, July 6th at 9 AM"), never as raw timestamps.
 
 STYLE: keep every reply to one or two short, natural sentences suitable for text-to-speech.
@@ -437,8 +445,10 @@ _INTENT_FRAGMENTS: dict[Intent, str] = {
 }
 
 
-def _core_prompt(now_local, today) -> str:
+def _core_prompt(now_local, today, clinic) -> str:
     return _CORE_TEMPLATE.format(
+        clinic_name=clinic.name,
+        tz_label=clinic.timezone,
         today=today.isoformat(),
         weekday=today.strftime("%A"),
         # e.g. "12:17 AM EDT" — includes the tz abbrev so the model knows which clock it's on.
@@ -467,7 +477,9 @@ def _build_date_table(today: date) -> str:
 
 
 def build_system_prompt(
-    intent: Intent | None = None, now: _datetime | None = None
+    intent: Intent | None = None,
+    now: _datetime | None = None,
+    clinic: "_tenant.Tenant | None" = None,
 ) -> str:
     """Assemble the system prompt for one turn, scoped to the caller's classified intent.
 
@@ -481,13 +493,16 @@ def build_system_prompt(
     day-of-week table and "has this time passed?" off by a day. `now` may be naive (assumed
     UTC) or tz-aware.
     """
+    clinic = clinic or _tenant.current()
     now = now or _datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
-    now_local = now.astimezone(CLINIC_TZ)
+    # The TENANT'S zone, not the module constant: Phase 17 put a clinic in Central time, and a
+    # date table built in the wrong zone is the Phase-4 date-grounding defect all over again.
+    now_local = now.astimezone(ZoneInfo(clinic.timezone))
     today = now_local.date()
 
-    parts = [_core_prompt(now_local, today)]
+    parts = [_core_prompt(now_local, today, clinic)]
 
     if intent is None or intent in SCHEDULING_INTENTS:
         # The date block also references the current clinic-local time — it is what backs the
@@ -522,9 +537,11 @@ def build_system_prompt(
     return "\n".join(parts).rstrip() + "\n"
 
 
-def build_phase2_system_prompt(now: _datetime | None = None) -> str:
+def build_phase2_system_prompt(
+    now: _datetime | None = None, clinic: "_tenant.Tenant | None" = None
+) -> str:
     """The full booking prompt. Retained as the name the Pipecat pipeline and eval import."""
-    return build_system_prompt(Intent.SCHEDULE_APPOINTMENT, now)
+    return build_system_prompt(Intent.SCHEDULE_APPOINTMENT, now, clinic)
 
 
 def prompt_sizes(now: _datetime | None = None) -> dict[str, int]:

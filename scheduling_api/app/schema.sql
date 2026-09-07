@@ -35,6 +35,20 @@ CREATE TABLE IF NOT EXISTS clinics (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Phase 17. ADD COLUMN IF NOT EXISTS rather than editing the CREATE above: `CREATE TABLE IF NOT
+-- EXISTS` does nothing to a table that already exists, so a column added there would be missing
+-- from every database created before today and present in every new one.
+--
+--   did              the number a caller DIALS. This is how the agent knows which clinic it is
+--                    answering for: one worker, one process, several tenants.
+--   transfer_number  where this clinic's calls escalate to. "Transfer to a human" is a
+--                    different human at each clinic, so it cannot stay a single env var.
+ALTER TABLE clinics ADD COLUMN IF NOT EXISTS did TEXT;
+ALTER TABLE clinics ADD COLUMN IF NOT EXISTS transfer_number TEXT;
+
+-- Partial: several tenants may have no number yet, and NULLs must not collide.
+CREATE UNIQUE INDEX IF NOT EXISTS clinics_did_idx ON clinics (did) WHERE did IS NOT NULL;
+
 -- =========================================================================================
 -- SCHEDULING (in use today)
 -- =========================================================================================
@@ -282,6 +296,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS audit_log_clinic_at_idx ON audit_log (clinic_id, at DESC);
+
+-- "Append-only" is a property, not a comment, so the database enforces it. A trigger rather
+-- than REVOKE: this service connects as an owner/service role, and an owner's privileges are
+-- unaffected by REVOKE ... FROM PUBLIC, so a grant-based control here would be decorative.
+-- Triggers fire for owners too.
+--
+-- TRUNCATE is deliberately still allowed: row triggers do not see it, it requires table
+-- ownership, and the test suite resets between cases with it. An operator who can TRUNCATE can
+-- also DROP TRIGGER — the control this gives you is that no ORDINARY statement, and no bug in
+-- this codebase, can quietly rewrite history.
+CREATE OR REPLACE FUNCTION audit_log_is_append_only() RETURNS trigger AS $audit$
+BEGIN
+    RAISE EXCEPTION 'audit_log is append-only (attempted %)', TG_OP;
+END;
+$audit$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_log_no_update_delete ON audit_log;
+CREATE TRIGGER audit_log_no_update_delete
+    BEFORE UPDATE OR DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_is_append_only();
 
 -- Deferred FK: bookings.patient_id -> patients.id. Declared here because bookings is created
 -- before patients (bookings is in use today; patients is not).

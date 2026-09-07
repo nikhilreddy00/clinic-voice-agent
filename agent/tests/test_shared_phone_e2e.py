@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from dataclasses import replace
 
 import pytest
@@ -420,3 +421,43 @@ async def test_a_failed_second_verification_does_not_disturb_the_first(client):
     call.say("show me my appointments")
     (listed,) = await call.model_calls(("list_appointments", {}))
     assert {a["confirmation_id"] for a in listed["appointments"]} == {nick["confirmation_id"]}
+
+
+async def test_every_phi_access_lands_in_the_audit_log_under_this_call_id():
+    """Phase 17 — the audit trail, proven across the seam rather than inside one service.
+
+    The header the agent sets, the middleware that binds it, and the row the database writes are
+    three separate pieces in two processes; each one has its own test and none of them proves
+    the chain. This books and verifies through the real client and then reads `audit_log`
+    directly: a row for the booking, a row for the verification, a row for the refusal, all
+    carrying the call id that names this call's trace file.
+    """
+    import psycopg
+
+    call_id = f"e2e-audit-{uuid.uuid4().hex[:8]}"
+    client = SchedulingClient(API_BASE, call_id=call_id)
+    try:
+        call = ScriptedCall(client)
+        call.answer()
+        await _book(call, *NICK)
+
+        call.say("actually, what do I have booked?", intent="list_appointments")
+        await call.model_calls(("verify_identity", {"date_of_birth": NICK[1]}))
+        await call.model_calls(("verify_identity", {"date_of_birth": "01/01/1900"}))
+    finally:
+        await client.aclose()
+
+    async with await psycopg.AsyncConnection.connect(
+        E2E_DATABASE_URL, connect_timeout=5, autocommit=True, row_factory=psycopg.rows.dict_row
+    ) as conn:
+        rows = await (await conn.execute(
+            "SELECT action, resource_id FROM audit_log WHERE call_id = %s ORDER BY id",
+            (call_id,),
+        )).fetchall()
+
+    actions = [r["action"] for r in rows]
+    assert "confirm_booking" in actions
+    assert "verify_identity" in actions
+    assert "verify_identity:denied" in actions, (
+        "a refused access left no trace — the denial's transaction rolled the audit row back"
+    )

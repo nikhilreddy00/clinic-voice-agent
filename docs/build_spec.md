@@ -1699,3 +1699,178 @@ asserted), and the trace viewer renders a real call.
 
 **Not proven:** `--live` audio-in-the-loop (never run, by choice); Tier 2's parallel speedup
 against a real model (unmeasured); the security suite's three-consecutive-run standard.
+
+---
+
+## Phase 17 — BAA-readiness + multi-tenancy
+
+Plan: `~/.claude/plans/dazzling-skipping-rain.md`. Built and verified **entirely offline; no
+call placed.** Full gap analysis: [`docs/compliance.md`](compliance.md).
+
+The phase closes the last item in the production-scale plan, and its shape is different from
+the ones before it: nothing here makes the agent better at answering the phone. It makes the
+places PHI crosses a boundary *nameable*, so that becoming compliant is contracts and
+configuration rather than a redesign. Four concrete gaps existed, all verified in the tree
+before touching anything.
+
+### 17.1 — The PHI boundary
+
+`agent/src/clinic_agent/phi.py`: `PHI_FIELDS`, `redact(field, value)`, `safe_args()`,
+`redact_phone()`.
+
+The defect it exists to prevent had already happened twice — `confirm_booking` logged
+`patient_name` verbatim on both its request and its result line, in a file where every other
+sensitive field was carefully reduced to `set` / `unset` / `len=`. **A convention is only as
+good as the author's attention; this is a module.** Deny-by-default over a named field set, not
+a scan for things that look like PHI: pattern-matching names is a losing game, and the set of
+keys this system actually puts in a tool argument is short, stable, and reviewable in one
+screen.
+
+`reason` is deliberately *outside* the set — it is a coarse category from a fixed four-value
+list and seeing it is how a booking flow gets debugged. The clinical sentence lives in
+`symptom_notes`, which is covered.
+
+**Spoken content was the bigger sink and was not in the plan.** `ASR ▶ transcript received`,
+`LLM ▶ response generated`, and the SIP participant identity all printed raw, and every event in
+`logs/traces/` carries the caller's words. One switch now governs both console and traces:
+
+* `CLINIC_PHI_LOGS=0` → the console prints lengths, and `phi.scrub_event` removes the words from
+  every trace record while keeping every event, timing and tool call. Replay still runs; it just
+  cannot show you what was said.
+* **Default is ON, deliberately.** The data is synthetic, and redacting the console while writing
+  the full transcript to a file on the same disk is theater rather than a control. The whole
+  live-debugging loop is built on those traces.
+
+The gate is `agent/tests/test_phi.py`: all nine tools driven through the real `execute_tool` with
+sentinel values, loguru's output searched. **A source grep would pass on an f-string.** It also
+asserts the lines stay *useful* (`dob=set`, `symptom_notes=len=57`, the confirmation id) —
+redaction that erases a line's purpose gets deleted by the next person debugging a call.
+
+### 17.2 — PHI at rest: two columns, two different treatments
+
+**The date of birth is a CREDENTIAL, not data.** It is only ever compared for equality; nothing
+reads it back, nothing speaks it, no endpoint returns it. So it gets a password digest, not
+encryption: `db.dob_key` = HMAC-SHA256 under `CLINIC_PHI_KEY`. One-way (a database dump
+discloses nothing) and deterministic (so `UNIQUE (clinic_id, phone, date_of_birth)` and every
+comparison keep working). Reversible encryption would be strictly worse — the same exposure,
+plus a decryptable plaintext nobody needs.
+
+**The clinical note is text a person must eventually read**, so it must be reversible: pgcrypto
+`pgp_sym_encrypt`, base64 into the existing TEXT column behind a `pgp:` marker.
+`db.read_clinical_note` is the decrypt half, so the column is not write-only.
+
+| Rule | Why |
+|---|---|
+| `dob_key` is idempotent on its own output | the boot migration runs on every start; without it the second boot digests the digest |
+| Comparisons use `dob_matches`, never `normalize_dob(a) == normalize_dob(b)` | re-normalizing a digest reduces it to the digits of its own hex — a silent wrong answer, not an error |
+| `is_full_dob` still runs on the **plaintext**, before hashing | the Phase-16 fragment rule is unchanged, and its contract test with `reducer._is_full_dob` still holds |
+| Key unset = plaintext, with a **warning on every boot** | a documented posture, never a silent downgrade. An operator who believes the database is encrypted and is wrong should learn it here, not in an incident review |
+| `CREATE EXTENSION pgcrypto` only when a key is set, and a failure is fatal | continuing would write plaintext into a deployment whose operator believes it is encrypted |
+| `patient_name` stays plaintext, deliberately | it is spoken back to the caller and fuzzy-matched, and the app holds the key next to the database. Recorded as an open gap in `compliance.md` rather than papered over |
+
+**The key is part of the data.** Change or lose `CLINIC_PHI_KEY` and every enrolled patient
+becomes unverifiable, with no recovery path — that is what one-way means. Pinned by
+`test_changing_the_key_makes_every_caller_unverifiable`, which asserts it fails *closed*.
+
+`run_e2e.sh` now runs the API suite **twice**, once with a key set. The failure mode this
+catches is not in `test_phi_at_rest.py` — it is a comparison site somewhere else that still
+expects to read a birthday out of the column.
+
+### 17.3 — The audit trail
+
+`audit_log` existed since Phase 9 and nothing wrote to it; "append-only" was a comment.
+
+* **Enforcement is a trigger, not a GRANT.** This service connects as an owner, and an owner's
+  privileges are unaffected by `REVOKE ... FROM PUBLIC` — a grant-based control here would be
+  decorative. Triggers fire for owners too. TRUNCATE stays allowed (row triggers do not see it,
+  it needs table ownership, and the fixtures reset with it); the property this buys is that no
+  ordinary statement and no bug in this codebase can quietly rewrite history.
+* **Denials are audited, and are the more useful row.** "Four wrong dates of birth on one call"
+  is the pattern the log exists to expose. Success-only logging records everything except the
+  attack.
+* **`_audit` takes its OWN connection, outside the caller's transaction.** A denial raises, the
+  transaction rolls back, and a row written inside it would vanish — losing precisely the events
+  worth keeping. The cost is one pooled connection per PHI call.
+* Rows record **that** a chart was reached — never a name, a date of birth, a phone number, a
+  medication or a symptom. There is a test asserting that over the whole table.
+* `X-Call-Id` (set by `SchedulingClient`, bound by one middleware) joins every audit row to
+  `logs/traces/<call_id>.jsonl` and to the call's OTel trace.
+
+### 17.4 — Multi-tenancy
+
+`clinic_id` was on every row from Phase 9, which is what made this a routing change rather than
+a migration. **Two lookups in `_verify` carried no tenant at all** — `WHERE phone = %s`, and a
+name+DOB scan across the entire `patients` table, which is reachable from an unknown number
+through the ordinary verification path. With one clinic that is invisible; with two it is
+cross-tenant PHI disclosure.
+
+API side:
+
+* `X-Clinic-Slug` → contextvar → `_clinic_id()`. Absent means the default clinic, so every
+  pre-Phase-17 caller, script and test kept working with no flag day.
+* Scoped: both `_verify` lookups, the orphan-booking candidate scan, `caller_memory`,
+  `clinic_info` (which returned *all* tenants' facts), `hold_slot`, `confirm_booking`, and
+  reschedule's slot compare-and-swap.
+* **The availability date filter reads the tenant's timezone from the joined `clinics` row**,
+  not the module constant. Bayside is Central; "Tuesday" has to mean Tuesday where the clinic
+  is, or it is the Phase-9 seed bug with a tenant column added.
+* `clinics.did` / `clinics.transfer_number` added by `ALTER ... IF NOT EXISTS` — editing the
+  `CREATE TABLE IF NOT EXISTS` would have added them only to *new* databases.
+* A second seeded tenant (`seed_data.BAYSIDE`): different zone, own DID, own providers and
+  slot-id range. It exists so tenancy is exercised rather than asserted.
+
+Agent side (`tenant.py`):
+
+* **Resolution happens once at worker startup, from the dialed number — never per call.** A
+  lookup on the critical path would put an HTTP round trip in front of the greeting, which
+  carries the AI disclosure; the Phase-13 rule that caller memory loads *after* the greeting
+  exists for exactly this. And with Direct dispatch every caller lands in one shared room, so a
+  process serves one trunk and therefore one clinic. Per-call `sip.trunkPhoneNumber` resolution
+  belongs with room-per-call dispatch — building it now would be code that cannot run.
+* Every failure degrades to the default tenant with a warning: unreachable API, unknown DID, no
+  number configured. All four paths are tested.
+* **The clinic name travels on `CallStarted`, not read from a module global in the reducer.**
+  `reduce` is pure: a trace recorded at one clinic must replay to that clinic's greeting on a
+  machine configured for another. A pre-tenancy trace (no `clinic_name`) still replays to the
+  original greeting.
+* **The AI disclosure and recording consent are not per-tenant.** A clinic does not get to
+  configure whether its callers are told they are talking to an AI.
+* Prompt caching re-checked as promised: the booking prefix estimates **4,296 tokens against the
+  4,096 floor**, identical ±1 across tenants. Substituting a name does not move it.
+
+### 17.5 — The gate and the document
+
+`scripts/prove_ci_gate.sh` grows from three planted regressions to **five**: a raw-PHI log line,
+and a patient lookup that loses its `clinic_id` filter. The tenancy scenario preserves the
+query's parameter *order* (the clinic id binds to a tautology, the phone still binds to the
+phone) so it reproduces the old unscoped lookup exactly rather than going red for the wrong
+reason. It is skipped, loudly, when no Postgres is reachable.
+
+CI needed no change — `offline` already runs `./run_e2e.sh`, and every new suite rides along.
+
+`docs/compliance.md` is the deliverable a clinic's IT reviewer actually asks for: the vendor/BAA
+matrix (including the two counter-intuitive parts — **ZDR is not the compliant setting**, and
+**TTS is in scope** because the agent speaks the caller's name back), the table of controls with
+the test that fails if each regresses, the two switches an operator sets, and **nine open
+items** — plaintext `patient_name`, transcripts on disk by default, the app holding its own key,
+no retention policy, one shared service token rather than per-tenant credentials, the
+unauthenticated router webhook, no signed BAA with anyone. Gap analysis, never a compliance
+claim.
+
+### Verification
+
+| Gate | Result |
+|---|---|
+| `./run_e2e.sh` | green — API **126**, API again with `CLINIC_PHI_KEY` **126**, agent **653**, session_router 26 |
+| `eval/tier1_replay.py` | 7/7 traces clean, 8 invariants each |
+| `run_intent_eval.py --detector-only` | emergency recall 100%, 0 false positives |
+| PHI gate | planting the old `patient_name` log line turns `test_phi.py` red |
+| Tenancy gate | reverting either `clinic_id` filter turns exactly the two disclosure tests red |
+| `migrate.py` / `reset_demo_data.py` | clean against a fresh database, both tenants seeded in their own zones |
+
+**Phase exit criterion met:** the PHI lint test fails on a deliberately-added raw-PHI log line —
+proven by running it, and now planted by `prove_ci_gate.sh` on every invocation.
+
+**Not proven:** no live call was placed (nothing here needs one); the promptfoo suites were not
+re-run after the clinic name became a variable in the prompt — the substitution is mechanical and
+the prefix size is unchanged, but only `evals` can say the model still obeys the prompt.

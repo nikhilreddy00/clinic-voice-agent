@@ -46,6 +46,7 @@ from .models import (
     CancelRequest,
     CancelResponse,
     ClinicInfoResponse,
+    ClinicResponse,
     ConfirmRequest,
     ConfirmResponse,
     HoldRequest,
@@ -103,6 +104,15 @@ async def _sweeper() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("connected to %s", db.describe_target())
+    # Say the PHI posture out loud on every boot. An operator who believes the database is
+    # encrypted and is wrong should find that out here, not in an incident review.
+    if db.phi_at_rest_enabled():
+        logger.info("PHI at rest: dates of birth digested, clinical notes encrypted")
+    else:
+        logger.warning(
+            "PHI at rest: DISABLED (CLINIC_PHI_KEY unset) — dates of birth and clinical notes "
+            "are stored in the clear. Correct for synthetic data; set a key before real PHI."
+        )
     await db.init_db()
     task = asyncio.create_task(_sweeper())
     try:
@@ -119,6 +129,30 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def bind_request_context(request, call_next):
+    """Bind the caller's call id and actor for the audit trail (Phase 17).
+
+    Headers rather than a body field: every endpoint would otherwise need a new required field,
+    and this is metadata about the request, not about the appointment. `X-Call-Id` is the
+    agent's own call id, so an audit row joins straight to `logs/traces/<call_id>.jsonl` and to
+    the OTel trace for the same call.
+
+    `X-Clinic-Slug` is the tenant (Phase 17). Absent means the default clinic, which is what
+    every pre-Phase-17 caller, script and test sends — so tenancy arrived without a flag day.
+    It is NOT an authorization boundary on its own: today the service token is shared, so a
+    holder of it can name any tenant. Per-tenant credentials are named in docs/compliance.md as
+    an open item; the isolation this header selects is real, the authentication in front of it
+    is not yet per-tenant.
+    """
+    db.set_request_context(
+        call_id=request.headers.get("X-Call-Id"),
+        actor=request.headers.get("X-Actor"),
+        clinic_slug=request.headers.get("X-Clinic-Slug"),
+    )
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -284,6 +318,20 @@ async def confirm_booking(
 async def get_caller_memory(phone: str = Query(..., description="Caller ANI, E.164")):
     """Pre-greeting lookup. Returns no identity — recognising a number is not authentication."""
     return CallerMemoryResponse(**await db.caller_memory(phone))
+
+
+@app.get("/clinic", response_model=ClinicResponse, dependencies=[Depends(require_token)])
+async def get_clinic(did: str = Query(..., description="The number the caller dialed, E.164")):
+    """Resolve a DIALED number to its tenant — the agent's entry point into multi-tenancy.
+
+    One worker process answers for several clinics, so the first thing a call needs is which
+    clinic it is. The answer is not PHI: a name, a timezone, and the number this clinic's calls
+    escalate to.
+    """
+    row = await db.clinic_by_did(did)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No clinic is configured for that number")
+    return ClinicResponse(**row)
 
 
 @app.get("/clinic-info", response_model=ClinicInfoResponse,
