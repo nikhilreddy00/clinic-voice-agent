@@ -54,10 +54,17 @@ scenario() {
     TOUCHED+=("$file")
     "$patch_fn"
 
-    local env_prefix=()
+    # Always starts with `env`, never empty: under `set -u`, expanding an EMPTY array as
+    # "${a[@]}" is an unbound-variable error on bash 3.2 (which is what macOS ships). That
+    # error made the subshell exit non-zero, which this script reads as "the gate blocked it" —
+    # so all four agent scenarios reported PASS without pytest ever running, and the "1 failed"
+    # count came from the previous scenario's leftover log. A gate proof that can pass without
+    # running the tests is worse than no gate proof.
+    local env_prefix=(env)
     if [[ "$runner" == "scheduling_api" ]]; then
-        env_prefix=(env "CLINIC_DATABASE_URL=postgresql://postgres@127.0.0.1:${CLINIC_E2E_PGPORT:-55432}/clinic_test")
+        env_prefix+=("CLINIC_DATABASE_URL=postgresql://postgres@127.0.0.1:${CLINIC_E2E_PGPORT:-55432}/clinic_test")
     fi
+    : >/tmp/prove-gate.log   # never let a stale log supply the next scenario's failure count
 
     if (cd "$runner" && "${env_prefix[@]}" uv run pytest "$target" -q >/tmp/prove-gate.log 2>&1); then
         echo "  ✗ the gate stayed GREEN with the regression applied — it does not catch this."
