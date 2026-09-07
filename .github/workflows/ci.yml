@@ -63,6 +63,11 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          # The action's post-job `uv cache prune` hung for exactly five minutes and exited 2 on
+          # the first green run, turning a passing gate red AFTER every test had already passed.
+          # Skipping the prune keeps the cache (which is the part with the benefit) and drops the
+          # part that failed. The cache is disposable; a red badge on a green run is not.
+          prune-cache: false
 
       - name: Install system packages
         # postgresql-client: run_e2e.sh uses pg_isready and createdb for its scratch databases.
@@ -131,6 +136,11 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          # The action's post-job `uv cache prune` hung for exactly five minutes and exited 2 on
+          # the first green run, turning a passing gate red AFTER every test had already passed.
+          # Skipping the prune keeps the cache (which is the part with the benefit) and drops the
+          # part that failed. The cache is disposable; a red badge on a green run is not.
+          prune-cache: false
 
       - name: Install system packages
         # See the offline job for why portaudio19-dev is needed to sync the agent venv.
