@@ -64,9 +64,17 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install postgresql-client
-        # run_e2e.sh uses pg_isready and createdb to bring up its scratch databases.
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Install system packages
+        # postgresql-client: run_e2e.sh uses pg_isready and createdb for its scratch databases.
+        # portaudio19-dev:   pipecat-ai[local] depends on pyaudio, which compiles against
+        #   portaudio.h. The `local` extra is the laptop mic path and CI never opens a
+        #   microphone — but the package still has to BUILD for the venv to sync, and a bare
+        #   Ubuntu runner has no portaudio headers. Installing it keeps CI on exactly the
+        #   dependency set a developer has, which is the point; dropping the extra in CI would
+        #   mean testing a different program from the one that ships.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client portaudio19-dev
 
       - name: Sync dependencies
         run: |
@@ -124,8 +132,11 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install postgresql-client
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: Install system packages
+        # See the offline job for why portaudio19-dev is needed to sync the agent venv.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client portaudio19-dev
 
       - name: Sync dependencies
         run: |
